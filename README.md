@@ -6,10 +6,15 @@
 
 **Make a Xiaomi bulb dance to your music, your films, or both at once.**
 
-DSP in, hue out — plus a built-in Xiaomi cloud token extractor, so setup
-never needs a second repo.
+DSP in, hue out — plus a built-in Xiaomi cloud token extractor.
 
 `music` · `screen` · `fusion` · local web desk · miio token extraction
+
+<br>
+
+<img src="assets/desk-runtime.png" alt="the bulbd desk in screen mode: live colour field, hue histogram, and the capture controls" width="820">
+
+<sub>Screen mode, mid-run. The address in the masthead is this machine's — yours will differ.</sub>
 
 </div>
 
@@ -103,18 +108,11 @@ next begins.
 
 ## The desk
 
-```
-┌─ BULBD/desk ── ● bulb 192.0.2.10 ── mode music ── running ──[RUNTIME][CLOUD]─┐
-│                                                                             │
-│                        ( live colour + beat pulse )                         │
-│           hue 214   sat 88   bright 96   bpm 128   palette ember            │
-│  ▁▂▃▅▇▅▃▂▁▂▃▅  ← 10 audio bands, or 12 hue bins in screen mode              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  01 TRANSPORT      [MUSIC][SCREEN][FUSION]   START   ☐ CALM MODE            │
-│  02 PALETTE        auto · ember · lagoon · orchid · citrus · nocturne …     │
-│  03 AUDIO CHAIN    beat sensitivity · contrast · punch · refresh · fade     │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The stage across the top is the colour going to the bulb right now, with the
+ring pulsing on beats and the strip below it showing 10 audio bands — or 12
+hue bins in screen mode, each bar painted with the hue it counts. Underneath
+sit the numbered panels: transport, palette, and whichever signal chain the
+current mode uses.
 
 The desk swaps its controls to match the mode. Fusion shows both halves minus
 what it can't use: the palettes, the colour fade and the dark lift have
@@ -141,6 +139,8 @@ setup is one repo:
 4. **USE** points the desk at that address, so you never have to type it.
    **ENABLE LAN** sends the token to the bulb, turns developer mode on and
    opens port 55443.
+
+<img src="assets/desk-cloud.png" alt="the CLOUD deck: bulb address field, password or QR login, region picker and a log pane" width="820">
 
 That's the entire provisioning path, and it is also the easiest way to answer
 "what is my bulb's IP?" — the cloud knows, and the table shows it. Afterwards

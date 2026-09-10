@@ -1035,12 +1035,18 @@ $('sub').textContent = SUBS.music;
     send({mode:m});
   };
 });
+function showDeck(name){
+  const tabs=[...document.querySelectorAll('.deck-tab')];
+  const tab = tabs.find(t=>t.dataset.deck===name) || tabs[0];
+  tabs.forEach(c=>c.setAttribute('aria-selected', c===tab));
+  document.body.dataset.deck = tab.dataset.deck;
+}
 [...document.querySelectorAll('.deck-tab')].forEach(b=>{
-  b.onclick=()=>{
-    document.querySelectorAll('.deck-tab').forEach(c=>c.setAttribute('aria-selected', c===b));
-    document.body.dataset.deck = b.dataset.deck;
-  };
+  b.onclick=()=>{ showDeck(b.dataset.deck); location.hash = b.dataset.deck; };
 });
+// #cloud in the URL opens straight onto that deck, so a link can point at it
+showDeck(location.hash.slice(1));
+addEventListener('hashchange', ()=>showDeck(location.hash.slice(1)));
 
 $('monitor').addEventListener('change',e=>send({monitor:+e.target.value}));
 $('calm').addEventListener('change',e=>send({calm:e.target.checked}));
