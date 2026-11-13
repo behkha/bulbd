@@ -24,6 +24,13 @@ cloud = [
     "Pillow",
     "colorama",
 ]
+# the ScreenCaptureKit capture backend (--capture sck / auto); macOS only,
+# and everything falls back to mss without it
+sck = [
+    "pyobjc-framework-ScreenCaptureKit; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreMedia; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+]
 test = ["pytest"]
 
 [project.scripts]
@@ -31,7 +38,7 @@ bulbd = "music_bulb:main"
 bulbd-desk = "music_bulb_dash:main"
 
 [tool.setuptools]
-py-modules = ["music_bulb", "music_bulb_dash", "token_extractor"]
+py-modules = ["music_bulb", "music_bulb_dash", "token_extractor", "sck_capture", "palettes"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

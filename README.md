@@ -46,11 +46,14 @@ which lives in the Xiaomi cloud — see [Getting the token](#getting-the-token).
 ```bash
 pip install -e .            # the light engine
 pip install -e ".[cloud]"   # plus the Xiaomi cloud / token half
+pip install -e ".[sck]"     # plus the ScreenCaptureKit screen capture (pyobjc)
 ```
 
 The base install is `yeelight numpy soundcard python-miio mss`; the `cloud`
 extra adds `requests`, `pycryptodome`, `charset-normalizer`, `Pillow` and
-`colorama` (`requirements.txt` lists the same five). If you already have a
+`colorama` (`requirements.txt` lists the same five); the `sck` extra adds the
+three pyobjc frameworks the cheaper screen capture needs (macOS only; without
+them screen capture uses `mss`). If you already have a
 token, you can skip it — the dashboard imports the extractor inside a
 `try`/`except` and simply turns off the Xiaomi login in Setup when it isn't there.
 
@@ -150,8 +153,8 @@ brightness.
   through ordinary gaps: sound counts after 2 s and is let go after 10 s of
   silence, a picture counts as moving after two looks in a row and as still
   after 15 s, and a pick stays at least 10 s. Watching the input the current
-  mode does not use is cheap: in Music one screen grab every 2 s (every 4 s
-  after a still minute), in Screen the input's level only. Without Screen
+  mode does not use is cheap: in Music one look at the screen every 2 s
+  (every 4 s after a still minute), in Screen the input's level only. Without Screen
   Recording permission Auto stays on Music.
 - **Presets** sit under Start: one click sets mode, Auto, palette, Calm and
   every fader. Club, Lounge, Cinema and Concert are built in; **Save as
@@ -160,6 +163,28 @@ brightness.
   sync, which describe your room rather than a look. The chip of the preset
   the desk matches is pressed; move a fader and none is.
 - **Beat sync** is the fader for `--lead` (music and fusion), Off at 0.
+- **Palettes of your own** (music) sit after the built-ins. **New palette**
+  opens an editor under the chips, starting from the palette that is on: a
+  name, a row of colours, and Hue and Saturation faders for the one picked;
+  **+** adds a colour after it, the arrows move it, **Remove** drops it.
+  **Save** keeps it, and chooses a new one. **Edit** turns your chips into a name to
+  open in the editor and a mark to delete. A palette is 2 to 8 colours,
+  saturation 45-100 (what the engine can show), and each colour must differ
+  enough from the one before it - the last from the first included - for the
+  step to be seen; the editor says so when two are too alike. Yours work like
+  the built-ins everywhere: the chips, the automatic switching between
+  palettes, and presets. Deleting one that is chosen, or that a preset uses,
+  leaves those on *auto*; renaming one carries them along.
+- **From a cover**: drop an image on the desk, paste one (Cmd-V), or pick a
+  file; **From the screen** shows a still of a display to draw a box around a
+  cover that is on screen (a desk on localhost only). The browser shrinks the
+  picture to 128 px and the desk takes its few dominant vivid colours, the
+  strongest first, ordered so every step shows; a one-colour cover gets
+  neighbours either side of it. They open in the editor, named after the
+  file; nothing changes on the lamp until **Save**. Black and white, grey,
+  sepia or nearly black art gives no palette, and the desk says so. Nothing
+  is fetched from the network. Music and Spotify do not let a cover be
+  dragged out of them: save or copy it first, or box it on the screen.
 
 - **Input** (music and fusion) lists every capture device plus *Automatic*,
   which names the device it resolves to. The bar under it is the raw input
@@ -179,7 +204,7 @@ brightness.
   power, brightness, and colour or white temperature — and so does Ctrl-C;
   `--no-restore` leaves it on the last colour sent. The CLI does the same.
 - Settings — address, the bulb's device id, input, mode, Auto, palette,
-  Calm, every fader, display, area and your presets — are saved to `~/Library/Application Support/bulbd/settings.json`
+  Calm, every fader, display, area, your presets and your palettes — are saved to `~/Library/Application Support/bulbd/settings.json`
   a second after the last change and loaded at start (`--settings PATH` to
   move it, `--settings ''` to keep nothing). Start/Stop is not saved: the lamp
   never turns on by itself. `--ip` and `--mic` win over the file, and a
@@ -265,11 +290,28 @@ playing app, and leave BlackHole's own gain at full or the capture goes quiet.
 
 ## Screen capture on macOS
 
-Uses `mss`, about 20-26 ms for a grab of any size, so ~33 fps is the practical
-ceiling. Most of that cost lands in macOS itself (WindowServer and the
-permission daemons), not in this process, so the capture rate is the battery
-dial: it defaults to 10 fps and drops to 5 and then 2 while the picture holds
-still, returning to full on the first frame that changes. Without Screen Recording permission macOS hands back the desktop
+Two backends, chosen with `--capture auto|sck|mss` (the CLI and the desk):
+
+- **sck**, a ScreenCaptureKit stream (the `sck` extra). The permission is
+  checked once when the stream starts, the system scales each frame down
+  before handing it over, and an unchanged picture sends no pixels. Measured
+  on a playing film at 10 fps it cost about 5% of a core across the process,
+  WindowServer, tccd, trustd, syspolicyd and replayd, against about 26% for
+  mss (`tools/bench_capture.py`). The colour it reads matches mss: the same
+  pixels on a still picture, under a degree of hue apart on a film.
+- **mss**, one grab per frame: about 20-26 ms for a grab of any size, and
+  most of that cost lands in macOS itself (WindowServer and the permission
+  daemons) rather than in this process.
+
+`auto` (the default) is the stream when pyobjc is installed, mss otherwise,
+and a stream that cannot start or stops mid-session is replaced by mss
+without ending the session; the desk's `/api/state` says which is in use
+(`capture`). Either way the capture rate is the battery dial: it defaults to
+10 fps and drops to 5 and then 2 while the picture holds still, returning to
+full on the first frame that changes; a stream also wakes the loop the moment
+the picture moves. The stream ends with the session, a switch to Music, an
+error or exit, so the screen-recording mark in the menu bar is not left on by
+it. Without Screen Recording permission macOS hands back the desktop
 wallpaper instead of an error, so the code preflights the permission and
 refuses to start rather than quietly lighting your room the colour of your
 wallpaper.
@@ -349,14 +391,18 @@ Offline and deterministic: no bulb, no screen-recording permission, no audio
 device, no network (a test that opens a socket fails). It feeds synthetic
 drums, tones, noise and solid frames through the analyser, colour engines,
 capture pacer and sender, and checks the yeelight wire format against a fake
-socket; the connection recovery, Beat sync, white frames, Auto and presets
-run against fakes of the bulb, the LAN and the clock. About 35 seconds.
+socket; the connection recovery, Beat sync, white frames, Auto, presets,
+palettes and the ScreenCaptureKit backend run against fakes of the bulb, the
+LAN, the clock and the capture frameworks, so it passes without pyobjc. About
+30 seconds.
 
 ## Layout
 
 ```
 music_bulb.py        DSP, screen capture, CLI, bulb lifecycle
 music_bulb_dash.py   the web desk; CloudSession drives the login
+sck_capture.py       the ScreenCaptureKit stream backend (optional pyobjc)
+palettes.py          what a valid palette is; a palette from album art
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
 tests/               pytest suite (synthetic signals in tests/signals.py)
 tools/check_bulb.py  manual check against a real bulb; not part of the suite
@@ -364,6 +410,7 @@ tools/check_link.py  hello, find, diagnose and a power-cycle reconnect, real bul
 tools/check_white.py white-LED brightness match and temperature sweep, real bulb
 tools/check_sync.py  Beat sync against a click track on your speakers, real bulb
 tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
+tools/bench_capture.py  mss vs the stream: CPU per process and colour agreement
 ```
 
 ## Credits

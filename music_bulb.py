@@ -47,6 +47,7 @@ Install:
 """
 
 import argparse
+import contextlib
 import json
 import math
 import queue
@@ -268,14 +269,16 @@ class ColorEngine:
     by at least `fade` so one sweep lands before the next begins.
     """
 
-    def __init__(self, palette=None, calm=False, fade=0.0):
-        self.names = list(PALETTES)
-        self.pal = palette if palette in PALETTES else self.names[0]
+    def __init__(self, palette=None, calm=False, fade=0.0, palettes=None):
+        # every palette it may use, the user's own included; the desk swaps
+        # this mapping when one is added, changed or deleted
+        self.palettes = dict(palettes or PALETTES)
+        self.pal = palette if palette in self.palettes else next(iter(self.palettes))
         self.locked = palette is not None
         self.calm = calm
         self.fade = float(fade)
         self.idx = 0
-        h, s = PALETTES[self.pal][0]
+        h, s = self.palettes[self.pal][0]
         self.hue = self.target_hue = float(h)
         self.sat = self.target_sat = float(s)
         self.from_hue = self.hue
@@ -303,7 +306,7 @@ class ColorEngine:
             gap = max(gap, self.fade)             # let a sweep land first
         if t - self.last_step < gap:
             return
-        anchors = PALETTES[self.pal]
+        anchors = self.anchors()
         self.idx = (self.idx + 1) % len(anchors)
         h, s = anchors[self.idx]
         self.retarget(h, s, t)
@@ -312,6 +315,13 @@ class ColorEngine:
             self.hue = hue_lerp(self.hue, self.target_hue,
                                 0.25 if self.calm else 0.55)
         self.last_step = t
+
+    def anchors(self):
+        """The current palette's anchors; one deleted under it falls back
+        to the first palette there is."""
+        if self.pal not in self.palettes:
+            self.pal, self.idx = next(iter(self.palettes)), 0
+        return self.palettes[self.pal]
 
     def maybe_switch(self, t, bands):
         """Change palette when the spectral profile shifts - verse to chorus."""
@@ -323,10 +333,12 @@ class ColorEngine:
             return None
         if float(np.abs(self.fast - self.slow).mean()) < 0.17:
             return None
-        choices = [n for n in self.names if n != self.pal]
+        choices = [n for n in self.palettes if n != self.pal]
+        if not choices:
+            return None
         self.pal = choices[int(t * 7) % len(choices)]
         self.idx = 0
-        self.retarget(*PALETTES[self.pal][0], t=t)
+        self.retarget(*self.palettes[self.pal][0], t=t)
         self.last_switch = t
         self.slow = bands.copy()
         return self.pal
@@ -611,21 +623,54 @@ def screen_permission():
         return None
 
 
+def monitor_box(monitor):
+    """mss's {left, top, width, height} of a display, in global points."""
+    import mss
+    with mss.MSS() as sct:
+        mons = sct.monitors
+    if not 1 <= monitor < len(mons):
+        raise RuntimeError(f"no monitor {monitor}; this Mac has "
+                           f"{len(mons) - 1}. Try --list-monitors")
+    return dict(mons[monitor])
+
+
+def pace(grab, started, base, period, wake=None):
+    """Wait from `started` until the next frame is due: not before `base`,
+    and on a still picture until `period`. A grabber that pushes frames
+    (a ScreenCaptureKit stream) ends the wait as soon as the picture
+    changes. -> True if `wake` ended it - a control moved - so the caller
+    can put its pacer back to the full rate. `wake` is cleared either way."""
+    own = getattr(grab, "pace", None)
+    if own is not None:
+        return own(started, base, period, wake)
+    slack = started + base - time.monotonic()
+    if slack > 0:
+        time.sleep(slack)
+    woke = False
+    left = started + period - time.monotonic()
+    if left > 0:
+        if wake is None:
+            time.sleep(left)
+        else:
+            woke = wake.wait(left)
+    if wake is not None:
+        wake.clear()
+    return woke
+
+
 class ScreenGrabber:
-    """Downsampled screen frames as float RGB in 0..1."""
+    """Downsampled screen frames as float RGB in 0..1, one mss grab each."""
+
+    pushes = False
 
     def __init__(self, monitor=1, region=None, width=192):
         import mss
-        self._sct = mss.MSS()
-        mons = self._sct.monitors
         if region:
             x, y, w, h = region
             self.box = {"left": x, "top": y, "width": w, "height": h}
         else:
-            if not 1 <= monitor < len(mons):
-                raise RuntimeError(f"no monitor {monitor}; this Mac has "
-                                   f"{len(mons) - 1}. Try --list-monitors")
-            self.box = mons[monitor]
+            self.box = monitor_box(monitor)
+        self._sct = mss.MSS()
         # stride-sample on the way out: the grab is the cost, not the maths
         self.stride = max(1, int(self.box["width"] // max(width, 16)))
 
@@ -639,6 +684,78 @@ class ScreenGrabber:
             self._sct.close()
         except Exception:
             pass
+
+
+# Which backend "auto" means. tools/bench_capture.py measured the two on the
+# same film: the stream cost ~5% of a core over idle (Python, WindowServer,
+# tccd, trustd, syspolicyd, replayd together), one mss grab per frame ~26%.
+# Without pyobjc, off macOS, or if the stream fails, "auto" is still mss.
+AUTO_CAPTURE = "sck"
+CAPTURE_BACKENDS = ("auto", "sck", "mss")
+
+
+class Capture:
+    """The screen through a ScreenCaptureKit stream or mss, whichever is
+    asked for and works - with ScreenGrabber's contract either way.
+
+    `backend` is "auto" (AUTO_CAPTURE), "sck" or "mss". A stream that cannot
+    start - no pyobjc, not macOS, an old macOS, a display it does not list -
+    leaves mss in its place, and one that dies mid-session is swapped for
+    mss on the next frame, so the session carries on. `backend` says which
+    one is in use, `note` why the stream is not.
+    """
+
+    def __init__(self, monitor=1, region=None, width=192, fps=10, backend="auto",
+                 stream=None):
+        self.monitor, self.region, self.width = monitor, region, width
+        self.backend, self.note = "mss", ""
+        self._impl = None
+        want = AUTO_CAPTURE if backend == "auto" else backend
+        if want == "sck":
+            try:
+                if stream is None:
+                    from sck_capture import StreamGrabber as stream
+                self._impl = stream(monitor_box(monitor), region, width, fps)
+                self.backend = "sck"
+            except Exception as exc:
+                self.note = f"{type(exc).__name__}: {exc}"
+        if self._impl is None:
+            self._impl = ScreenGrabber(monitor, region, width)
+
+    @property
+    def pushes(self):
+        return self._impl.pushes
+
+    @property
+    def box(self):
+        return self._impl.box
+
+    def _fall_back(self, exc):
+        with contextlib.suppress(Exception):
+            self._impl.close()
+        self.note = f"{type(exc).__name__}: {exc}"
+        self._impl = ScreenGrabber(self.monitor, self.region, self.width)
+        self.backend = "mss"
+
+    def frame(self):
+        try:
+            return self._impl.frame()
+        except Exception as exc:
+            if self.backend != "sck":
+                raise
+            self._fall_back(exc)
+            return self._impl.frame()
+
+    def pace(self, started, base, period, wake=None):
+        return pace(self._impl, started, base, period, wake)
+
+    def set_fps(self, fps):
+        setter = getattr(self._impl, "set_fps", None)
+        if setter is not None:
+            setter(fps)
+
+    def close(self):
+        self._impl.close()
 
 
 class CapturePacer:
@@ -917,7 +1034,8 @@ class ScreenColorThread(threading.Thread):
     reader takes it, so a cut can never fall into the gap between sends.
 
     The grab rate follows CapturePacer, so a still picture is read a few
-    times a second instead of `fps` times. `poke()` ends that idle wait.
+    times a second instead of `fps` times. `poke()` ends that idle wait, and
+    a stream (Capture on ScreenCaptureKit) ends it with a new picture.
     """
 
     def __init__(self, grab, engine, fps=10, on_frame=None):
@@ -957,14 +1075,12 @@ class ScreenColorThread(threading.Thread):
             if self.on_frame is not None:
                 self.on_frame(frame, now)
 
-            base = 1.0 / max(self.fps, 1)
-            period = self._pacer.period(frame, self.fps, now)
-            slack = base - (time.monotonic() - now)
-            if slack > 0:
-                time.sleep(slack)
-            if period > base:                       # idle stretch, interruptible
-                self._wake.wait(period - base)
-            self._wake.clear()
+            setter = getattr(self.grab, "set_fps", None)
+            if setter is not None:
+                setter(self.fps)
+            # idle stretch, interruptible by poke() or a new picture
+            pace(self.grab, now, 1.0 / max(self.fps, 1),
+                 self._pacer.period(frame, self.fps, now), self._wake)
 
     def read(self):
         """-> (hue, sat 0..100, value 0..1, cut) - clears the pending cut."""
@@ -1948,11 +2064,12 @@ def run_screen(args):
               file=sys.stderr)
         return
 
-    grab = ScreenGrabber(args.monitor, args.screen_region, args.screen_width)
+    grab = Capture(args.monitor, args.screen_region, args.screen_width,
+                   args.screen_fps, args.capture)
     link = cli_link(args)
     sender = link
     print(f"Screen mode active on {link.ip}, monitor {args.monitor}, "
-          f"{args.screen_fps} fps. Ctrl-C to stop.")
+          f"{args.screen_fps} fps, {capture_label(grab)}. Ctrl-C to stop.")
 
     color = ScreenColorEngine(min_sat=args.min_sat, sat_boost=args.sat_boost,
                               gamma=args.screen_gamma, calm=args.calm)
@@ -1984,9 +2101,7 @@ def run_screen(args):
                            duration=ramp_ms(light, last_hsv, period))
                 last_hsv = light
 
-            slack = period - (time.monotonic() - now)
-            if slack > 0:
-                time.sleep(slack)
+            grab.pace(now, 1.0 / args.screen_fps, period)
     finally:
         link.close(restore=args.restore)
         grab.close()
@@ -2001,7 +2116,8 @@ def run_fusion(args):
               file=sys.stderr)
         return
 
-    grab = ScreenGrabber(args.monitor, args.screen_region, args.screen_width)
+    grab = Capture(args.monitor, args.screen_region, args.screen_width,
+                   args.screen_fps, args.capture)
     color = ScreenColorEngine(min_sat=args.min_sat, sat_boost=args.sat_boost,
                               gamma=args.screen_gamma, calm=args.calm)
     screen = ScreenColorThread(grab, color, fps=args.screen_fps)
@@ -2009,7 +2125,8 @@ def run_fusion(args):
     link = cli_link(args)
     sender = link
     print(f"Fusion mode active on {link.ip}: colour from monitor "
-          f"{args.monitor}, brightness from audio. Ctrl-C to stop.")
+          f"{args.monitor} ({capture_label(grab)}), brightness from audio. "
+          f"Ctrl-C to stop.")
 
     analyser = Analyser()
     lvl = LevelEngine(calm=args.calm)
@@ -2053,6 +2170,13 @@ def run_fusion(args):
     finally:
         screen.close()
         link.close(restore=args.restore)
+
+
+def capture_label(grab):
+    """"ScreenCaptureKit" / "mss", and why not the stream if it was wanted."""
+    if grab.backend == "sck":
+        return "ScreenCaptureKit"
+    return f"mss ({grab.note})" if grab.note else "mss"
 
 
 def parse_region(text):
@@ -2107,6 +2231,11 @@ def main():
     g.add_argument("--screen-fps", type=int, default=10,
                    help="capture rate while the picture moves, max 30 "
                         "(default: 10); a still picture is read less often")
+    g.add_argument("--capture", choices=CAPTURE_BACKENDS, default="auto",
+                   help="screen capture: a ScreenCaptureKit stream (sck, needs "
+                        "the 'sck' extra), one mss grab per frame (mss), or "
+                        f"auto (= {AUTO_CAPTURE}); a stream that fails falls "
+                        "back to mss")
     g.add_argument("--screen-width", type=int, default=192,
                    help="pixels the frame is sampled down to (default: 192)")
     g.add_argument("--screen-gamma", type=float, default=0.75,

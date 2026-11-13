@@ -39,10 +39,14 @@ import numpy as np
 
 from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
                         LevelEngine, pick_recorder, enable_lan,
-                        ScreenGrabber, ScreenColorEngine, ScreenColorThread,
+                        Capture, ScreenColorEngine, ScreenColorThread,
                         CapturePacer, crop_letterbox, screen_permission,
                         Link, BulbUnreachable, White, screen_frame, same_light,
-                        ramp_ms, BeatSync, LED_GAP, AutoPicker, MotionMeter)
+                        ramp_ms, BeatSync, LED_GAP, AutoPicker, MotionMeter,
+                        AUTO_CAPTURE, CAPTURE_BACKENDS)
+
+import palettes as pal_rules
+from palettes import PaletteError, clean_anchors
 
 # The cloud half is optional: it pulls in requests/PIL/pycryptodome, and a
 # desk that only drives an already-provisioned bulb should still start
@@ -117,7 +121,7 @@ MIN_REGION = 32                     # points; smaller than this is a mis-click
 # what survives a restart. Never `running` (the lamp must not start on its
 # own) and nothing from the cloud login (no secret touches disk).
 SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
-              "monitor", "region", "presets")
+              "monitor", "region", "presets", "palettes")
 
 
 def _number(v):
@@ -228,12 +232,145 @@ def preset_op(op, snap):
     return mine, "bad request"
 
 
+def all_palettes(snap):
+    """{name: anchors} - the built-ins, then the user's own."""
+    out = dict(PALETTES)
+    for p in snap.get("palettes") or []:
+        out[p["name"]] = [tuple(a) for a in p["anchors"]]
+    return out
+
+
+def _taken_palette(name, mine, skip=None):
+    """The name `name` clashes with, or None. Case is ignored."""
+    key = name.casefold()
+    for other in (*PALETTES, *pal_rules.RESERVED):
+        if other.casefold() == key:
+            return other
+    for i, p in enumerate(mine):
+        if i != skip and p["name"].casefold() == key:
+            return p["name"]
+    return None
+
+
+def clean_palette_name(name):
+    name = clean_name(name)
+    return name if name and len(name) <= pal_rules.NAME_MAX else None
+
+
+def clean_palettes(palettes):
+    """The user's palettes from a file: [{name, anchors}], each valid on its
+    own, names unique and not a built-in's. Anything broken is dropped."""
+    if not isinstance(palettes, list):
+        return []
+    out = []
+    for p in palettes[:pal_rules.MAX_PALETTES]:
+        if not isinstance(p, dict):
+            continue
+        name = clean_palette_name(p.get("name"))
+        try:
+            anchors = clean_anchors(p.get("anchors"))
+        except PaletteError:
+            continue
+        if name is None or _taken_palette(name, out):
+            continue
+        out.append({"name": name, "anchors": [list(a) for a in anchors]})
+    return out
+
+
+def palette_op(op, snap):
+    """Save, rename or delete one of the user's palettes.
+    -> (patch for the state, error or "").
+
+    A rename carries the selected palette and every preset that names it to
+    the new name. A delete leaves them on "auto" - the switching between
+    palettes - rather than on a palette that is gone."""
+    mine = [dict(p) for p in snap.get("palettes") or []]
+    if not isinstance(op, dict):
+        return {}, "bad request"
+    kind, name = op.get("op"), clean_palette_name(op.get("name"))
+    index = next((i for i, p in enumerate(mine) if name and p["name"] == name), None)
+
+    def follow(old, new):
+        """Point the setting and the presets at `new` instead of `old`."""
+        patch = {"palettes": mine}
+        if snap.get("palette") == old:
+            patch["palette"] = new
+        presets = [dict(p, look=dict(p["look"], palette=new))
+                   if p["look"].get("palette") == old else p
+                   for p in snap.get("presets") or []]
+        if presets != list(snap.get("presets") or []):
+            patch["presets"] = presets
+        return patch
+
+    if kind == "save":
+        if name is None:
+            return {}, f"Give the palette a name of up to {pal_rules.NAME_MAX} characters."
+        try:
+            anchors = [list(a) for a in clean_anchors(op.get("anchors"))]
+        except PaletteError as exc:
+            return {}, str(exc)
+        if index is not None:
+            mine[index] = {"name": name, "anchors": anchors}
+        else:
+            taken = _taken_palette(name, mine)
+            if taken:
+                return {}, f"There is already a palette called {taken}."
+            if len(mine) >= pal_rules.MAX_PALETTES:
+                return {}, f"{pal_rules.MAX_PALETTES} palettes is the most the desk keeps."
+            mine.append({"name": name, "anchors": anchors})
+        return {"palettes": mine}, ""
+    if index is None:
+        return {}, "No such palette of yours."
+    if kind == "delete":
+        del mine[index]
+        return follow(name, "auto"), ""
+    if kind == "rename":
+        to = clean_palette_name(op.get("to"))
+        if to is None:
+            return {}, f"Give the palette a name of up to {pal_rules.NAME_MAX} characters."
+        taken = _taken_palette(to, mine, skip=index)
+        if taken:
+            return {}, f"There is already a palette called {taken}."
+        mine[index] = {"name": to, "anchors": mine[index]["anchors"]}
+        return follow(name, to), ""
+    return {}, "bad request"
+
+
+ART_SIDE = 128                      # px: the page sends a cover at most this big
+
+
+def extract_palette(body):
+    """A cover the page decoded and shrank -> (anchors or None, error).
+    `body` is {w, h, rgb}: rgb is base64 of w*h RGB bytes, row by row. The
+    page does the decoding, so the desk needs no image library and never
+    fetches anything; None means the art has no colour to take."""
+    if not isinstance(body, dict):
+        return None, "bad request"
+    w, h, data = body.get("w"), body.get("h"), body.get("rgb")
+    if not (isinstance(w, int) and isinstance(h, int) and 1 <= w <= ART_SIDE
+            and 1 <= h <= ART_SIDE and isinstance(data, str)):
+        return None, "bad picture"
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except ValueError:
+        return None, "bad picture"
+    if len(raw) != w * h * 3:
+        return None, "bad picture"
+    return pal_rules.palette_from_image(
+        np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)), ""
+
+
 def clean_patch(patch, snap):
     """The subset of `patch` that is valid against the current state, with
     numbers clamped to the faders' ranges. Unknown keys are dropped."""
     if not isinstance(patch, dict):
         return {}
     out = {}
+    # the user's palettes first: the palette setting and the presets' looks
+    # are checked against them
+    if "palettes" in patch:             # from the settings file; the page uses /api/palettes
+        out["palettes"] = clean_palettes(patch["palettes"])
+        snap = dict(snap, palettes=out["palettes"])
     for key, (lo, hi, kind) in NUMERIC.items():
         v = patch.get(key)
         if _number(v):
@@ -242,7 +379,8 @@ def clean_patch(patch, snap):
     for key in ("running", "calm", "auto"):
         if isinstance(patch.get(key), bool):
             out[key] = patch[key]
-    if patch.get("palette") == "auto" or patch.get("palette") in PALETTES:
+    if patch.get("palette") == "auto" or (isinstance(patch.get("palette"), str)
+                                          and patch["palette"] in all_palettes(snap)):
         out["palette"] = patch["palette"]
     if patch.get("mode") in MODES:
         out["mode"] = patch["mode"]
@@ -409,6 +547,7 @@ class State:
             "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
             "fade": 0.0, "lead": 80,
             "presets": [],                  # the user's own; BUILTIN_PRESETS are fixed
+            "palettes": [],                 # the user's own [{name, anchors}]; PALETTES are fixed
             # screen mode
             "monitor": mons[0]["i"] if mons else 1,
             "screen_fps": 10, "screen_gamma": 0.75,
@@ -424,6 +563,8 @@ class State:
             "level": 0.0, "hit": 0.0, "bands": [0.0] * 10,
             "input_db": None, "signal": True,
             "active_palette": "ember", "device": "-",
+            # the screen capture in use: "sck", "mss", or None when not capturing
+            "capture": None,
         }
         if saved:
             self._d.update(clean_patch(saved, self._d))
@@ -595,24 +736,29 @@ def light_telemetry(light, hue, level):
     return {"hue": light[0], "sat": light[1], "val": light[2], "white": False, "ct": 0}
 
 
-def apply_palette(color, name):
-    if name == "auto":
+def apply_palette(color, name, palettes=None):
+    """Point the music engine at the setting: a palette, or "auto". A new
+    `palettes` mapping (one added, edited or deleted) is taken as it is."""
+    if palettes is not None:
+        color.palettes = palettes
+    if name == "auto" or name not in color.palettes:
         color.locked = False
         return
     if color.pal != name or not color.locked:
         color.pal = name
         color.locked = True
         color.idx = 0
-        color.retarget(*PALETTES[name][0])
+        color.retarget(*color.palettes[name][0])
 
 
 class Engine(threading.Thread):
     daemon = True
 
-    def __init__(self, state, restore=True):
+    def __init__(self, state, restore=True, capture="auto"):
         super().__init__()
         self.state = state
         self.restore = restore
+        self.capture = capture                  # auto / sck / mss
         self.idle = threading.Event()           # set while parked, for a clean exit
         self.idle.set()
         self.picker = None                      # an AutoPicker while Auto is on
@@ -726,11 +872,13 @@ class Engine(threading.Thread):
                                "System Settings > Privacy & Security")
 
         monitor, region = cfg["monitor"], cfg["region"]
-        grab = ScreenGrabber(monitor, region_box(cfg), cfg["screen_width"])
+        grab = Capture(monitor, region_box(cfg), cfg["screen_width"],
+                       max(cfg["screen_fps"], 4), self.capture)
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
                                   sat_boost=cfg["sat_boost"],
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
         st.set(status="running", active_palette="screen", bpm=0.0,
+               capture=grab.backend,
                device=f"display {monitor} "
                       f"{grab.box['width']}x{grab.box['height']}")
 
@@ -775,7 +923,7 @@ class Engine(threading.Thread):
                 cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                 hist = color.hist.reshape(12, 3).sum(axis=1)
                 peak = float(hist.max())
-                st.set(**light_telemetry(light, hue, v),
+                st.set(**light_telemetry(light, hue, v), capture=grab.backend,
                        level=round(float(val), 3), hit=round(cut_env, 3),
                        bands=[round(float(b) / peak, 3) for b in hist]
                              if peak > 0 else [0.0] * 12)
@@ -786,16 +934,15 @@ class Engine(threading.Thread):
                                duration=ramp_ms(light, last_hsv, period))
                     last_hsv = light
 
-                slack = base - (time.monotonic() - now)
-                if slack > 0:
-                    time.sleep(slack)
                 # still picture: wait out the longer gap, but a moved control
-                # ends it so the desk never feels slow
-                if period > base and st.changed.wait(period - base):
+                # (or, on a stream, a new picture) ends it so the desk never
+                # feels slow
+                grab.set_fps(max(cfg["screen_fps"], 4))
+                if grab.pace(now, base, period, st.changed):
                     pacer.reset()
-                st.changed.clear()
         finally:
             grab.close()
+            st.set(capture=None)
             if ears is not None:
                 ears.close()
 
@@ -803,7 +950,9 @@ class Engine(threading.Thread):
     def _audio_loop(self, st, sender):
         cfg = st.snapshot()
         analyser = Analyser()
-        color = ColorEngine(None, calm=cfg["calm"], fade=cfg["fade"])
+        mine = cfg["palettes"]
+        color = ColorEngine(None, calm=cfg["calm"], fade=cfg["fade"],
+                            palettes=all_palettes(cfg))
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
         sync = BeatSync()
         mic = cfg["mic"]
@@ -819,9 +968,11 @@ class Engine(threading.Thread):
         picker, eyes = self.picker, None
         if picker is not None and picker.screen_ok:
             with contextlib.suppress(Exception):
-                eyes = MotionProbe(ScreenGrabber(cfg["monitor"], region_box(cfg),
-                                                 cfg["screen_width"]), picker)
+                eyes = MotionProbe(Capture(cfg["monitor"], region_box(cfg),
+                                           cfg["screen_width"], 1.0 / MotionMeter.PROBE,
+                                           self.capture), picker)
                 eyes.start()
+                st.set(capture=eyes.grab.backend)
 
         try:
             with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
@@ -835,7 +986,11 @@ class Engine(threading.Thread):
                     color.calm = lvl.calm = cfg["calm"]
                     color.fade = float(cfg["fade"])
                     lvl.punch = cfg["punch"]
-                    apply_palette(color, cfg["palette"])
+                    if cfg["palettes"] is not mine:      # one added, edited or deleted
+                        mine = cfg["palettes"]
+                        apply_palette(color, cfg["palette"], all_palettes(cfg))
+                    else:
+                        apply_palette(color, cfg["palette"])
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
                     fired = sync.feed(f, lvl, dt, cfg["lead"] / 1000.0, color)
@@ -875,7 +1030,7 @@ class Engine(threading.Thread):
         finally:
             if eyes is not None:
                 eyes.close()
-            st.set(bands=[0.0] * 10, input_db=None, signal=True)
+            st.set(bands=[0.0] * 10, input_db=None, signal=True, capture=None)
 
     # -- fusion mode: colour from the display, brightness from the audio ----
     def _fusion_loop(self, st, sender):
@@ -895,9 +1050,9 @@ class Engine(threading.Thread):
         # starve rec.record() and drag the onsets behind the music
         recorder = open_recorder(mic)
         picker, meter = self.picker, MotionMeter()
-        screen = ScreenColorThread(ScreenGrabber(monitor, region_box(cfg),
-                                                 cfg["screen_width"]),
-                                   color, fps=cfg["screen_fps"],
+        grab = Capture(monitor, region_box(cfg), cfg["screen_width"],
+                       cfg["screen_fps"], self.capture)
+        screen = ScreenColorThread(grab, color, fps=cfg["screen_fps"],
                                    on_frame=None if picker is None else
                                    lambda frame, now: picker.feed_motion(
                                        meter.feed(frame, now), now))
@@ -954,6 +1109,7 @@ class Engine(threading.Thread):
                     input_db, signal = watch.read(now)
                     st.set(**light_telemetry(light, hue, val),
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
+                           capture=grab.backend,
                            level=round(lvl.brightness, 3),
                            hit=round(max(lvl.hit, cut_env), 3),
                            bands=[round(float(b), 3) for b in f["bands"]],
@@ -968,7 +1124,7 @@ class Engine(threading.Thread):
                     last_sent, last_hsv = now, light
         finally:
             screen.close()
-            st.set(bands=[0.0] * 10, input_db=None, signal=True)
+            st.set(bands=[0.0] * 10, input_db=None, signal=True, capture=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,11 +1440,42 @@ body[data-deck="runtime"] #done{display:none}
 .pchip.edit input[aria-invalid="true"]{border-color:var(--err)}
 .mini.ghost{box-shadow:none;color:var(--dim);padding-inline:6px}
 .mini.ghost:hover{color:var(--ink);box-shadow:none}
+.mini.ghost[aria-pressed="true"]{color:var(--ink);font-weight:600}
 .chip{display:flex;align-items:center;gap:8px;padding:6px 11px 6px 7px;border-radius:8px;border:0;cursor:pointer;
   background:var(--sf);box-shadow:inset 0 0 0 1px var(--line);font-size:13.5px;text-transform:capitalize}
 .chip s{display:block;width:30px;height:12px;border-radius:3px}
 .chip:hover{box-shadow:inset 0 0 0 1px var(--dim)}
 .chip[aria-pressed="true"]{box-shadow:inset 0 0 0 1.5px var(--ink);font-weight:600}
+.chip.own,.pchip.mine.own{text-transform:none}
+.pchip.mine s{display:inline-block;width:30px;height:12px;border-radius:3px;margin-right:8px;vertical-align:-1px}
+.pchip.mine button.nm{padding-left:7px}
+
+/* palette editor: the user's own palettes, typed or taken from a cover */
+.pal{display:grid;gap:14px}
+.ed{background:var(--sf);border-radius:10px;box-shadow:inset 0 0 0 1px var(--line);padding:14px;display:grid;gap:12px}
+.ed .nm{display:flex;gap:10px;align-items:center}
+.ed .nm img,.cno img{flex:none;width:44px;height:44px;border-radius:5px;object-fit:cover}
+.sw{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.sw button{width:44px;height:44px;border-radius:8px;border:0;padding:0;cursor:pointer}
+.sw button[aria-pressed="true"]{box-shadow:0 0 0 2px var(--sf),0 0 0 4px var(--ink)}
+.sw .add{background:transparent;box-shadow:inset 0 0 0 1.5px var(--line);color:var(--dim);font-size:20px}
+.sw .add:disabled{opacity:.4;cursor:default}
+input[type=range].hue::-webkit-slider-runnable-track{height:8px;border-radius:4px;
+  background:linear-gradient(90deg,#eb0000,#ebeb00,#00eb00,#00ebeb,#0000eb,#eb00eb,#eb0000)}
+input[type=range].hue::-moz-range-track{height:8px;border-radius:4px;
+  background:linear-gradient(90deg,#eb0000,#ebeb00,#00eb00,#00ebeb,#0000eb,#eb00eb,#eb0000)}
+input[type=range].sat::-webkit-slider-runnable-track{height:8px;border-radius:4px;background:var(--st)}
+input[type=range].sat::-moz-range-track{height:8px;border-radius:4px;background:var(--st)}
+input[type=range].hue::-moz-range-progress,input[type=range].sat::-moz-range-progress{background:transparent}
+input[type=range].hue::-webkit-slider-thumb,input[type=range].sat::-webkit-slider-thumb{margin-top:-4px;box-shadow:0 0 0 2px #fff}
+.acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.link{border:0;background:none;color:var(--err);padding:8px 4px;cursor:pointer}
+.cno{display:flex;align-items:center;gap:12px}
+.cno p{margin:0;flex:1}
+.side{position:relative}
+.drop{position:absolute;inset:10px 14px 18px;border-radius:12px;border:2px dashed var(--ink);
+  background:color-mix(in srgb,var(--bg) 94%,transparent);display:flex;align-items:center;justify-content:center;
+  font-size:15px;font-weight:600;pointer-events:none;z-index:2}
 .rows{display:grid;gap:4px}
 .r{display:grid;grid-template-columns:150px 1fr 54px;gap:16px;align-items:center;min-height:34px}
 .r output{text-align:right;color:var(--dim);font-size:13.5px}
@@ -1409,7 +1596,46 @@ td .mini+.mini{margin-left:6px}
 
     <div class="chips deck-runtime" id="presets"></div>
 
-    <div class="chips deck-runtime only-music no-fusion" id="chips"></div>
+    <div class="pal deck-runtime only-music no-fusion">
+      <div class="chips" id="chips"></div>
+      <div class="ed" id="ped" hidden>
+        <div class="nm"><img id="pthumb" alt="" hidden>
+          <input class="tx" id="pname" autocomplete="off" spellcheck="false" placeholder="Name" aria-label="Palette name"></div>
+        <div class="sw" id="pswatches"></div>
+        <p class="note err" id="perr"></p>
+        <div class="rows">
+          <div class="r"><label for="phue">Hue</label>
+            <input type="range" class="hue" id="phue" min="0" max="359" step="1"><output id="v-phue"></output></div>
+          <div class="r"><label for="psat">Saturation</label>
+            <input type="range" class="sat" id="psat" min="45" max="100" step="1"><output id="v-psat"></output></div>
+        </div>
+        <div class="acts">
+          <button class="mini" id="pleft" type="button" aria-label="Move left">&larr;</button>
+          <button class="mini" id="pright" type="button" aria-label="Move right">&rarr;</button>
+          <button class="mini" id="prm" type="button">Remove</button>
+          <span class="sp"></span>
+          <button class="link" id="pdel" type="button">Delete</button>
+          <button class="btn" id="pcancel" type="button">Cancel</button>
+          <button class="btn pri" id="psave" type="button">Save</button>
+        </div>
+      </div>
+      <div class="in" id="cpick" hidden>
+        <select id="cmon" aria-label="Display"></select>
+        <div class="shot" id="cshot" tabindex="0" role="group" aria-label="Box around the cover">
+          <img id="cimg" alt="" hidden>
+          <div class="shade" id="cshade" hidden></div>
+          <div class="box" id="cbox" hidden><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i></div>
+        </div>
+        <div class="rline"><span class="sp"></span>
+          <button class="btn" id="cstop" type="button">Cancel</button>
+          <button class="btn pri" id="ctake" type="button" disabled>Take colours</button></div>
+      </div>
+      <div class="cno" id="pno" hidden><img id="pnothumb" alt="">
+        <p class="note warn">No colour in this cover to make a palette from.</p>
+        <button class="btn" id="pnook" type="button">OK</button></div>
+      <input type="file" id="pfile" accept="image/*" hidden>
+    </div>
+    <div class="drop" id="drop" hidden><span>Drop the cover</span></div>
 
     <div class="in deck-runtime only-screen">
       <label for="monitor">Display</label>
@@ -1512,6 +1738,7 @@ td .mini+.mini{margin-left:6px}
 
 <script>
 const P = __PALETTES__;
+const PR = __PAL_RULES__;   // what palettes.py accepts: name length, anchors, saturation
 const BUILTIN = __PRESETS__;
 const $ = id => document.getElementById(id);
 let holdUntil = 0;   // don't let polling stomp a fader you're dragging
@@ -1535,23 +1762,7 @@ function hsv2rgb(h,s,v){
   return [(r+m)*255,(g+m)*255,(b+m)*255].map(Math.round);
 }
 
-// palette chips, each previewing its own anchors
 const chips = $('chips');
-[['auto',null]].concat(Object.keys(P).map(k=>[k,P[k]])).forEach(([name,anchors])=>{
-  const b=document.createElement('button');
-  b.className='chip'; b.type='button'; b.dataset.name=name;
-  b.setAttribute('aria-pressed', name==='auto');
-  const s=document.createElement('s');
-  s.style.background = anchors
-    ? 'linear-gradient(90deg,'+anchors.map(a=>`rgb(${hsv2rgb(a[0],a[1],92)})`).join(',')+')'
-    : 'repeating-linear-gradient(90deg,var(--dim) 0 2px,transparent 2px 5px)';
-  b.append(s, document.createTextNode(name));
-  b.onclick=()=>{
-    [...chips.children].forEach(c=>c.setAttribute('aria-pressed', c===b));
-    send({palette:name});
-  };
-  chips.append(b);
-});
 
 // spectrum bars - 10 audio bands in music mode, 12 hue bins in screen mode
 const spec=$('spec');
@@ -1746,6 +1957,250 @@ function renderPresets(s){
     if(mine.length) mini('Edit',()=>{ pEdit=true; pNaming=false; pKey=''; renderPresets(live); });
   }
 }
+
+/* -------------------------------- palettes -------------------------------- */
+// The built-ins and the user's own, as chips. Edit turns the user's into a
+// name to open in the editor and a mark to delete. The editor works on a
+// copy (ped) and writes it with Save; a cover - dropped, pasted, picked from
+// a file or boxed on a still of the screen - opens it with the colours
+// already taken, and nothing changes on the lamp until Save.
+let pEditMode=false, ped=null, palKey='';
+const own = s => (s && s.palettes) || [];
+const swatch = a => `rgb(${hsv2rgb(a[0],a[1],92)})`;
+const strip = anchors => 'linear-gradient(90deg,'+anchors.map(swatch).join(',')+')';
+function palNames(s){ return Object.keys(P).concat(own(s).map(p=>p.name)); }
+function renderPalettes(s){
+  if(!s) return;
+  const row=chips, mine=own(s);
+  const key=JSON.stringify([mine, s.palette, pEditMode, !!ped, !$('cpick').hidden, s.snapshot_ok]);
+  if(key===palKey) return;
+  palKey=key; row.innerHTML='';
+  if(pEditMode && !mine.length) pEditMode=false;
+  const list=[['auto',null,false]].concat(Object.keys(P).map(k=>[k,P[k],false]), mine.map(p=>[p.name,p.anchors,true]));
+  list.forEach(([name,anchors,isMine])=>{
+    const sw=document.createElement('s');
+    sw.style.background = anchors ? strip(anchors)
+      : 'repeating-linear-gradient(90deg,var(--dim) 0 2px,transparent 2px 5px)';
+    if(pEditMode && isMine){
+      const chip=document.createElement('span'); chip.className='pchip mine own';
+      const nm=document.createElement('button'); nm.type='button'; nm.className='nm';
+      nm.append(sw, document.createTextNode(name)); nm.setAttribute('aria-label','Edit '+name);
+      nm.onclick=()=>openEditor({name, anchors});
+      const x=document.createElement('button'); x.type='button'; x.className='x'; x.textContent='✕';
+      x.setAttribute('aria-label','Delete '+name);
+      x.onclick=()=>palOp({op:'delete', name});
+      chip.append(nm,x); row.append(chip); return;
+    }
+    const b=document.createElement('button');
+    b.className='chip'+(isMine?' own':''); b.type='button'; b.dataset.name=name;
+    b.setAttribute('aria-pressed', name===s.palette);
+    b.append(sw, document.createTextNode(name));
+    b.onclick=()=>{ [...row.querySelectorAll('.chip')].forEach(c=>c.setAttribute('aria-pressed', c===b));
+                    send({palette:name}); };
+    row.append(b);
+  });
+  const mini=(text,fn,pressed)=>{ const b=document.createElement('button'); b.type='button';
+    b.className='mini ghost'; b.textContent=text; b.onclick=fn;
+    if(pressed!==undefined) b.setAttribute('aria-pressed', pressed); row.append(b); };
+  if(pEditMode){ mini('Done',()=>{ pEditMode=false; palKey=''; renderPalettes(live); }); return; }
+  if(!ped){
+    mini('New palette',()=>{
+      const cur=P[s.palette] || (mine.find(p=>p.name===s.palette)||{}).anchors || P[Object.keys(P)[0]];
+      openEditor(null, {anchors:cur});
+    });
+    mini('From a cover',()=>$('pfile').click());
+    if(s.snapshot_ok) mini('From the screen',()=>$('cpick').hidden ? openPick() : closePick(), !$('cpick').hidden);
+  }
+  if(mine.length && !ped && $('cpick').hidden) mini('Edit',()=>{ pEditMode=true; closePick(); palKey=''; renderPalettes(live); });
+}
+async function palOp(body){
+  const r = await post('/api/palettes', body);
+  palKey=''; poll();
+  return r;
+}
+
+// -- the editor --------------------------------------------------------------
+function openEditor(p, from){
+  closePick(); $('pno').hidden=true; pEditMode=false;
+  ped = {orig: p ? p.name : null, anchors: (p ? p.anchors : from.anchors).map(a=>[a[0],a[1]]), sel:0};
+  $('pname').value = p ? p.name : (from.name || '');
+  $('pname').maxLength = PR.name;
+  $('pthumb').hidden = !(from && from.thumb);
+  if(from && from.thumb) $('pthumb').src = from.thumb;
+  $('perr').textContent=''; $('pdel').hidden = !ped.orig;
+  $('ped').hidden=false;
+  paintEditor(); palKey=''; renderPalettes(live);
+  if(!p) $('pname').focus();
+}
+function closeEditor(){ ped=null; $('ped').hidden=true; palKey=''; renderPalettes(live); }
+function paintEditor(){
+  const e=ped, a=e.anchors[e.sel], wrap=$('pswatches');
+  wrap.innerHTML='';
+  e.anchors.forEach((c,i)=>{
+    const b=document.createElement('button'); b.type='button';
+    b.style.background=swatch(c); b.setAttribute('aria-pressed', i===e.sel);
+    b.setAttribute('aria-label', `Colour ${i+1}, hue ${c[0]}, saturation ${c[1]}`);
+    b.onclick=()=>{ e.sel=i; paintEditor(); };
+    wrap.append(b);
+  });
+  const add=document.createElement('button'); add.type='button'; add.className='add'; add.textContent='+';
+  add.setAttribute('aria-label','Add a colour'); add.disabled = e.anchors.length>=PR.max;
+  add.onclick=()=>{ const c=e.anchors[e.sel]; e.anchors.splice(e.sel+1,0,[(c[0]+40)%360,c[1]]); e.sel++; paintEditor(); };
+  wrap.append(add);
+  $('phue').value=a[0]; $('psat').value=a[1];
+  $('v-phue').textContent=a[0]+'°'; $('v-psat').textContent=a[1];
+  $('psat').style.setProperty('--st', `linear-gradient(90deg,${swatch([a[0],PR.sat[0]])},${swatch([a[0],PR.sat[1]])})`);
+  $('prm').disabled = e.anchors.length<=PR.min;
+  $('pleft').disabled = e.sel===0; $('pright').disabled = e.sel===e.anchors.length-1;
+}
+function nudge(){
+  const a=ped.anchors[ped.sel];
+  a[0]=+$('phue').value; a[1]=+$('psat').value;
+  $('perr').textContent='';
+  paintEditor();
+}
+$('phue').addEventListener('input', nudge);
+$('psat').addEventListener('input', nudge);
+$('pleft').onclick=()=>{ const e=ped, i=e.sel; [e.anchors[i-1],e.anchors[i]]=[e.anchors[i],e.anchors[i-1]]; e.sel--; paintEditor(); };
+$('pright').onclick=()=>{ const e=ped, i=e.sel; [e.anchors[i+1],e.anchors[i]]=[e.anchors[i],e.anchors[i+1]]; e.sel++; paintEditor(); };
+$('prm').onclick=()=>{ const e=ped; e.anchors.splice(e.sel,1); e.sel=Math.min(e.sel,e.anchors.length-1); paintEditor(); };
+$('pcancel').onclick=closeEditor;
+$('pdel').onclick=async ()=>{ const r=await palOp({op:'delete', name:ped.orig}); if(r.ok) closeEditor(); else $('perr').textContent=r.error; };
+$('pname').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); $('psave').click(); } });
+$('psave').onclick=async ()=>{
+  const e=ped, name=$('pname').value.trim(), fresh=!e.orig;
+  $('perr').textContent='';
+  if(e.orig && name!==e.orig){
+    const r=await post('/api/palettes', {op:'rename', name:e.orig, to:name});
+    if(!r.ok){ $('perr').textContent=r.error; return; }
+    e.orig=name;
+  }
+  const r=await post('/api/palettes', {op:'save', name, anchors:e.anchors});
+  if(!r.ok){ $('perr').textContent=r.error; palKey=''; poll(); return; }
+  closeEditor();
+  if(fresh) send({palette:name}); else poll();
+};
+
+// -- a cover -----------------------------------------------------------------
+function coverName(file){
+  const base=(file && file.name || '').replace(/\.[^.]*$/,'').replace(/[-_]+/g,' ').replace(/\s+/g,' ').trim();
+  let name = /^(image|img|pasted|screenshot|untitled)\b/i.test(base) || !base ? 'Cover'
+    : base.charAt(0).toUpperCase()+base.slice(1);
+  name=name.slice(0, PR.name);
+  const taken=new Set(palNames(live).map(n=>n.toLowerCase()).concat(['auto','screen']));
+  for(let i=2, b=name.slice(0, PR.name-3); taken.has(name.toLowerCase()); i++) name=b+' '+i;
+  return name;
+}
+async function fromCover(src, name){
+  // shrink to PR.side px in the browser, which also decodes it: the desk
+  // needs no image library and the picture never leaves this machine
+  const w0=src.width, h0=src.height, k=Math.min(1, PR.side/Math.max(w0,h0));
+  const w=Math.max(1,Math.round(w0*k)), h=Math.max(1,Math.round(h0*k));
+  const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+  const cx=cv.getContext('2d'); cx.drawImage(src,0,0,w,h);
+  const px=cx.getImageData(0,0,w,h).data, rgb=new Uint8Array(w*h*3);
+  for(let i=0,j=0;i<px.length;i+=4){ rgb[j++]=px[i]; rgb[j++]=px[i+1]; rgb[j++]=px[i+2]; }
+  let bin=''; for(let i=0;i<rgb.length;i+=0x8000) bin+=String.fromCharCode.apply(null, rgb.subarray(i,i+0x8000));
+  const thumb=cv.toDataURL('image/png');
+  const r=await post('/api/palettes/extract', {w, h, rgb:btoa(bin)});
+  closePick();
+  if(!r.ok) return;
+  if(r.anchors) openEditor(null, {name, anchors:r.anchors, thumb});
+  else{ closeEditor(); $('pnothumb').src=thumb; $('pno').hidden=false; }
+}
+async function fromFile(file){
+  if(!file || !/^image\//.test(file.type) || modeOf(live||{})!=='music') return;
+  try{ const bmp=await createImageBitmap(file); await fromCover(bmp, coverName(file)); bmp.close && bmp.close(); }
+  catch(e){ /* not a picture the browser can read */ }
+}
+$('pfile').addEventListener('change', ()=>{ fromFile($('pfile').files[0]); $('pfile').value=''; });
+$('pnook').onclick=()=>{ $('pno').hidden=true; };
+document.addEventListener('paste', e=>{
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement||{}).tagName||'')) return;
+  const f=[...(e.clipboardData ? e.clipboardData.files : [])].find(f=>/^image\//.test(f.type));
+  if(f){ e.preventDefault(); fromFile(f); }
+});
+// a file dragged over the desk: the side column becomes the place to drop it
+let dragDepth=0;
+const droppable = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files')
+  && document.body.dataset.deck==='runtime' && document.body.dataset.mode==='music';
+document.addEventListener('dragenter', e=>{ if(!droppable(e)) return; dragDepth++; $('drop').hidden=false; });
+document.addEventListener('dragleave', e=>{ if(!droppable(e)) return; if(--dragDepth<=0){ dragDepth=0; $('drop').hidden=true; } });
+document.addEventListener('dragover', e=>{ if(droppable(e)) e.preventDefault(); });
+document.addEventListener('drop', e=>{
+  if(!droppable(e)) return;
+  e.preventDefault(); dragDepth=0; $('drop').hidden=true;
+  fromFile([...e.dataTransfer.files].find(f=>/^image\//.test(f.type)));
+});
+
+// -- a box on a still of the screen --------------------------------------------
+// The box is kept in 0..1 of the still, which is all a crop needs.
+let cbox=null, cdrag=null;
+function openPick(){
+  closeEditor(); $('pno').hidden=true;
+  const sel=$('cmon');
+  sel.innerHTML = live.monitors.map(m=>`<option value="${m.i}">Display ${m.i}, ${m.w} × ${m.h}</option>`).join('');
+  sel.value = live.monitor; sel.hidden = live.monitors.length<2;
+  $('cpick').hidden=false; cbox=null; paintPick(); loadPick();
+  palKey=''; renderPalettes(live);
+}
+function closePick(){ if($('cpick').hidden) return; $('cpick').hidden=true; cbox=null; cdrag=null; palKey=''; renderPalettes(live); }
+function loadPick(){
+  const m=live.monitors.find(m=>m.i===+$('cmon').value); if(!m) return;
+  $('cshot').style.aspectRatio = m.w+'/'+m.h;
+  const img=$('cimg');
+  img.onload=()=>{ img.hidden=false; }; img.onerror=()=>{ img.hidden=true; };
+  img.src='/api/snapshot?monitor='+m.i+'&t='+Date.now();
+}
+$('cmon').addEventListener('change', ()=>{ cbox=null; paintPick(); loadPick(); });
+$('cstop').onclick=closePick;
+function paintPick(){
+  const has=!!cbox;
+  $('cbox').hidden=$('cshade').hidden=!has; $('ctake').disabled=!has;
+  if(!has) return;
+  const [L,T,W,H]=cbox.map(v=>v*100);
+  Object.assign($('cbox').style,{left:L+'%',top:T+'%',width:W+'%',height:H+'%'});
+  $('cshade').style.clipPath=`polygon(0 0,100% 0,100% 100%,0 100%,0 ${T}%,${L}% ${T}%,${L}% ${T+H}%,${L+W}% ${T+H}%,${L+W}% ${T}%,0 ${T}%)`;
+}
+function cpt(e){ const b=$('cshot').getBoundingClientRect();
+  return [Math.max(0,Math.min(1,(e.clientX-b.left)/b.width)), Math.max(0,Math.min(1,(e.clientY-b.top)/b.height))]; }
+$('cshot').addEventListener('pointerdown', e=>{
+  if(e.button>0) return;
+  const p=cpt(e), h=e.target.dataset && e.target.dataset.h, r=cbox;
+  if(h && r) cdrag={kind:'size', ax:h.includes('w')?r[0]+r[2]:r[0], ay:h.includes('n')?r[1]+r[3]:r[1]};
+  else if(r && e.target===$('cbox')) cdrag={kind:'move', dx:p[0]-r[0], dy:p[1]-r[1]};
+  else cdrag={kind:'size', ax:p[0], ay:p[1]};
+  $('cshot').setPointerCapture(e.pointerId); e.preventDefault();
+});
+$('cshot').addEventListener('pointermove', e=>{
+  if(!cdrag) return;
+  const p=cpt(e);
+  if(cdrag.kind==='move'){ const [,,w,h]=cbox;
+    cbox=[Math.max(0,Math.min(1-w,p[0]-cdrag.dx)), Math.max(0,Math.min(1-h,p[1]-cdrag.dy)), w, h]; }
+  else cbox=[Math.min(cdrag.ax,p[0]), Math.min(cdrag.ay,p[1]), Math.abs(p[0]-cdrag.ax), Math.abs(p[1]-cdrag.ay)];
+  paintPick();
+});
+const cend=()=>{ if(!cdrag) return; cdrag=null; if(cbox && (cbox[2]<0.01 || cbox[3]<0.01)){ cbox=null; } paintPick(); };
+$('cshot').addEventListener('pointerup', cend);
+$('cshot').addEventListener('pointercancel', cend);
+$('cshot').addEventListener('keydown', e=>{
+  const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];
+  if(!d || !cbox) return;
+  e.preventDefault();
+  let [x,y,w,h]=cbox; const st=0.01;
+  if(e.shiftKey){ w=Math.max(0.02,Math.min(1-x,w+d[0]*st)); h=Math.max(0.02,Math.min(1-y,h+d[1]*st)); }
+  else{ x=Math.max(0,Math.min(1-w,x+d[0]*st)); y=Math.max(0,Math.min(1-h,y+d[1]*st)); }
+  cbox=[x,y,w,h]; paintPick();
+});
+$('ctake').onclick=()=>{
+  const img=$('cimg'); if(!cbox || img.hidden || !img.naturalWidth) return;
+  const W=img.naturalWidth, H=img.naturalHeight;
+  const sx=Math.round(cbox[0]*W), sy=Math.round(cbox[1]*H);
+  const sw=Math.max(1,Math.round(cbox[2]*W)), sh=Math.max(1,Math.round(cbox[3]*H));
+  const cv=document.createElement('canvas'); cv.width=sw; cv.height=sh;
+  cv.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  fromCover(cv, coverName(null));
+};
 
 /* ------------------------------ audio input ------------------------------ */
 // The device list costs a CoreAudio walk, so it is fetched on load and when
@@ -1946,7 +2401,7 @@ async function poll(){
     if(Date.now() > holdUntil){
       $('calm').checked = s.calm;
       $('auto').checked = s.auto;
-      [...chips.children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.name===s.palette));
+      renderPalettes(s);
       [...$('modes').children].forEach(c=>{
         c.setAttribute('aria-pressed', c.dataset.mode===mode);
         c.classList.toggle('off', s.auto && !s.screen_ok && c.dataset.mode!=='music');
@@ -2192,6 +2647,10 @@ class Handler(BaseHTTPRequestHandler):
             self._snapshot()
         elif self.path in ("/", "/index.html"):
             page = (PAGE.replace("__PALETTES__", json.dumps(PALETTES))
+                        .replace("__PAL_RULES__", json.dumps({
+                            "name": pal_rules.NAME_MAX, "min": pal_rules.MIN_ANCHORS,
+                            "max": pal_rules.MAX_ANCHORS, "sat": pal_rules.SAT_RANGE,
+                            "side": ART_SIDE}))
                         .replace("__PRESETS__", json.dumps(BUILTIN_PRESETS)))
             self._send(200, page, "text/html; charset=utf-8")
         else:
@@ -2206,6 +2665,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/presets"):
             self._do_presets()
             return
+        if self.path.startswith("/api/palettes/extract"):
+            body = self._body()
+            anchors, error = extract_palette(body)
+            self._json(400 if error else 200,
+                       {"ok": not error, "error": error,
+                        "anchors": [list(a) for a in anchors] if anchors else None})
+            return
+        if self.path.startswith("/api/palettes"):
+            self._do_palettes()
+            return
         if not self.path.startswith("/api/control"):
             self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
@@ -2217,7 +2686,9 @@ class Handler(BaseHTTPRequestHandler):
         snap = self.state.snapshot()
         # a preset is its look, applied like any other change; the list itself
         # changes only through /api/presets
-        patch.pop("presets", None) if isinstance(patch, dict) else None
+        if isinstance(patch, dict):
+            patch.pop("presets", None)
+            patch.pop("palettes", None)
         if isinstance(patch, dict) and "preset" in patch:
             found = find_preset(patch.pop("preset"), snap)
             if found:
@@ -2258,6 +2729,16 @@ class Handler(BaseHTTPRequestHandler):
         presets, error = preset_op(body, self.state.snapshot())
         if not error:
             self.state.control(presets=presets)
+        self._json(200 if not error else 400, {"ok": not error, "error": error})
+
+    def _do_palettes(self):
+        body = self._body()
+        if body is None:
+            self._send(400, "bad json", "text/plain")
+            return
+        patch, error = palette_op(body, self.state.snapshot())
+        if not error:
+            self.state.control(**patch)
         self._json(200 if not error else 400, {"ok": not error, "error": error})
 
     def _snapshot(self):
@@ -2337,6 +2818,10 @@ def main():
     p.add_argument("--no-restore", dest="restore", action="store_false",
                    help="leave the lamp on the last colour sent when the desk "
                         "stops, instead of putting back what it showed before")
+    p.add_argument("--capture", choices=CAPTURE_BACKENDS, default="auto",
+                   help="screen capture: a ScreenCaptureKit stream (sck), one "
+                        f"mss grab per frame (mss), or auto (= {AUTO_CAPTURE}); "
+                        "a stream that fails falls back to mss")
     p.add_argument("--allow-remote-login", action="store_true",
                    help="permit the Xiaomi cloud login from a non-loopback "
                         "bind; the desk has no authentication, so only on a "
@@ -2359,7 +2844,7 @@ def main():
         saved["mic"] = args.mic
     state = State(saved, store=store, local=loopback)
     store.attach(state)
-    engine = Engine(state, restore=args.restore)
+    engine = Engine(state, restore=args.restore, capture=args.capture)
     engine.start()
     Handler.state = state
     Handler.cloud = CloudSession()
