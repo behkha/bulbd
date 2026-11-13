@@ -38,10 +38,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
-                        LevelEngine, Sender, pick_recorder, enable_lan,
+                        LevelEngine, pick_recorder, enable_lan,
                         ScreenGrabber, ScreenColorEngine, ScreenColorThread,
                         CapturePacer, crop_letterbox, screen_permission,
-                        open_bulb, release_bulb)
+                        Link, BulbUnreachable, White, screen_frame, same_light,
+                        ramp_ms, BeatSync, LED_GAP, AutoPicker, MotionMeter)
 
 # The cloud half is optional: it pulls in requests/PIL/pycryptodome, and a
 # desk that only drives an already-provisioned bulb should still start
@@ -77,15 +78,46 @@ def screen_monitors():
 NUMERIC = {                         # key: (low, high, type) - the faders' ranges
     "sensitivity": (0.6, 2.6, float), "gamma": (1.0, 3.0, float),
     "punch": (0.2, 1.0, float), "fps": (5, 30, int), "fade": (0.0, 6.0, float),
+    "lead": (0, 250, int),          # beat sync, ms early; 0 = flash when heard
     "screen_fps": (4, 30, int), "screen_gamma": (0.4, 1.6, float),
     "min_sat": (0.0, 90.0, float), "sat_boost": (0.8, 2.0, float),
 }
 MODES = ("music", "screen", "fusion")
+# What a preset holds: how the light looks. Never the address, input, display
+# or area (they describe the room, not the look), and never Beat sync, which
+# is set once for the network and speakers.
+LOOK_KEYS = ("mode", "auto", "palette", "calm", "sensitivity", "gamma", "punch",
+             "fps", "fade", "screen_fps", "screen_gamma", "min_sat", "sat_boost")
+LOOK_DEFAULTS = {"mode": "music", "auto": False, "palette": "auto", "calm": False,
+                 "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
+                 "fade": 0.0, "screen_fps": 10, "screen_gamma": 0.75,
+                 "min_sat": 55.0, "sat_boost": 1.35}
+# Built-in looks. Each sets every look key, so applying one always gives the
+# same light whatever came before; keys its mode does not use stay at the
+# defaults above.
+BUILTIN_PRESETS = [
+    # dance music: more onsets pass (1.2), deeper dips between hits (2.3),
+    # hits near full, colour steps snapping
+    {"name": "Club", "look": dict(LOOK_DEFAULTS, sensitivity=1.2, gamma=2.3, punch=0.95)},
+    # background music: only the clear beats (1.9), a flatter level (1.5),
+    # soft hits, the calm decays, and the hue sweeping between anchors
+    {"name": "Lounge", "look": dict(LOOK_DEFAULTS, calm=True, sensitivity=1.9, gamma=1.5,
+                                    punch=0.45, fps=20, fade=2.5)},
+    # films: slower follow (calm), dark scenes left darker (0.9), pastel
+    # grading kept pastel (floor 40, boost 1.15)
+    {"name": "Cinema", "look": dict(LOOK_DEFAULTS, mode="screen", calm=True, screen_gamma=0.9,
+                                    min_sat=40.0, sat_boost=1.15)},
+    # concert films and music videos: the picture's colour, the music's hits
+    {"name": "Concert", "look": dict(LOOK_DEFAULTS, mode="fusion", gamma=2.0, punch=0.85,
+                                     screen_fps=12)},
+]
+MAX_PRESETS = 24
+PRESET_NAME_MAX = 32
 MIN_REGION = 32                     # points; smaller than this is a mis-click
 # what survives a restart. Never `running` (the lamp must not start on its
 # own) and nothing from the cloud login (no secret touches disk).
-SAVED_KEYS = ("ip", "mic", "mode", "palette", "calm", *NUMERIC,
-              "monitor", "region")
+SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
+              "monitor", "region", "presets")
 
 
 def _number(v):
@@ -109,6 +141,93 @@ def clean_region(region, mon):
     return [x, y, w, h]
 
 
+def clean_name(name):
+    """A preset name as it will be kept, or None if it cannot be one."""
+    if not isinstance(name, str):
+        return None
+    name = " ".join(name.split())
+    if not name or len(name) > PRESET_NAME_MAX or not name.isprintable():
+        return None
+    return name
+
+
+def clean_look(look, snap):
+    """The look keys of `look` that are valid, through clean_patch."""
+    if not isinstance(look, dict):
+        return {}
+    return clean_patch({k: look[k] for k in LOOK_KEYS if k in look}, snap)
+
+
+def clean_presets(presets, snap):
+    """The user's presets from a file or the desk: a list of {name, look},
+    names unique (case aside) and not a built-in's, looks cleaned. Anything
+    broken is dropped on its own."""
+    if not isinstance(presets, list):
+        return []
+    taken = {p["name"].casefold() for p in BUILTIN_PRESETS}
+    out = []
+    for p in presets[:MAX_PRESETS]:
+        if not isinstance(p, dict):
+            continue
+        name = clean_name(p.get("name"))
+        look = clean_look(p.get("look"), snap)
+        if name is None or name.casefold() in taken or not look:
+            continue
+        taken.add(name.casefold())
+        out.append({"name": name, "look": look})
+    return out
+
+
+def find_preset(name, snap):
+    for p in BUILTIN_PRESETS + list(snap.get("presets") or []):
+        if p["name"] == name:
+            return p
+    return None
+
+
+def preset_op(op, snap):
+    """Save, rename or delete one of the user's presets.
+    -> (new list of presets, error or "")."""
+    mine = [dict(p) for p in snap.get("presets") or []]
+    if not isinstance(op, dict):
+        return mine, "bad request"
+    kind, name = op.get("op"), clean_name(op.get("name"))
+    builtin = {p["name"].casefold() for p in BUILTIN_PRESETS}
+    index = next((i for i, p in enumerate(mine) if name and p["name"] == name), None)
+    if kind == "save":
+        if name is None:
+            return mine, "Give the preset a name."
+        if name.casefold() in builtin:
+            taken = next(p["name"] for p in BUILTIN_PRESETS
+                         if p["name"].casefold() == name.casefold())
+            return mine, f"{taken} is a built-in preset. Choose another name."
+        look = clean_look({k: snap[k] for k in LOOK_KEYS}, snap)
+        if index is not None:
+            mine[index] = {"name": name, "look": look}
+        elif any(p["name"].casefold() == name.casefold() for p in mine):
+            return mine, f"There is already a preset called {name}."
+        elif len(mine) >= MAX_PRESETS:
+            return mine, f"{MAX_PRESETS} presets is the most the desk keeps."
+        else:
+            mine.append({"name": name, "look": look})
+        return mine, ""
+    if index is None:
+        return mine, "No such preset of yours."
+    if kind == "delete":
+        del mine[index]
+        return mine, ""
+    if kind == "rename":
+        to = clean_name(op.get("to"))
+        if to is None:
+            return mine, "Give the preset a name."
+        if to.casefold() in builtin or any(
+                p["name"].casefold() == to.casefold() for i, p in enumerate(mine) if i != index):
+            return mine, f"There is already a preset called {to}."
+        mine[index] = {"name": to, "look": mine[index]["look"]}
+        return mine, ""
+    return mine, "bad request"
+
+
 def clean_patch(patch, snap):
     """The subset of `patch` that is valid against the current state, with
     numbers clamped to the faders' ranges. Unknown keys are dropped."""
@@ -120,7 +239,7 @@ def clean_patch(patch, snap):
         if _number(v):
             v = min(max(v, lo), hi)
             out[key] = int(round(v)) if kind is int else float(v)
-    for key in ("running", "calm"):
+    for key in ("running", "calm", "auto"):
         if isinstance(patch.get(key), bool):
             out[key] = patch[key]
     if patch.get("palette") == "auto" or patch.get("palette") in PALETTES:
@@ -131,6 +250,10 @@ def clean_patch(patch, snap):
         ip = str(patch["ip"] or "").strip()
         if HOSTNAME_RE.match(ip):
             out["ip"] = ip
+    if "did" in patch:                  # the bulb's miio id, learned by Link
+        did = patch["did"]
+        if did is None or (_number(did) and int(did) == did and 0 <= did < 2 ** 32):
+            out["did"] = None if did is None else int(did)
     if "mic" in patch:                  # None is the automatic choice
         mic = patch["mic"]
         if mic is None or mic == "":
@@ -149,6 +272,8 @@ def clean_patch(patch, snap):
                 patch["region"], mons.get(out.get("monitor", snap.get("monitor"))))
         except ValueError:
             pass
+    if "presets" in patch:              # from the settings file; the page uses /api/presets
+        out["presets"] = clean_presets(patch["presets"], snap)
     return out
 
 
@@ -266,17 +391,24 @@ class State:
         # the engine parks on `started` instead of polling for a session, and
         # a loop idling on a still picture ends its wait early on `changed`
         self.started = threading.Event()
+        self.stopped = threading.Event()        # the inverse: ends a reconnect wait
+        self.stopped.set()
         self.changed = threading.Event()
         self.store = store
         mons = screen_monitors()
         screen_ok = screen_permission() is not False
         self._d = {
-            "ip": "", "mic": None,
+            "ip": "", "did": None, "mic": None,
             "running": False, "status": "idle",
+            # the note under the top bar: None or {kind, text, action}
+            "notice": None,
             "mode": "music",
+            # Auto picks the mode; `mode` keeps the last one chosen by hand
+            "auto": False, "auto_mode": None,
             "palette": "auto", "calm": False,
             "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
-            "fade": 0.0,
+            "fade": 0.0, "lead": 80,
+            "presets": [],                  # the user's own; BUILTIN_PRESETS are fixed
             # screen mode
             "monitor": mons[0]["i"] if mons else 1,
             "screen_fps": 10, "screen_gamma": 0.75,
@@ -288,7 +420,7 @@ class State:
             # of the user's screen, so only a desk bound to loopback serves it
             "snapshot_ok": bool(local and mons and screen_ok),
             # telemetry
-            "hue": 0, "sat": 0, "val": 0, "bpm": 0.0,
+            "hue": 0, "sat": 0, "val": 0, "white": False, "ct": 0, "bpm": 0.0,
             "level": 0.0, "hit": 0.0, "bands": [0.0] * 10,
             "input_db": None, "signal": True,
             "active_palette": "ember", "device": "-",
@@ -305,6 +437,7 @@ class State:
             self._d.update(kw)
             if "running" in kw:
                 (self.started.set if kw["running"] else self.started.clear)()
+                (self.stopped.clear if kw["running"] else self.stopped.set)()
 
     def control(self, **kw):
         """set(), for a change that came from the desk rather than telemetry."""
@@ -368,6 +501,61 @@ def audio_inputs():
     return {"inputs": names, "auto": auto}
 
 
+class MotionProbe(threading.Thread):
+    """Music mode under Auto: is the picture moving? One grab every
+    MotionMeter.PROBE seconds - a twentieth of screen mode's 10 a second -
+    and half that after a minute of stillness, into the picker."""
+
+    def __init__(self, grab, picker):
+        super().__init__(daemon=True)
+        self.grab, self.picker = grab, picker
+        self.meter = MotionMeter()
+        self.halt = threading.Event()
+
+    def run(self):
+        still_since = time.monotonic()
+        wait = 0.0
+        while not self.halt.wait(wait):
+            now = time.monotonic()
+            try:
+                moving = self.meter.feed(self.grab.frame(), now)
+            except Exception:
+                return                          # display gone: the picker keeps its view
+            self.picker.feed_motion(moving, now)
+            if moving:
+                still_since = now
+            wait = MotionMeter.PROBE * (2 if now - still_since > 60 else 1)
+
+    def close(self):
+        self.halt.set()
+        self.join(2)
+        self.grab.close()
+
+
+class SoundProbe(threading.Thread):
+    """Screen mode under Auto: is there sound? Reads the input in 93 ms
+    blocks and keeps only the level - no analysis, nothing sent."""
+
+    def __init__(self, recorder, picker):
+        super().__init__(daemon=True)
+        self.recorder, self.picker = recorder, picker
+        self.halt = threading.Event()
+
+    def run(self):
+        try:
+            with self.recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
+                while not self.halt.is_set():
+                    pcm = rec.record(numframes=4 * BLOCK)
+                    self.picker.feed_sound(float(np.sqrt(np.mean(np.square(pcm)))),
+                                           time.monotonic())
+        except Exception:
+            return                              # input gone: no sound to report
+
+    def close(self):
+        self.halt.set()
+        self.join(2)
+
+
 def region_box(cfg):
     """The absolute X, Y, W, H for ScreenGrabber, or None for the whole display."""
     region = cfg.get("region")
@@ -396,6 +584,17 @@ def display_snapshot(monitor, width=640):
 
 
 # ---------------------------------------------------------------------------
+def light_telemetry(light, hue, level):
+    """What the page needs to paint the light: hue/sat/val on the colour
+    LEDs' scale always, and for a White frame its temperature. `val` stays
+    the matched level, not the white LEDs' own number, so the colour field
+    does not jump when the lamp changes LEDs."""
+    if isinstance(light, White):
+        return {"hue": int(round(hue)) % 360, "sat": 0, "val": int(level),
+                "white": True, "ct": light.ct}
+    return {"hue": light[0], "sat": light[1], "val": light[2], "white": False, "ct": 0}
+
+
 def apply_palette(color, name):
     if name == "auto":
         color.locked = False
@@ -416,6 +615,28 @@ class Engine(threading.Thread):
         self.restore = restore
         self.idle = threading.Event()           # set while parked, for a clean exit
         self.idle.set()
+        self.picker = None                      # an AutoPicker while Auto is on
+
+    def _mode(self, cfg):
+        """The mode to run: the picker's choice under Auto, else the desk's.
+        None right after Auto is switched, which ends the running loop so the
+        session can start the next one with (or without) its probe."""
+        if bool(cfg["auto"]) != (self.picker is not None):
+            return None
+        if self.picker is None:
+            return cfg["mode"]
+        mode = self.picker.pick(time.monotonic())
+        if mode != cfg["auto_mode"]:
+            self.state.set(auto_mode=mode)
+        return mode
+
+    def _watch(self, cfg, start=None):
+        """Keep the picker in step with the Auto switch."""
+        if not cfg["auto"]:
+            self.picker = None
+        elif self.picker is None:
+            self.picker = AutoPicker(screen_permission() is not False,
+                                     now=time.monotonic(), start=start)
 
     def run(self):
         while True:
@@ -424,6 +645,10 @@ class Engine(threading.Thread):
             self.idle.clear()
             try:
                 self._session()
+            except BulbUnreachable as exc:
+                self.state.set(running=False, status="error", notice={
+                    "kind": "err", "text": str(exc), "action": exc.action})
+                time.sleep(0.5)
             except Exception as exc:
                 self.state.set(running=False, status=f"error: {exc}")
                 time.sleep(0.5)
@@ -446,31 +671,50 @@ class Engine(threading.Thread):
             return
         # fail on a missing input or permission before the bulb is touched:
         # opening it turns the lamp on, and a restore right after would flash
-        if cfg["mode"] != "screen" and cfg["mic"]:
+        if (cfg["auto"] or cfg["mode"] != "screen") and cfg["mic"]:
             open_recorder(cfg["mic"])
-        if cfg["mode"] != "music" and screen_permission() is False:
+        if not cfg["auto"] and cfg["mode"] != "music" and screen_permission() is False:
             raise RuntimeError("no Screen Recording permission - grant it in "
                                "System Settings > Privacy & Security")
-        st.set(status="connecting")
+        # Auto starts in fusion, which hears and sees everything, and makes
+        # its first real pick after AutoPicker.SETTLE seconds
+        self.picker = None
+        self._watch(cfg)
 
-        bulb = open_bulb(cfg["ip"], remember=self.restore,
-                         on_attempt=lambda n, total, err: st.set(
-                             status=f"connecting {n}/{total}" + (f" - {err}" if err else "")))
-        sender = Sender(bulb)
-        sender.start()
+        # Link owns the connection: it finds a bulb that moved, explains one
+        # it cannot reach, and reconnects after a drop until Stop is pressed
+        def report(word, notice=None):
+            st.set(status=word, notice=notice and {
+                "kind": notice[0], "text": notice[1], "action": None})
+
+        def moved(ip, did):
+            # a new address or a newly learned id is saved like any setting
+            st.control(ip=ip, did=did)
+
+        link = Link(cfg["ip"], did=cfg["did"], remember=self.restore,
+                    status=report, stopped=st.stopped, moved=moved)
+        if not link.open():
+            st.set(status="stopped")
+            return
         loops = {"music": self._audio_loop, "screen": self._screen_loop,
                  "fusion": self._fusion_loop}
         try:
             while True:
                 cfg = st.snapshot()
-                if not cfg["running"] or cfg["ip"] != bulb._ip:
+                if not cfg["running"] or cfg["ip"] != link.ip:
                     break
-                loops.get(cfg["mode"], self._audio_loop)(st, sender)
+                if link.lost:
+                    if not link.recover():
+                        break                   # Stop pressed while reconnecting
+                    continue
+                # Auto turned on mid-session starts from the mode running now
+                self._watch(cfg, start=cfg["mode"])
+                loops.get(self._mode(cfg), self._audio_loop)(st, link)
         finally:
-            sender.stop()
-            if self.restore and bulb.bulbd_saved:
+            self.picker = None
+            if self.restore and link.saved and not link.lost:
                 st.set(status="restoring the lamp")
-            release_bulb(bulb, restore=self.restore)
+            link.close(restore=self.restore)
             st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10,
                    input_db=None, signal=True)
 
@@ -494,11 +738,17 @@ class Engine(threading.Thread):
         last = time.monotonic()
         last_hsv = None
         cut_env = 0.0
+        # under Auto, listen for sound - the one input this loop does not use
+        picker, meter, ears = self.picker, MotionMeter(), None
+        if picker is not None:
+            with contextlib.suppress(Exception):
+                ears = SoundProbe(open_recorder(cfg["mic"]), picker)
+                ears.start()
 
         try:
             while True:
                 cfg = st.snapshot()
-                if not cfg["running"] or cfg["mode"] != "screen":
+                if not cfg["running"] or self._mode(cfg) != "screen" or sender.lost:
                     break
                 if cfg["monitor"] != monitor or cfg["region"] != region:
                     break                       # recapture the new display or box
@@ -515,28 +765,26 @@ class Engine(threading.Thread):
                     dt, *color.measure(crop_letterbox(frame)))
                 base = 1.0 / max(cfg["screen_fps"], 4)
                 period = pacer.period(frame, max(cfg["screen_fps"], 4), now)
+                if picker is not None:
+                    picker.feed_motion(meter.feed(frame, now), now)
 
                 v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
-                hsv = (int(round(hue)) % 360, int(round(sat)), v)
+                light = screen_frame(color, hue, sat, v)
 
                 # hue histogram, folded to 12 bars for the UI
                 cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                 hist = color.hist.reshape(12, 3).sum(axis=1)
                 peak = float(hist.max())
-                st.set(hue=hsv[0], sat=hsv[1], val=hsv[2],
+                st.set(**light_telemetry(light, hue, v),
                        level=round(float(val), 3), hit=round(cut_env, 3),
                        bands=[round(float(b) / peak, 3) for b in hist]
                              if peak > 0 else [0.0] * 12)
 
-                settled = (last_hsv and not cut
-                           and abs(hsv[2] - last_hsv[2]) < 2
-                           and abs(hsv[1] - last_hsv[1]) < 3
-                           and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
-                if not settled:
+                if cut or not same_light(light, last_hsv):
                     # ramp for one frame gap so consecutive colours join up
-                    sender.put(hsv, sudden=cut,
-                               duration=int(np.clip(period * 1000, 30, 150)))
-                    last_hsv = hsv
+                    sender.put(light, sudden=cut,
+                               duration=ramp_ms(light, last_hsv, period))
+                    last_hsv = light
 
                 slack = base - (time.monotonic() - now)
                 if slack > 0:
@@ -548,6 +796,8 @@ class Engine(threading.Thread):
                 st.changed.clear()
         finally:
             grab.close()
+            if ears is not None:
+                ears.close()
 
     # -- music mode ---------------------------------------------------------
     def _audio_loop(self, st, sender):
@@ -555,6 +805,7 @@ class Engine(threading.Thread):
         analyser = Analyser()
         color = ColorEngine(None, calm=cfg["calm"], fade=cfg["fade"])
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
+        sync = BeatSync()
         mic = cfg["mic"]
         recorder = open_recorder(mic)
         st.set(device=str(getattr(recorder, "name", recorder))[:48])
@@ -564,13 +815,20 @@ class Engine(threading.Thread):
         last_sent = 0.0
         last_hsv = None
         st.set(status="running")
+        # under Auto, glance at the screen - the one input this loop does not use
+        picker, eyes = self.picker, None
+        if picker is not None and picker.screen_ok:
+            with contextlib.suppress(Exception):
+                eyes = MotionProbe(ScreenGrabber(cfg["monitor"], region_box(cfg),
+                                                 cfg["screen_width"]), picker)
+                eyes.start()
 
         try:
             with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
                 while True:
                     cfg = st.snapshot()
-                    if not cfg["running"] or cfg["mode"] != "music" \
-                            or cfg["mic"] != mic:
+                    if not cfg["running"] or self._mode(cfg) != "music" \
+                            or cfg["mic"] != mic or sender.lost:
                         break
 
                     analyser.sensitivity = cfg["sensitivity"]
@@ -580,15 +838,17 @@ class Engine(threading.Thread):
                     apply_palette(color, cfg["palette"])
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
-                    if lvl.feed(f, dt):
-                        color.step(f["t"], f["beat"])
+                    fired = sync.feed(f, lvl, dt, cfg["lead"] / 1000.0, color)
 
                     color.maybe_switch(f["t"], f["bands"])
                     hue, sat = color.tick(dt, f["treble"], f["t"])
 
                     now = time.monotonic()
                     watch.feed(f["rms"], now)
-                    if now - last_sent < 1.0 / max(cfg["fps"], 5):
+                    if picker is not None:
+                        picker.feed_sound(f["rms"], now)
+                    # a predicted beat goes out on its block, not the next free one
+                    if now - last_sent < (LED_GAP if fired else 1.0 / max(cfg["fps"], 5)):
                         continue
 
                     val = int(round(np.clip(
@@ -596,7 +856,7 @@ class Engine(threading.Thread):
                     hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
                     input_db, signal = watch.read(now)
-                    st.set(hue=hsv[0], sat=hsv[1], val=hsv[2],
+                    st.set(hue=hsv[0], sat=hsv[1], val=hsv[2], white=False, ct=0,
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            level=round(lvl.brightness, 3),
                            hit=round(lvl.hit, 3),
@@ -604,9 +864,7 @@ class Engine(threading.Thread):
                            input_db=input_db, signal=signal,
                            active_palette=color.pal)
 
-                    if last_hsv and abs(hsv[2] - last_hsv[2]) < 2 \
-                            and abs(hsv[1] - last_hsv[1]) < 3 \
-                            and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 2:
+                    if not fired and same_light(hsv, last_hsv, hue_tol=2):
                         continue
 
                     fading = color.fade_t is not None
@@ -615,6 +873,8 @@ class Engine(threading.Thread):
                                    1000.0 / max(cfg["fps"], 5), 30, 150)))
                     last_sent, last_hsv = now, hsv
         finally:
+            if eyes is not None:
+                eyes.close()
             st.set(bands=[0.0] * 10, input_db=None, signal=True)
 
     # -- fusion mode: colour from the display, brightness from the audio ----
@@ -627,15 +887,20 @@ class Engine(threading.Thread):
         monitor, region, mic = cfg["monitor"], cfg["region"], cfg["mic"]
         analyser = Analyser()
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
+        sync = BeatSync()
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
                                   sat_boost=cfg["sat_boost"],
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
         # the grab runs on its own thread: a ~26 ms capture inline would
         # starve rec.record() and drag the onsets behind the music
         recorder = open_recorder(mic)
+        picker, meter = self.picker, MotionMeter()
         screen = ScreenColorThread(ScreenGrabber(monitor, region_box(cfg),
                                                  cfg["screen_width"]),
-                                   color, fps=cfg["screen_fps"])
+                                   color, fps=cfg["screen_fps"],
+                                   on_frame=None if picker is None else
+                                   lambda frame, now: picker.feed_motion(
+                                       meter.feed(frame, now), now))
         watch = SignalWatch()
         dt = analyser.dt
         last_sent = 0.0
@@ -650,7 +915,7 @@ class Engine(threading.Thread):
             with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
                 while True:
                     cfg = st.snapshot()
-                    if not cfg["running"] or cfg["mode"] != "fusion":
+                    if not cfg["running"] or self._mode(cfg) != "fusion" or sender.lost:
                         break
                     if cfg["monitor"] != monitor or cfg["region"] != region \
                             or cfg["mic"] != mic:
@@ -670,38 +935,37 @@ class Engine(threading.Thread):
                         screen.poke()
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
-                    lvl.feed(f, dt)             # accents move brightness only
+                    # accents move brightness only
+                    fired = sync.feed(f, lvl, dt, cfg["lead"] / 1000.0)
 
                     now = time.monotonic()
                     watch.feed(f["rms"], now)
-                    if now - last_sent < 1.0 / max(cfg["fps"], 5):
+                    if picker is not None:
+                        picker.feed_sound(f["rms"], now)
+                    if now - last_sent < (LED_GAP if fired else 1.0 / max(cfg["fps"], 5)):
                         continue
 
                     hue, sat, _val, cut = screen.read()
                     val = int(round(np.clip(
                         4 + 96 * (lvl.brightness ** cfg["gamma"]), 1, 100)))
-                    hsv = (int(round(hue)) % 360, int(round(sat)), val)
+                    light = screen_frame(screen, hue, sat, val)
 
                     cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                     input_db, signal = watch.read(now)
-                    st.set(hue=hsv[0], sat=hsv[1], val=hsv[2],
+                    st.set(**light_telemetry(light, hue, val),
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            level=round(lvl.brightness, 3),
                            hit=round(max(lvl.hit, cut_env), 3),
                            bands=[round(float(b), 3) for b in f["bands"]],
                            input_db=input_db, signal=signal)
 
-                    settled = (last_hsv and not cut
-                               and abs(hsv[2] - last_hsv[2]) < 2
-                               and abs(hsv[1] - last_hsv[1]) < 3
-                               and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
-                    if settled:
+                    if not (cut or fired) and same_light(light, last_hsv):
                         continue
 
-                    sender.put(hsv, sudden=cut or lvl.hit > 0.35,
-                               duration=int(np.clip(
-                                   1000.0 / max(cfg["fps"], 5), 30, 150)))
-                    last_sent, last_hsv = now, hsv
+                    sender.put(light, sudden=cut or lvl.hit > 0.35,
+                               duration=ramp_ms(light, last_hsv,
+                                                1.0 / max(cfg["fps"], 5)))
+                    last_sent, last_hsv = now, light
         finally:
             screen.close()
             st.set(bands=[0.0] * 10, input_db=None, signal=True)
@@ -1001,11 +1265,25 @@ body[data-deck="runtime"] #done{display:none}
 .seg button{border:0;background:transparent;padding:6px 15px;border-radius:7px;color:var(--dim);cursor:pointer}
 .seg button:hover{color:var(--ink)}
 .seg button[aria-pressed="true"]{background:var(--sf);color:var(--ink);font-weight:600;box-shadow:0 0 0 1px var(--line)}
+.seg button.off{opacity:.4}
 .go{border:0;padding:8px 20px;border-radius:9px;background:var(--ink);color:var(--bg);font-weight:650;cursor:pointer}
 .go[data-on="true"]{background:transparent;color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--ink)}
 .chk{display:flex;align-items:center;gap:8px;cursor:pointer}
 .chk input{width:16px;height:16px;margin:0;accent-color:var(--ink)}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
+/* presets: one click applies a look; Edit turns your own into rename fields */
+.pchip{display:inline-flex;align-items:center;gap:2px;padding:6px 12px;border-radius:8px;border:0;cursor:pointer;
+  background:var(--sf);box-shadow:inset 0 0 0 1px var(--line);font-size:13.5px}
+.pchip:hover{box-shadow:inset 0 0 0 1px var(--dim)}
+.pchip[aria-pressed="true"]{box-shadow:inset 0 0 0 1.5px var(--ink);font-weight:600}
+.pchip.mine{padding:0 2px 0 0;cursor:default}
+.pchip.mine button{border:0;background:none;padding:6px 4px 6px 12px;cursor:pointer;font-size:13.5px}
+.pchip.mine button.x{color:var(--dim);padding:6px 8px 6px 4px;font-size:12px}
+.pchip.edit{padding:3px;cursor:default}
+.pchip.edit input{border:1px solid var(--ink);border-radius:6px;padding:3px 8px;width:130px;background:var(--bg);font-size:13.5px}
+.pchip.edit input[aria-invalid="true"]{border-color:var(--err)}
+.mini.ghost{box-shadow:none;color:var(--dim);padding-inline:6px}
+.mini.ghost:hover{color:var(--ink);box-shadow:none}
 .chip{display:flex;align-items:center;gap:8px;padding:6px 11px 6px 7px;border-radius:8px;border:0;cursor:pointer;
   background:var(--sf);box-shadow:inset 0 0 0 1px var(--line);font-size:13.5px;text-transform:capitalize}
 .chip s{display:block;width:30px;height:12px;border-radius:3px}
@@ -1030,6 +1308,8 @@ select,input.tx{border:1px solid var(--line);background:var(--sf);border-radius:
 input.tx::placeholder{color:var(--dim)}
 .note{font-size:13.5px;margin:0}
 .note:empty{display:none}
+#errnote{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+#errnote span{flex:1 1 260px}
 .warn{color:var(--warn)} .err{color:var(--err)} .ok{color:var(--ok)}
 .line{display:flex;gap:8px}
 .line>input{flex:1;min-width:0}
@@ -1113,7 +1393,8 @@ td .mini+.mini{margin-left:6px}
 
   <div class="side">
     <!-- ============================ RUNTIME ============================ -->
-    <p class="note err deck-runtime" id="errnote"></p>
+    <p class="note deck-runtime" id="errnote" hidden><span id="errtxt"></span>
+      <button class="btn" id="errfix" type="button" hidden>Open Setup</button></p>
     <div class="transport deck-runtime">
       <span class="seg" id="modes">
         <button type="button" data-mode="music" aria-pressed="true">Music</button>
@@ -1121,9 +1402,12 @@ td .mini+.mini{margin-left:6px}
         <button type="button" data-mode="fusion" aria-pressed="false">Fusion</button>
       </span>
       <span class="sp"></span>
+      <label class="chk"><input type="checkbox" id="auto">Auto</label>
       <label class="chk"><input type="checkbox" id="calm">Calm</label>
       <button class="go" id="go" type="button" data-on="false">Start</button>
     </div>
+
+    <div class="chips deck-runtime" id="presets"></div>
 
     <div class="chips deck-runtime only-music no-fusion" id="chips"></div>
 
@@ -1161,6 +1445,8 @@ td .mini+.mini{margin-left:6px}
         <input type="range" id="fps" min="8" max="30" step="1" value="25"><output id="v-fps"></output></div>
       <div class="r only-music no-fusion"><label for="fade">Colour fade</label>
         <input type="range" id="fade" min="0" max="6" step="0.1" value="0"><output id="v-fade"></output></div>
+      <div class="r only-music"><label for="lead">Beat sync</label>
+        <input type="range" id="lead" min="0" max="250" step="5" value="80"><output id="v-lead"></output></div>
       <div class="r only-screen no-fusion"><label for="sgamma">Dark lift</label>
         <input type="range" id="sgamma" min="0.4" max="1.6" step="0.05" value="0.75"><output id="v-sgamma"></output></div>
       <div class="r only-screen"><label for="minsat">Colour floor</label>
@@ -1226,10 +1512,19 @@ td .mini+.mini{margin-left:6px}
 
 <script>
 const P = __PALETTES__;
+const BUILTIN = __PRESETS__;
 const $ = id => document.getElementById(id);
 let holdUntil = 0;   // don't let polling stomp a fader you're dragging
 let draft=null, drag=null, shotFor=null, shotStale=true, keyTimer=0;   // capture area
 
+// a white frame's colour: Tanner Helland's fit of the black-body curve,
+// scaled by the level like hsv2rgb's value
+function kelvin2rgb(k,v){
+  k/=100; let r,g,b;
+  if(k<=66){ r=255; g=99.47*Math.log(k)-161.12; b=k<=19?0:138.52*Math.log(k-10)-305.04; }
+  else{ r=329.7*Math.pow(k-60,-0.1332); g=288.12*Math.pow(k-60,-0.0755); b=255; }
+  return [r,g,b].map(c=>Math.round(Math.max(0,Math.min(255,c))*v/100));
+}
 function hsv2rgb(h,s,v){
   h=((h%360)+360)%360; s/=100; v/=100;
   const c=v*s, x=c*(1-Math.abs((h/60)%2-1)), m=v-c;
@@ -1299,13 +1594,14 @@ async function post(path, body){
 }
 
 const KEYS = {sens:'sensitivity', gamma:'gamma', punch:'punch', fps:'fps',
-              fade:'fade',
+              lead:'lead', fade:'fade',
               sgamma:'screen_gamma', minsat:'min_sat', sboost:'sat_boost',
               sfps:'screen_fps'};
 function fmt(id, v){
   v=+v;
   if(id==='fps' || id==='sfps') return v+'/s';
   if(id==='fade') return v ? v.toFixed(1)+' s' : 'Off';
+  if(id==='lead') return v ? v+' ms' : 'Off';
   if(id==='minsat') return String(v);
   return v.toFixed(2);
 }
@@ -1320,26 +1616,35 @@ Object.keys(KEYS).forEach(id=>{
   el.addEventListener('input',()=>{ paint(id); send({[KEYS[id]]: +el.value}); });
 });
 
-function setStatus(text){
+function setStatus(text, notice){
   const st=$('status');
-  // a failure arrives with a paragraph of advice: the bar says "error" and
-  // the advice goes in a note, where it has room to wrap
+  // a failure arrives with a paragraph of advice: the bar says one word and
+  // the advice goes in a note, where it has room to wrap. Link's reasons
+  // come as a notice; anything else that failed as "error: <detail>".
   const m = /^error:\s*([\s\S]*)$/.exec(text);
   $('stxt').textContent = m ? 'error' : text.replace('on the cloud deck','in Setup');
-  $('errnote').textContent = m ? m[1].charAt(0).toUpperCase() + m[1].slice(1) : '';
-  st.className = 'st' + (text==='running' ? ' on'
+  const n = notice || (m ? {kind:'err', text:m[1].charAt(0).toUpperCase()+m[1].slice(1)} : null);
+  $('errnote').hidden = !n;
+  $('errnote').className = 'note deck-runtime ' + (n ? n.kind : '');
+  $('errtxt').textContent = n ? n.text : '';
+  $('errfix').hidden = !(n && n.action==='setup');
+  st.className = 'st' + (text==='running' || text==='connected' ? ' on'
     : text==='no signal' ? ' quiet'
-    : /^(connecting|starting|stopping|restoring)/.test(text) ? ' busy'
+    : /^(connecting|starting|stopping|restoring|reconnecting|searching)/.test(text) ? ' busy'
     : /^(error|no bulb|server)/.test(text) ? ' bad' : '');
 }
+$('errfix').addEventListener('click',()=>{ location.hash='cloud'; });
 
+// the mode that is running: Auto's pick while Auto is on
+function modeOf(s){ return s.auto ? (s.auto_mode || (s.screen_ok ? 'fusion' : 'music')) : s.mode; }
 [...$('modes').children].forEach(b=>{
   b.onclick=()=>{
     const m=b.dataset.mode;
     [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c===b));
     if(m!=='music' && document.body.dataset.mode==='music') shotStale = true;
     document.body.dataset.mode = m;
-    send({mode:m});
+    $('auto').checked = false;           // a mode picked by hand turns Auto off
+    send({mode:m, auto:false});
   };
 });
 function showDeck(name){
@@ -1357,12 +1662,90 @@ addEventListener('hashchange', ()=>showDeck(location.hash.slice(1)));
 $('monitor').addEventListener('change',e=>send({monitor:+e.target.value}));
 $('mic').addEventListener('change',e=>send({mic:e.target.value || null}));
 $('calm').addEventListener('change',e=>send({calm:e.target.checked}));
+$('auto').addEventListener('change',e=>send({auto:e.target.checked}));
 $('go').addEventListener('click',()=>{
   const on = $('go').dataset.on === 'true';
   send({running: !on});
 });
 $('ipset').addEventListener('click',()=>send({ip:$('ip').value.trim()}));
 $('ip').addEventListener('keydown',e=>{ if(e.key==='Enter') send({ip:$('ip').value.trim()}); });
+
+/* -------------------------------- presets -------------------------------- */
+// Built-ins and the user's own, as chips. The pressed chip is the preset the
+// desk's look matches now; move a fader and none is. Edit turns the user's
+// chips into a name to rename and a mark to delete.
+let pEdit=false, pRename=null, pNaming=false, pKey='';
+function same(look, s){
+  return Object.keys(look).every(k => typeof look[k]==='number'
+    ? Math.abs(look[k]-s[k]) < 1e-6 : look[k]===s[k]);
+}
+async function presetOp(body, input){
+  const r = await post('/api/presets', body);
+  if(!r.ok && input){ input.setAttribute('aria-invalid','true'); input.title = r.error||''; input.focus(); return false; }
+  pKey=''; poll();
+  return r.ok;
+}
+function nameField(value, commit){
+  const wrap=document.createElement('span'); wrap.className='pchip edit';
+  const i=document.createElement('input'); i.className='tx'; i.value=value; i.maxLength=32;
+  i.setAttribute('aria-label', value ? 'New name for '+value : 'Name for this look');
+  i.placeholder='Name';
+  let done=false;
+  const finish=async ok=>{
+    if(done) return;
+    const v=i.value.trim();
+    if(ok && v && v!==value){ done = await commit(v, i); if(!done) return; }
+    done=true; pRename=null; pNaming=false; pKey=''; i.blur(); renderPresets(live);
+  };
+  i.addEventListener('keydown',e=>{
+    i.removeAttribute('aria-invalid');
+    if(e.key==='Enter'){ e.preventDefault(); finish(true); }
+    if(e.key==='Escape'){ e.preventDefault(); finish(false); }
+  });
+  i.addEventListener('blur',()=>{ if(!i.value.trim() || i.value.trim()===value) finish(false); });
+  wrap.append(i);
+  setTimeout(()=>{ i.focus(); i.select(); });
+  return wrap;
+}
+function renderPresets(s){
+  if(!s) return;
+  const row=$('presets');
+  // never rebuild under a name being typed
+  if(row.contains(document.activeElement) && document.activeElement.tagName==='INPUT') return;
+  const mine=(s.presets||[]);
+  const all=BUILTIN.map(p=>[p,false]).concat(mine.map(p=>[p,true]));
+  const on=(all.find(([p])=>same(p.look, s))||[{}])[0].name;
+  const key=JSON.stringify([mine, on, pEdit, pRename, pNaming]);
+  if(key===pKey) return;
+  pKey=key; row.innerHTML='';
+  if(pEdit && !mine.length) pEdit=false;
+  all.forEach(([p, isMine])=>{
+    if(pEdit && isMine){
+      if(p.name===pRename){ row.append(nameField(p.name,(v,i)=>presetOp({op:'rename',name:p.name,to:v},i))); return; }
+      const chip=document.createElement('span'); chip.className='pchip mine';
+      const nm=document.createElement('button'); nm.type='button'; nm.textContent=p.name;
+      nm.setAttribute('aria-label','Rename '+p.name);
+      nm.onclick=()=>{ pRename=p.name; pKey=''; renderPresets(live); };
+      const x=document.createElement('button'); x.type='button'; x.className='x'; x.textContent='\u2715';
+      x.setAttribute('aria-label','Delete '+p.name);
+      x.onclick=()=>presetOp({op:'delete',name:p.name});
+      chip.append(nm,x); row.append(chip); return;
+    }
+    const b=document.createElement('button'); b.type='button'; b.className='pchip';
+    b.textContent=p.name; b.setAttribute('aria-pressed', p.name===on);
+    b.onclick=()=>{ [...row.querySelectorAll('.pchip')].forEach(c=>c.setAttribute('aria-pressed', c===b));
+                    send({preset:p.name}); };
+    row.append(b);
+  });
+  if(pNaming) row.append(nameField('',(v,i)=>presetOp({op:'save',name:v},i)));
+  const mini=(text,fn)=>{ const b=document.createElement('button'); b.type='button';
+    b.className='mini ghost'; b.textContent=text; b.onclick=fn; row.append(b); };
+  if(pEdit) mini('Done',()=>{ pEdit=false; pRename=null; pKey=''; renderPresets(live); });
+  else{
+    if(!pNaming) mini('Save as preset',()=>{ pNaming=true; pKey=''; renderPresets(live); });
+    if(mine.length) mini('Edit',()=>{ pEdit=true; pNaming=false; pKey=''; renderPresets(live); });
+  }
+}
 
 /* ------------------------------ audio input ------------------------------ */
 // The device list costs a CoreAudio walk, so it is fetched on load and when
@@ -1390,7 +1773,7 @@ $('mic').addEventListener('focus', loadInputs);
 loadInputs();
 
 function paintMeter(s){
-  const on = s.running && s.mode!=='screen' && s.input_db !== null;
+  const on = s.running && modeOf(s)!=='screen' && s.input_db !== null;
   $('meter').hidden = !on;
   if(!on) return;
   $('meter').classList.toggle('none', !s.signal);
@@ -1422,7 +1805,7 @@ function paintRegion(r, live_=false){
 function maybeShot(s){
   // one still when the area first shows, on a display change and on coming
   // back to the page - never on a timer
-  if(!s.snapshot_ok || s.mode==='music' || document.body.dataset.deck!=='runtime' || document.hidden) return;
+  if(!s.snapshot_ok || modeOf(s)==='music' || document.body.dataset.deck!=='runtime' || document.hidden) return;
   if(shotFor===s.monitor && !shotStale) return;
   shotFor=s.monitor; shotStale=false;
   const img=$('shotimg');
@@ -1498,7 +1881,7 @@ let busy=false, pollTimer=0, live=null, wasRunning=false;
 function pollDelay(){
   if(document.hidden) return 2000;
   if(!live || !live.running) return 1000;
-  return live.mode==='screen' ? Math.max(60, 1000/live.screen_fps) : 60;
+  return modeOf(live)==='screen' ? Math.max(60, 1000/live.screen_fps) : 60;
 }
 async function poll(){
   if(busy) return; busy=true;
@@ -1506,14 +1889,16 @@ async function poll(){
   try{
     const s = await (await fetch('/api/state')).json();
     live = s;
-    const [r,g,b] = hsv2rgb(s.hue, s.sat, s.val);
+    const [r,g,b] = s.white ? kelvin2rgb(s.ct, s.val) : hsv2rgb(s.hue, s.sat, s.val);
     const col = `rgb(${r},${g},${b})`;
     $('field').style.background = s.running ? col : '';
     $('ro').hidden = $('tape').hidden = !s.running;
     if(s.running){
       if(!wasRunning) tbuf=[];
       $('ro').style.color = (0.299*r+0.587*g+0.114*b) > 150 ? '#111' : '#fff';
-      $('rh').textContent=s.hue+'°'; $('rs').textContent=s.sat+'%'; $('rv').textContent=s.val+'%';
+      $('rh').textContent = s.white ? s.ct+' K' : s.hue+'°';
+      $('rs').textContent = s.white ? '' : s.sat+'%'; $('rs').hidden = s.white;
+      $('rv').textContent=s.val+'%';
       $('rb').textContent=s.bpm.toFixed(0)+' bpm'; $('rp').textContent=s.active_palette;
       $('rd').textContent=s.device;
       drawTape(col);
@@ -1521,7 +1906,13 @@ async function poll(){
     wasRunning = s.running;
     // a session that runs on a silent input looks like a dead lamp, so the
     // bar says so outright (screen mode has no input)
-    setStatus(s.running && s.status==='running' && !s.signal && s.mode!=='screen' ? 'no signal' : s.status);
+    const mode = modeOf(s);
+    // Auto without Screen Recording can only ever be Music; say so where
+    // the reasons go, unless something more urgent is there
+    const autoNote = s.auto && !s.screen_ok
+      ? {kind:'warn', text:'No Screen Recording permission, so Auto stays on Music.'} : null;
+    setStatus(s.running && s.status==='running' && !s.signal && mode!=='screen' ? 'no signal' : s.status,
+              s.notice || autoNote);
     paintMeter(s);
     maybeShot(s);
     const addr=$('addr');
@@ -1531,7 +1922,7 @@ async function poll(){
     $('go').dataset.on = s.running; $('go').textContent = s.running ? 'Stop' : 'Start';
     if(!ipTouched && document.activeElement !== $('ip')) $('ip').value = s.ip || '';
 
-    const screenMode = s.mode === 'screen';
+    const screenMode = mode === 'screen';
     setBars(s.bands.length);
     s.bands.forEach((v,i)=>{
       const bar=bars[i];
@@ -1554,12 +1945,17 @@ async function poll(){
 
     if(Date.now() > holdUntil){
       $('calm').checked = s.calm;
+      $('auto').checked = s.auto;
       [...chips.children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.name===s.palette));
-      [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.mode===s.mode));
-      document.body.dataset.mode = s.mode;
+      [...$('modes').children].forEach(c=>{
+        c.setAttribute('aria-pressed', c.dataset.mode===mode);
+        c.classList.toggle('off', s.auto && !s.screen_ok && c.dataset.mode!=='music');
+      });
+      document.body.dataset.mode = mode;
       $('monitor').value = s.monitor;
       if(!drag && !draft) paintRegion(s.region, true);
       buildMics();
+      renderPresets(s);
       // faders follow the desk too, or a reload leaves them showing whatever
       // the browser restored rather than what is running
       Object.keys(KEYS).forEach(id=>{
@@ -1569,7 +1965,7 @@ async function poll(){
         paint(id);
       });
     }
-  }catch(e){ live=null; setStatus('server unreachable'); }
+  }catch(e){ live=null; setStatus('server unreachable', null); }
   busy=false;
   pollTimer = setTimeout(poll, pollDelay());
 }
@@ -1795,7 +2191,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/snapshot"):
             self._snapshot()
         elif self.path in ("/", "/index.html"):
-            page = PAGE.replace("__PALETTES__", json.dumps(PALETTES))
+            page = (PAGE.replace("__PALETTES__", json.dumps(PALETTES))
+                        .replace("__PRESETS__", json.dumps(BUILTIN_PRESETS)))
             self._send(200, page, "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
@@ -1806,6 +2203,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/cloud/"):
             self._do_cloud()
             return
+        if self.path.startswith("/api/presets"):
+            self._do_presets()
+            return
         if not self.path.startswith("/api/control"):
             self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
@@ -1815,6 +2215,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, "bad json", "text/plain")
             return
         snap = self.state.snapshot()
+        # a preset is its look, applied like any other change; the list itself
+        # changes only through /api/presets
+        patch.pop("presets", None) if isinstance(patch, dict) else None
+        if isinstance(patch, dict) and "preset" in patch:
+            found = find_preset(patch.pop("preset"), snap)
+            if found:
+                patch = dict(found["look"], **patch)
         # the LEDs cannot resolve past ~30/s, so clamp rather than trust the UI
         clean = clean_patch(patch, snap)
         # a saved input may be unplugged (the desk then says so), but the
@@ -1822,8 +2229,19 @@ class Handler(BaseHTTPRequestHandler):
         if clean.get("mic") and clean["mic"] != snap["mic"] \
                 and clean["mic"] not in audio_inputs()["inputs"]:
             clean.pop("mic")
+        # the bulb's id is learned on the wire, never taken from the page,
+        # and a new address may be a different bulb
+        clean.pop("did", None)
+        # Auto off keeps the mode it was running rather than jumping back to
+        # the last one picked by hand
+        if clean.get("auto") is False and snap["auto"] and "mode" not in clean \
+                and snap["auto_mode"] in MODES:
+            clean["mode"] = snap["auto_mode"]
+        if "ip" in clean and clean["ip"] != snap["ip"]:
+            clean["did"] = None
         if "running" in clean:
             clean["status"] = "starting" if clean["running"] else "stopping"
+            clean["notice"] = None
         if "ip" in clean and snap["running"] and clean["ip"] != snap["ip"]:
             # the session reads the address once, at connect time, so a
             # live run has to end before the new bulb can be opened
@@ -1831,6 +2249,16 @@ class Handler(BaseHTTPRequestHandler):
             clean["status"] = f"bulb address is now {clean['ip']} - press Start"
         self.state.control(**clean)
         self._send(200, json.dumps({"ok": True}), "application/json")
+
+    def _do_presets(self):
+        body = self._body()
+        if body is None:
+            self._send(400, "bad json", "text/plain")
+            return
+        presets, error = preset_op(body, self.state.snapshot())
+        if not error:
+            self.state.control(presets=presets)
+        self._json(200 if not error else 400, {"ok": not error, "error": error})
 
     def _snapshot(self):
         snap = self.state.snapshot()

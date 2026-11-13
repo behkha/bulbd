@@ -84,17 +84,18 @@ def test_sender_stops_with_a_frame_pending(sender):
     assert not s.is_alive()
 
 
-def test_sender_reopens_music_mode_after_a_dropped_link_and_carries_on(sender, capsys):
+def test_a_failed_send_marks_the_link_lost_and_touches_nothing_else(sender):
+    """Recovery belongs to Link: the sender must not reopen music mode on a
+    Bulb whose socket yeelight has already thrown away."""
     bulb = FakeBulb(fail_first=1); s = sender(bulb)
     s.put((1, 1, 1), False)
-    deadline = time.monotonic() + 3
-    while bulb.music != ["stop", "start"] and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert bulb.music == ["stop", "start"]
-    s.put((2, 2, 2), False)
-    assert bulb.seen.wait(2)
-    assert bulb.calls[-1][0] == (2, 2, 2)
-    assert "link dropped" in capsys.readouterr().err
+    assert s.lost.wait(2)
+    assert isinstance(s.error, OSError)
+    assert bulb.music == []
+    s.join(2)
+    assert not s.is_alive()
+    s.put((2, 2, 2), False)                            # dropped, not queued forever
+    assert bulb.calls == []
 
 
 # --------------------------------------------------------------------- wire

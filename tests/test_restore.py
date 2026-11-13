@@ -226,13 +226,17 @@ def test_the_state_is_read_on_the_sessions_own_connection(monkeypatch):
     assert bulb._Bulb__socket.sent[0][0] == "get_prop"
 
 
-def test_no_remember_reads_nothing(monkeypatch):
+def test_no_remember_keeps_nothing_but_still_asks_first(monkeypatch):
+    """The bounded get_prop is also the probe: yeelight's own first command
+    can wait forever on a bulb that closed the socket."""
     import yeelight
     log = []
     monkeypatch.setattr(yeelight, "Bulb", fake_bulb_class(log))
+    monkeypatch.setattr(socket, "create_connection", no_new_connection)
     bulb = open_bulb("192.0.2.1", remember=False)
     assert bulb.bulbd_saved is None
-    assert log == [("turn_on", 1), ("start_music", 1)]
+    assert log == [("connect", 1), ("turn_on", 1), ("start_music", 1)]
+    assert [m for m, _ in bulb._Bulb__socket.sent] == ["get_prop"]
 
 
 def test_a_retry_keeps_the_first_reading(monkeypatch):
@@ -243,4 +247,35 @@ def test_a_retry_keeps_the_first_reading(monkeypatch):
     monkeypatch.setattr(music_bulb.time, "sleep", lambda s: None)
     bulb = open_bulb("192.0.2.1")
     assert bulb.n == 2 and bulb.bulbd_saved == WARM
-    assert bulb._Bulb__socket is None or bulb._Bulb__socket.sent == []
+
+
+def test_the_first_reading_carries_across_calls_in_a_memo(monkeypatch):
+    """Link opens with attempts=1 several times; the look is the first one."""
+    import yeelight
+    log = []
+    monkeypatch.setattr(yeelight, "Bulb", fake_bulb_class(log, props=["on", "90", "1", "255", "4000", "0", "0"]))
+    memo = {"saved": WARM}
+    bulb = open_bulb("192.0.2.1", attempts=1, memo=memo)
+    assert bulb.bulbd_saved == WARM
+
+
+@pytest.mark.parametrize("where, stage", [("connect", "connect"), ("start_music", "music")])
+def test_a_failure_is_tagged_with_its_step(monkeypatch, where, stage):
+    import yeelight
+    Fake = fake_bulb_class([])
+
+    class Failing(Fake):
+        @property
+        def _socket(self):
+            if where == "connect":
+                raise ConnectionRefusedError("refused")
+            return Fake._socket.fget(self)
+
+        def start_music(self):
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr(yeelight, "Bulb", Failing)
+    monkeypatch.setattr(socket, "create_connection", no_new_connection)
+    with pytest.raises(Exception) as err:
+        open_bulb("192.0.2.1", attempts=1)
+    assert err.value.bulbd_stage == stage

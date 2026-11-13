@@ -54,7 +54,7 @@ import socket
 import sys
 import threading
 import time
-from collections import deque
+from collections import deque, namedtuple
 
 import numpy as np
 
@@ -240,6 +240,8 @@ class Analyser:
 
         return {
             "bands": norm,
+            "low": float(self.env[-1]),           # the flux's rise in the beat bands
+            "flux": flux,
             "bass": float(norm[:3].mean()),
             "mid": float(norm[3:7].mean()),
             "treble": float(norm[7:].mean()),
@@ -370,12 +372,20 @@ class LevelEngine:
         self.sustain = 0.0
         self.brightness = 0.0
         self.silent_since = None
+        self.flashed = False
 
-    def feed(self, f, dt):
-        """-> True when this frame is a strong accent (worth a colour step)."""
+    def feed(self, f, dt, predicted=None, claimed=False):
+        """-> True when this frame is a strong accent (worth a colour step).
+
+        `predicted` is the strength of a beat BeatClock flashed early on this
+        frame; `claimed` says this frame's onset is that beat arriving, so it
+        adds no second flash - though it still counts as an accent, because
+        the colour follows what was really heard. `flashed` is True on a
+        frame that started a flash."""
         punch = self.punch if self.punch is not None else (0.45 if self.calm else 0.78)
         gate = 0.30 if self.calm else 0.12
         accent = False
+        self.flashed = False
 
         if f["rms"] < 0.004:
             self.silent_since = self.silent_since or f["t"]
@@ -387,8 +397,13 @@ class LevelEngine:
             level = 0.06 + 0.10 * phase
             self.hit = self.sustain = 0.0
         else:
+            if predicted is not None and predicted > gate:
+                self.hit = max(self.hit, 0.35 + 0.65 * predicted)
+                self.flashed = True
             if f["onset"] and f["strength"] > gate:
-                self.hit = max(self.hit, 0.35 + 0.65 * f["strength"])
+                if not claimed:
+                    self.hit = max(self.hit, 0.35 + 0.65 * f["strength"])
+                    self.flashed = True
                 accent = f["strength"] > 0.45
             # decay tied to tempo: the flash fills the beat, then clears
             tau = float(np.clip(0.42 * f["beat"], 0.09, 0.40))
@@ -402,6 +417,141 @@ class LevelEngine:
         else:
             self.brightness += (level - self.brightness) * (1.0 - math.exp(-dt / 0.11))
         return accent
+
+
+# ---------------------------------------------------------------------------
+# beat prediction - send the flash early so it lands on the beat
+# ---------------------------------------------------------------------------
+class BeatClock:
+    """Predicts the next beat once the tempo can be trusted.
+
+    A flash sent when the beat is heard lands late: the onset is seen at the
+    end of its 23 ms block, then the Wi-Fi hop and the bulb's 50 ms ramp
+    follow. With a steady tempo the next beat is known in advance, so it can
+    be flashed `lead` seconds before it would be detected.
+
+    The grid is the last beat heard plus the period. Only onsets that are
+    mostly low-band rise count as beats (a hat is an onset, not the beat);
+    each one on the grid nudges it (phase and period, a small two-term loop)
+    and lengthens the streak. A beat is predicted only after LOCK beats in a
+    row, and only the one right after a beat that was heard: when the music
+    stops or turns into a held passage, at most one predicted flash follows
+    the last real beat, inside one period. Any onset that arrives within the
+    window of a beat already flashed is that beat, and is claimed, so a beat
+    gives one flash, never two. Off the grid, or with no lead, everything
+    stays reactive, as before this existed.
+
+    Times are the analyser's audio time, which the loops run in step with.
+    Firing happens on the block nearest the target, so a flash is within
+    half a block (11.6 ms) of where it was aimed; the network's own jitter
+    (round trips of 23-106 ms measured) is several times that.
+    """
+
+    LOCK = 4                  # beats on the grid in a row before predicting
+    WINDOW = 0.2              # share of a period around a grid beat that is it
+    PHASE_GAIN = 0.35
+    PERIOD_GAIN = 0.1
+    LOW_SHARE = 0.4           # share of an onset's flux in the beat bands
+    RESYNC = 0.08             # follow the analyser's tempo past this mismatch
+
+    def __init__(self, dt=BLOCK / SAMPLERATE):
+        self.dt = dt
+        self.reset()
+
+    def reset(self):
+        self.last = None              # time of the last beat heard, on the grid
+        self.period = None
+        self.streak = 0
+        self.fired = None             # grid time of the beat flashed early
+        self.offgrid = 0
+        self.strengths = deque(maxlen=6)
+
+    @property
+    def trusted(self):
+        return self.streak >= self.LOCK and self.period is not None
+
+    def frame(self, f, lead):
+        """One analyser frame. -> (strength of a beat to flash now or None,
+        whether this frame's onset is a beat already flashed)."""
+        t, beat = f["t"], f["beat"]
+        if lead <= 0.0:
+            self.reset()
+            return None, False
+        if self.period is None or abs(self.period - beat) > self.RESYNC * beat:
+            self.period = beat               # the analyser's tempo moved: take it
+
+        claimed = False
+        if f["onset"]:
+            claimed = (self.fired is not None
+                       and abs(t - self.fired) <= self.WINDOW * self.period)
+            if f["low"] >= self.LOW_SHARE * max(f["flux"], 1e-9):
+                self._heard(t, f["strength"])
+
+        # a run of missed beats loses the grid
+        if self.last is not None and t - self.last > 2.5 * self.period:
+            self.streak = 0
+
+        fire = None
+        if self.trusted:
+            nxt = self.last + self.period
+            if self.fired != nxt and nxt - lead - 0.5 * self.dt <= t < nxt:
+                self.fired = nxt
+                fire = float(np.median(self.strengths)) if self.strengths else 0.5
+        return fire, claimed
+
+    def _heard(self, t, strength):
+        if self.last is None:
+            self.last, self.streak = t, 1
+            return
+        p = self.period
+        k = round((t - self.last) / p)
+        err = t - (self.last + k * p)
+        if k >= 1 and abs(err) <= self.WINDOW * p:
+            self.last = self.last + k * p + self.PHASE_GAIN * err
+            self.period = p + self.PERIOD_GAIN * err / k
+            self.streak = self.streak + 1 if k <= 2 else 1
+            self.offgrid = 0
+            self.strengths.append(strength)
+        elif k >= 1 or abs(err) > self.WINDOW * p:
+            # a beat-like onset off the grid: a syncopated kick is forgiven
+            # once, two in a row mean the grid is wrong
+            self.offgrid += 1
+            if not self.trusted or self.offgrid >= 2:
+                self.last, self.streak, self.offgrid = t, 1, 0
+                self.strengths.clear()
+
+
+class BeatSync:
+    """What the audio loops (music and fusion) do with each analyser frame:
+    BeatClock, then the brightness, then - in music mode - the colour.
+
+    The colour rule does not move: a palette step is still triggered only by
+    an accent that was really heard. What prediction changes is when it
+    lands. An accent heard on a beat that was already flashed early arms the
+    step, and the step goes out with the next predicted flash, on that beat,
+    instead of trailing the flash it belongs to by the lead time. Without a
+    trusted grid it steps at once, as it always did."""
+
+    def __init__(self):
+        self.clock = BeatClock()
+        self.pending = False
+
+    def feed(self, f, lvl, dt, lead, color=None):
+        """-> True if this frame flashed a predicted beat."""
+        fire, claimed = self.clock.frame(f, lead)
+        accent = lvl.feed(f, dt, predicted=fire, claimed=claimed)
+        if color is not None:
+            if accent and claimed:
+                self.pending = True
+            elif accent:
+                color.step(f["t"], f["beat"])
+            if self.pending and (fire is not None or not self.clock.trusted):
+                color.step(f["t"], f["beat"])
+                self.pending = False
+        return fire is not None and lvl.flashed
+
+
+LED_GAP = 1.0 / 30                    # the fastest the LEDs can show a change
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +684,89 @@ class CapturePacer:
         return 1.0 / fps
 
 
+def neutral_kelvin(rgb, s, v, limits=(2700, 6500)):
+    """Colour temperature of the picture's neutral light, or None if none is lit.
+
+    Lit pixels short of vivid (saturation under 0.3, so an accent does not
+    pull it) are averaged in linear light and put through McCamy's
+    approximation. A white page on an sRGB display is D65, 6500 K - the
+    temperature bias lighting is set to - and a warm grey film scene comes
+    out lower. Clamped to `limits`: past them the scene has a colour."""
+    keep = (v > 0.09) & (s < 0.3)
+    if int(keep.sum()) < 24:
+        return None
+    lin = np.where(rgb[keep] <= 0.04045, rgb[keep] / 12.92,
+                   ((rgb[keep] + 0.055) / 1.055) ** 2.4)
+    r, g, b = (float(c) for c in lin.mean(axis=0))
+    X = 0.4124 * r + 0.3576 * g + 0.1805 * b
+    Y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    Z = 0.0193 * r + 0.1192 * g + 0.9505 * b
+    tot = X + Y + Z
+    if tot <= 1e-9:
+        return None
+    x, y = X / tot, Y / tot
+    if abs(0.1858 - y) < 1e-6:
+        return None
+    n = (x - 0.3320) / (0.1858 - y)
+    cct = 449.0 * n ** 3 + 3525.0 * n ** 2 + 6823.3 * n + 5520.33
+    return float(np.clip(cct, *limits))
+
+
+# A frame for the white LEDs: colour temperature in kelvin and the bulb's
+# brightness number. Colour frames stay plain (hue, sat, value) tuples.
+White = namedtuple("White", "ct bright")
+
+# The white LEDs give far more light than the RGB ones at the same brightness
+# number (the RGB ones also lose the share a near-grey colour leaves dark), so
+# a white frame is sent at this fraction of the colour frame's number to land
+# at the same level and not pop at the switch. Fitted on the lamp: see
+# tools/check_white.py.
+WHITE_GAIN = 0.4
+
+
+def white_frame(ct, level):
+    """The White frame for a colour temperature and a 1..100 colour-scale
+    level: kelvin to the nearest 50, brightness matched to the RGB LEDs."""
+    return White(int(round(ct / 50.0)) * 50, max(1, int(round(level * WHITE_GAIN))))
+
+
+def same_light(a, b, hue_tol=3):
+    """True if frame `b` would look the same as `a` - the deadband that keeps
+    sends the LEDs could not show off the wire. A switch between the white and
+    the colour LEDs is never the same."""
+    if a is None or b is None or isinstance(a, White) != isinstance(b, White):
+        return False
+    if isinstance(a, White):
+        return a.bright == b.bright and abs(a.ct - b.ct) < 100
+    return (abs(a[2] - b[2]) < 2 and abs(a[1] - b[1]) < 3
+            and abs(((a[0] - b[0] + 180) % 360) - 180) < hue_tol)
+
+
+def screen_frame(engine, hue, sat, level):
+    """What the screen and fusion loops send for one tick of `engine`: a
+    White frame while it calls the scene colourless, else (hue, sat, level).
+    `level` is the 1..100 brightness on the colour LEDs' scale. `engine` may
+    also be a ScreenColorThread, whose white() is its last published frame."""
+    white, ct = engine.white() if callable(engine.white) else (engine.white, engine.ct)
+    if white:
+        return white_frame(ct, level)
+    return (int(round(hue)) % 360, int(round(sat)), int(level))
+
+
+SWITCH_MS = 300                       # ramp across a colour <-> white switch
+
+
+def ramp_ms(frame, last, period):
+    """The bulb-side ramp for a smooth send: one frame gap, so consecutive
+    frames join up, but a switch between the colour and the white LEDs
+    crossfades for longer - a 100 ms jump between two sets of LEDs reads as a
+    pop even when their levels match."""
+    ms = int(np.clip(period * 1000, 30, 150))
+    if last is not None and isinstance(frame, White) != isinstance(last, White):
+        return max(ms, SWITCH_MS)
+    return ms
+
+
 class ScreenColorEngine:
     """Dominant hue by weighted hue histogram, then smoothed over time.
 
@@ -547,6 +780,17 @@ class ScreenColorEngine:
     GREY_SAT = 18.0                   # saturation of a colourless scene
     FULL_SHARE = 0.2                  # share of the light that earns full colour
     MOVED = 0.12                      # per-channel change that counts for a pixel
+    # A scene this close to colourless goes to the white LEDs, and comes back
+    # to colour only well past it: the gap is what keeps a scene that sits on
+    # the line from flapping between the two sets of LEDs. For a vivid
+    # accent on grey: white while it carries under about 2.5% of the light,
+    # colour again once it carries about 5%.
+    WHITE_IN, WHITE_OUT = 28.0, 38.0
+    # A picture whose main colour is this pale is near-colourless too - a
+    # warm-graded grey, a cream wall - and reads truer as warm white than as
+    # that hue pushed up to the colour floor. Entered under 0.20, left over 0.26.
+    PALE_IN, PALE_OUT = 0.20, 0.26
+    CT_RANGE = (2700, 6500)           # warm lamp light .. the display's own D65
 
     def __init__(self, min_sat=55.0, sat_boost=1.35, gamma=0.75, calm=False):
         self.min_sat = float(min_sat)
@@ -562,6 +806,10 @@ class ScreenColorEngine:
         self._prev = None                 # last frame, to tell a cut from motion
         self.changed = 0.0                # share of pixels that moved since it
         self.share = 0.0                  # share of the light the hue carries
+        self.white = False                # send this scene on the white LEDs
+        self.pale = False                 # its colour is too pale to count
+        self.ct = float(self.CT_RANGE[1])  # its colour temperature, kelvin
+        self._ct_m = None                 # this frame's measured temperature
 
     def measure(self, rgb):
         """One frame -> (hue or None if colourless, sat 0..1, luma 0..1)."""
@@ -573,6 +821,7 @@ class ScreenColorEngine:
         h, s, v = rgb_to_hsv(rgb)
         luma = float((rgb @ _LUMA).mean())
         self.share = 0.0
+        self._ct_m = neutral_kelvin(rgb, s, v, self.CT_RANGE)
 
         keep = (v > 0.09) & (s > 0.14)              # drop crushed and grey
         if int(keep.sum()) < 24:
@@ -623,8 +872,13 @@ class ScreenColorEngine:
         t_sat = 0.12 if cut else (1.10 if self.calm else 0.60)
         t_val = 0.08 if cut else (0.45 if self.calm else 0.22)
 
-        if hue_m is None:
+        if hue_m is not None:
+            self.pale = sat_m < (self.PALE_OUT if self.pale else self.PALE_IN)
+        if hue_m is None or self.pale:
             want_sat = self.GREY_SAT                # grey scene -> near white
+            if hue_m is not None:
+                self.hue = hue_m if cut else hue_lerp(
+                    self.hue, hue_m, 1.0 - math.exp(-dt / t_hue))
         else:
             self.hue = hue_m if cut else hue_lerp(
                 self.hue, hue_m, 1.0 - math.exp(-dt / t_hue))
@@ -640,6 +894,13 @@ class ScreenColorEngine:
         else:
             self.sat += (want_sat - self.sat) * (1.0 - math.exp(-dt / t_sat))
             self.val += (want_val - self.val) * (1.0 - math.exp(-dt / t_val))
+
+        # white: the temperature follows the picture's neutral light on the
+        # saturation's clock, and lands with it on a cut
+        if self._ct_m is not None:
+            self.ct = self._ct_m if cut else self.ct + (self._ct_m - self.ct) * (
+                1.0 - math.exp(-dt / t_sat))
+        self.white = self.sat < (self.WHITE_OUT if self.white else self.WHITE_IN)
         return self.hue, float(np.clip(self.sat, 0.0, 100.0)), self.val, cut
 
 
@@ -659,11 +920,12 @@ class ScreenColorThread(threading.Thread):
     times a second instead of `fps` times. `poke()` ends that idle wait.
     """
 
-    def __init__(self, grab, engine, fps=10):
+    def __init__(self, grab, engine, fps=10, on_frame=None):
         super().__init__(daemon=True)
         self.grab = grab
         self.engine = engine
         self.fps = fps
+        self.on_frame = on_frame          # (frame, now) after each grab - Auto's motion
         self.alive = True
         self.error = None
         self._lock = threading.Lock()
@@ -672,6 +934,7 @@ class ScreenColorThread(threading.Thread):
         self._hue = engine.hue
         self._sat = engine.sat
         self._val = engine.val
+        self._white, self._ct = engine.white, engine.ct
         self._cut = False
 
     def run(self):
@@ -689,7 +952,10 @@ class ScreenColorThread(threading.Thread):
                 return
             with self._lock:
                 self._hue, self._sat, self._val = hue, sat, val
+                self._white, self._ct = self.engine.white, self.engine.ct
                 self._cut = self._cut or cut
+            if self.on_frame is not None:
+                self.on_frame(frame, now)
 
             base = 1.0 / max(self.fps, 1)
             period = self._pacer.period(frame, self.fps, now)
@@ -706,6 +972,11 @@ class ScreenColorThread(threading.Thread):
             cut, self._cut = self._cut, False
             return self._hue, self._sat, self._val, cut
 
+    def white(self):
+        """-> (white, kelvin) as of the last frame read."""
+        with self._lock:
+            return self._white, self._ct
+
     def poke(self):
         """A setting changed: read the screen at the full rate again."""
         self._pacer.reset()
@@ -718,14 +989,129 @@ class ScreenColorThread(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# auto mode - pick music, screen or fusion from what is happening
+# ---------------------------------------------------------------------------
+class MotionMeter:
+    """Whether the picture is moving, from one frame every PROBE seconds.
+
+    Two frames PROBE apart are compared; it is moving when more than SHARE
+    of the pixels changed. A film or a video in a window clears that easily,
+    a blinking cursor or a ticking clock does not. Frames in between are
+    ignored, so the screen loops can feed it every frame for free and the
+    probe in music mode needs only one grab per PROBE."""
+
+    PROBE = 2.0
+    SHARE = 0.01
+    PIXEL = 0.04
+
+    def __init__(self):
+        self.ref, self.at = None, None
+
+    def feed(self, frame, now):
+        """-> True/False on a comparison, None between them."""
+        if self.ref is not None and now - self.at < self.PROBE * 0.9:
+            return None
+        ref, self.ref, self.at = self.ref, frame, now
+        if ref is None or ref.shape != frame.shape:
+            return None
+        return float((np.abs(frame - ref).max(axis=-1) > self.PIXEL).mean()) > self.SHARE
+
+
+class AutoPicker:
+    """Chooses the mode from sound and a moving picture.
+
+        sound + moving picture  -> fusion
+        sound only              -> music
+        moving picture only     -> screen
+        neither                 -> screen: a still picture is read twice a
+                                   second and the lamp holds its colour;
+                                   a paused film keeps its light
+        no Screen Recording     -> music, always
+
+    It has to hold still through the ordinary gaps. Sound counts after
+    SOUND_ON seconds of it and is let go after SOUND_OFF of silence (the gap
+    between two tracks is a few seconds). A picture counts as moving after
+    two comparisons in a row say so, and as still after MOTION_OFF seconds
+    without one (a paused film). A pick stays at least HOLD seconds, except
+    the first, which lands after SETTLE seconds of watching.
+    """
+
+    SOUND_ON, SOUND_OFF = 2.0, 10.0
+    MOTION_OFF = 15.0
+    HOLD, SETTLE = 10.0, 3.0
+    QUIET = 0.004                       # rms: LevelEngine's own silence
+
+    def __init__(self, screen_ok=True, now=0.0, start=None):
+        self.screen_ok = screen_ok
+        self.mode = start or ("fusion" if screen_ok else "music")
+        self.since = now - self.HOLD + self.SETTLE
+        self.sound = self.moving = False
+        self._heard = self._quiet = None
+        self._runs, self._last_motion = 0, None
+        self._lock = threading.Lock()
+
+    def feed_sound(self, rms, now):
+        with self._lock:
+            if rms >= self.QUIET:
+                self._quiet = None
+                self._heard = self._heard if self._heard is not None else now
+                if now - self._heard >= self.SOUND_ON:
+                    self.sound = True
+            else:
+                self._heard = None
+                self._quiet = self._quiet if self._quiet is not None else now
+                if now - self._quiet >= self.SOUND_OFF:
+                    self.sound = False
+
+    def feed_motion(self, moving, now):
+        if moving is None:
+            return
+        with self._lock:
+            if moving:
+                self._runs += 1
+                self._last_motion = now
+                if self._runs >= 2:
+                    self.moving = True
+            else:
+                self._runs = 0
+                if self._last_motion is None or now - self._last_motion >= self.MOTION_OFF:
+                    self.moving = False
+
+    def want(self):
+        if not self.screen_ok:
+            return "music"
+        if self.sound:
+            return "fusion" if self.moving else "music"
+        return "screen"
+
+    def pick(self, now):
+        """-> the mode to run now."""
+        with self._lock:
+            want = self.want()
+            if want != self.mode and now - self.since >= self.HOLD:
+                self.mode, self.since = want, now
+            return self.mode
+
+
+# ---------------------------------------------------------------------------
 # sender thread - keeps network latency out of the audio loop
 # ---------------------------------------------------------------------------
 class Sender(threading.Thread):
+    """Puts frames on the wire off the audio and screen loops' clocks.
+
+    A failed send ends the sender: the error is kept in `error`, `lost` is
+    set, and whoever owns the bulb (Link) decides whether to reconnect. It
+    used to retry forever on the same Bulb, whose socket yeelight had already
+    thrown away, and each retry opened another connection to a bulb that was
+    struggling."""
+
     def __init__(self, bulb):
         super().__init__(daemon=True)
         self.bulb = bulb
         self.box = queue.Queue(maxsize=1)          # latest value wins
         self.alive = True
+        self.lost = threading.Event()
+        self.error = None
 
     def put(self, hsv, sudden, duration=40):
         """Queue one frame. `duration` is the bulb-side ramp for smooth sends;
@@ -761,22 +1147,28 @@ class Sender(threading.Thread):
             item = self.box.get()                  # no wake-ups between frames
             if item is None:
                 break
-            (h, s, v), sudden, duration = item
+            frame, sudden, duration = item
             try:
-                self.bulb.set_hsv(h, s, v,
-                                  effect="sudden" if sudden else "smooth",
-                                  duration=0 if sudden else duration)
+                send_frame(self.bulb, frame, sudden, duration)
             except Exception as exc:
-                print("link dropped, reopening music mode:", exc, file=sys.stderr)
-                time.sleep(0.4)
-                try:
-                    self.bulb.stop_music()
-                except Exception:
-                    pass
-                try:
-                    self.bulb.start_music()
-                except Exception:
-                    time.sleep(1.0)
+                self.error = exc
+                self.lost.set()
+                break
+
+
+def send_frame(bulb, frame, sudden, duration):
+    """One frame onto a bulb in music mode.
+
+    Colour goes through yeelight's set_hsv, which becomes a one-step flow in
+    RGB mode. A White frame is the same flow in colour-temperature mode (2);
+    `sudden` is the 50 ms step yeelight uses for colour."""
+    if isinstance(frame, White):
+        ms = 50 if sudden else max(int(duration), 30)
+        bulb.send_command("start_cf", [1, 1, f"{ms}, 2, {frame.ct}, {frame.bright}"])
+        return
+    h, s, v = frame
+    bulb.set_hsv(h, s, v, effect="sudden" if sudden else "smooth",
+                 duration=0 if sudden else duration)
 
 
 # What the lamp was showing before a session took it, so stopping can put it
@@ -886,7 +1278,35 @@ def restore_commands(saved, ms=300):
     return cmds
 
 
-def open_bulb(ip, attempts=3, on_attempt=None, remember=True):
+def _stage(exc, name):
+    """Tag an exception with the step of open_bulb() it came from, which is
+    what classify() reads to explain it."""
+    if getattr(exc, "bulbd_stage", None) is None:
+        try:
+            exc.bulbd_stage = name
+        except Exception:
+            pass
+    return exc
+
+
+def _harden(sock):
+    """Make a dead music connection fail within seconds, not minutes.
+
+    A send to a bulb that lost power sits in the kernel's buffer while TCP
+    retransmits for minutes; nothing raises, so nothing reconnects. A send
+    timeout and (on macOS) a cap on how long unacknowledged data may wait
+    turn that into an error the sender sees."""
+    try:
+        sock.settimeout(2.0)
+        if sys.platform == "darwin":
+            sock.setsockopt(socket.IPPROTO_TCP, 0x80, 6)     # TCP_RXT_CONNDROPTIME
+        elif hasattr(socket, "TCP_USER_TIMEOUT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 6000)
+    except Exception:
+        pass
+
+
+def open_bulb(ip, attempts=3, on_attempt=None, remember=True, memo=None):
     """Connect and enter music mode, retrying a bulb that is still busy.
 
     A color5 accepts only a handful of LAN connections at once, so a slot
@@ -895,15 +1315,21 @@ def open_bulb(ip, attempts=3, on_attempt=None, remember=True):
     seconds, so `on_attempt(n, total, error)` reports progress - without it
     a caller showing "connecting" just looks hung.
 
-    With `remember`, the lamp's state is read first - on the connection the
-    session is about to use, not one of its own - and kept on the bulb as
-    `bulbd_saved`, for release_bulb(bulb, restore=True). It is read once: a
-    retry must not mistake what a failed attempt left behind for the lamp's
-    own look. An answer that makes no sense only means nothing is restored.
+    Every attempt first asks the lamp for its state with lamp_call(), on the
+    connection the session is about to use: bounded, where yeelight's own
+    first command can wait forever on a bulb that closed the socket. With
+    `remember` the answer is kept on the bulb as `bulbd_saved`, for
+    release_bulb(bulb, restore=True). It is kept once: a retry must not
+    mistake what a failed attempt left behind for the lamp's own look. Pass a
+    dict as `memo` to carry that first reading across separate calls (Link
+    does). An answer that makes no sense only means nothing is restored.
+
+    A failure is raised as it came, tagged `bulbd_stage` = connect, query
+    or music, for classify().
     """
     from yeelight import Bulb
 
-    saved, asked = None, False
+    memo = {} if memo is None else memo
     last = None
     for i in range(attempts):
         if on_attempt:
@@ -911,23 +1337,32 @@ def open_bulb(ip, attempts=3, on_attempt=None, remember=True):
         bulb = Bulb(ip, effect="sudden", duration=0, auto_on=True)
         bulb.bulbd_saved = None
         try:
-            if remember and not asked:
+            try:
+                sock = bulb._socket
+            except Exception as exc:
+                raise _stage(exc, "connect")
+            try:
                 # a bulb that will not answer this will not answer turn_on
                 # either, so a timeout here fails the attempt like any other
-                saved = read_lamp(ip, sock=bulb._socket)
-                asked = True
-            bulb.bulbd_saved = saved
-            bulb.turn_on()
-            bulb.start_music()
+                reading = read_lamp(ip, sock=sock)
+            except Exception as exc:
+                raise _stage(exc, "query")
+            if remember and "saved" not in memo:
+                memo["saved"] = reading
+            bulb.bulbd_saved = memo.get("saved") if remember else None
+            try:
+                bulb.turn_on()
+                bulb.start_music()
+            except Exception as exc:
+                raise _stage(exc, "music")
+            _harden(getattr(bulb, "_Bulb__socket", None) or sock)
             return bulb
         except Exception as exc:
             last = exc
             release_bulb(bulb)
             if i < attempts - 1:
                 time.sleep(1.5 * (i + 1))
-    raise RuntimeError(f"could not open music mode on {ip} after {attempts} "
-                       f"tries: {str(last).rstrip('.')}. If the bulb answers discovery but not "
-                       f"port 55443, its LAN slots are wedged - power-cycle it")
+    raise last
 
 
 def release_bulb(bulb, restore=False):
@@ -974,6 +1409,377 @@ def release_bulb(bulb, restore=False):
         except Exception:
             pass
     return restored
+
+
+def abandon_bulb(bulb):
+    """Close a dropped link's socket without sending anything.
+
+    release_bulb() would send `set_music 0` on a fresh connection, which to a
+    bulb that has just vanished is a 5 s connect timeout and, to one that is
+    struggling, one more slot taken."""
+    sock = getattr(bulb, "_Bulb__socket", None)
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    try:
+        bulb._Bulb__socket = None
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# finding the bulb again - the miio hello
+# ---------------------------------------------------------------------------
+# Every miio device answers a 32-byte hello on UDP 54321 with its device id,
+# even during a music session, and it costs no TCP slot. SSDP discovery
+# returns nothing on the Mac this was written on; the hello to the subnet's
+# broadcast address is answered (255.255.255.255 is refused by macOS).
+MIIO_PORT = 54321
+HELLO = bytes.fromhex("21310020" + "ff" * 28)
+
+
+def _udp():
+    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def hello_id(data):
+    """The device id in a hello answer, or None if `data` is not one."""
+    if len(data) < 32 or data[:2] != b"\x21\x31":
+        return None
+    return int.from_bytes(data[8:12], "big")
+
+
+def _collect(sock, deadline, want=None):
+    """Read hello answers until `deadline`. -> {address: device id}, or as
+    soon as `want` (a device id) answers, {its address: want}."""
+    seen = {}
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return seen
+        try:
+            sock.settimeout(left)
+            data, addr = sock.recvfrom(1024)
+        except OSError:                            # timeout, or the net went away
+            return seen
+        did = hello_id(data)
+        if did is None:
+            continue
+        seen[addr[0]] = did
+        if want is not None and did == want:
+            return {addr[0]: did}
+
+
+def miio_hello(ip, timeout=0.8, tries=2, udp=_udp):
+    """Ask `ip` for its miio device id. -> int, or None if nothing answered."""
+    try:
+        s = udp()
+    except OSError:
+        return None
+    try:
+        for _ in range(tries):
+            s.sendto(HELLO, (ip, MIIO_PORT))
+            seen = _collect(s, time.monotonic() + timeout)
+            if ip in seen:
+                return seen[ip]
+        return None
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def local_net(near_ip, udp=_udp):
+    """(this machine's address towards `near_ip`, that LAN's broadcast).
+
+    A connected UDP socket sends nothing but tells which interface the route
+    uses. The broadcast address is read from ifconfig where it can be, else
+    taken as the /24's - which is what a home router hands out."""
+    s = udp()
+    try:
+        s.connect((near_ip, MIIO_PORT))
+        local = s.getsockname()[0]
+    finally:
+        s.close()
+    bcast = None
+    try:
+        import subprocess
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True,
+                             timeout=1.0).stdout
+        import re
+        m = re.search(r"inet %s\b[^\n]*?broadcast (\d+\.\d+\.\d+\.\d+)"
+                      % re.escape(local), out)
+        bcast = m.group(1) if m else None
+    except Exception:
+        pass
+    return local, bcast or ".".join(local.split(".")[:3] + ["255"])
+
+
+def find_bulb(did, near_ip, timeout=1.5, sweep=True, udp=_udp, net=local_net):
+    """Where the device with miio id `did` is now, or None.
+
+    One hello to the broadcast address of the LAN `near_ip` was on; if no
+    answer carries the id, one unicast hello to every other address of that
+    /24, paced over about a quarter of a second, for routers that drop
+    broadcasts. Bounded: a few seconds at most, and nothing here opens a TCP
+    connection."""
+    try:
+        local, bcast = net(near_ip, udp)
+        s = udp()
+    except OSError:
+        return None
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.sendto(HELLO, (bcast, MIIO_PORT))
+        for addr, got in _collect(s, time.monotonic() + timeout, want=did).items():
+            if got == did:
+                return addr
+        if not sweep:
+            return None
+        prefix = local.rsplit(".", 1)[0]
+        for n in range(1, 255):
+            addr = f"{prefix}.{n}"
+            if addr != local:
+                s.sendto(HELLO, (addr, MIIO_PORT))
+                if n % 32 == 0:
+                    time.sleep(0.03)
+        for addr, got in _collect(s, time.monotonic() + timeout, want=did).items():
+            if got == did:
+                return addr
+        return None
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------------
+# why it cannot connect, in plain words
+# ---------------------------------------------------------------------------
+class BulbUnreachable(RuntimeError):
+    """The bulb could not be opened, with the reason a person can act on.
+
+    `kind` is one of no_device, not_bulb, lan_off, busy, blocked, other;
+    `action` is "setup" when the fix is in the desk's Setup deck."""
+
+    def __init__(self, kind, ip, detail="", searched=False, lost=False):
+        self.kind, self.ip, self.detail, self.searched = kind, ip, detail, searched
+        self.action = "setup" if kind in ("not_bulb", "lan_off") else None
+        text = {
+            "no_device": f"Nothing answers at {ip}"
+                         + (", and the bulb is not answering anywhere else on "
+                            "this network" if searched else "")
+                         + ". Check that it has power.",
+            "not_bulb": f"{ip} is another device, not the bulb. Find the "
+                        f"bulb's address in Setup.",
+            "lan_off": "The bulb is there, but LAN control is off. Turn it on "
+                       "with Enable LAN in Setup.",
+            "busy": "The bulb is there but takes no more connections. Wait a "
+                    "minute and press Start; if that fails, switch it off and "
+                    "on at the wall.",
+            "blocked": "The bulb could not connect back to this computer, which "
+                       "music mode needs. Allow incoming connections for Python "
+                       "in the firewall.",
+        }.get(kind, f"Could not open the bulb at {ip}: {str(detail).rstrip('.')}.")
+        if lost:
+            text = "Lost the bulb and could not get it back. " + text
+        super().__init__(text)
+
+
+def classify(exc, answered, known):
+    """Which BulbUnreachable kind a failed open_bulb() was.
+
+    `answered`: a miio hello came back from the address. `known`: it came
+    back with the id of a bulb this desk has opened before, so LAN control
+    was on. A refused port on a bulb that has worked is far more likely full
+    slots than a switched-off API; on a bulb never opened, the reverse."""
+    stage = getattr(exc, "bulbd_stage", None)
+    if stage == "connect":
+        if isinstance(exc, ConnectionRefusedError):
+            if not answered:
+                return "not_bulb"
+            return "busy" if known else "lan_off"
+        return "busy" if answered else "no_device"
+    if stage == "query":
+        return "busy"
+    if stage == "music":
+        return "blocked" if isinstance(exc, (socket.timeout, TimeoutError)) else "busy"
+    return "other"
+
+
+class Link:
+    """One bulb from Start to Stop: open it, notice a drop, get it back.
+
+    Every connection still goes through open_bulb() and release_bulb(). Each
+    try starts with a miio hello (UDP, no slot). If the address no longer
+    answers with this bulb's id, find_bulb() looks for the id on the LAN and
+    the link moves there; `moved(ip, did)` tells the owner, which saves it.
+    The id is learned on the first successful open. A failure is raised as
+    BulbUnreachable, already explained.
+
+    A first open retries only what time can fix (busy slots). After a drop,
+    recover() waits RETRY seconds before each try and returns False the
+    moment `stopped` is set. Nothing here adds a connection to a healthy
+    session, and the waits keep a struggling bulb from being hammered.
+
+    `status(word, notice)` reports progress: a short word for the top bar
+    and None or (kind, text) for the note.
+    """
+
+    START_WAITS = (1.5, 3.0)                 # between the tries of a first open
+    RETRY = (1, 2, 4, 8, 15, 30)             # before each try after a drop
+
+    def __init__(self, ip, did=None, remember=True, status=None, stopped=None,
+                 moved=None):
+        self.ip, self.did, self.remember = ip, did, remember
+        self.status = status or (lambda word, notice=None: None)
+        self.stopped = stopped or threading.Event()
+        self.moved = moved or (lambda ip, did: None)
+        self.bulb = None
+        self.sender = None
+        self.memo = {}                       # the lamp's look, read once at Start
+        self.moved_note = None
+
+    # -- the pieces, looked up late so tests can swap them ----------------
+    def _hello(self, ip):
+        return miio_hello(ip)
+
+    def _find(self, did, ip):
+        return find_bulb(did, ip)
+
+    def _open(self, ip):
+        return open_bulb(ip, attempts=1, remember=self.remember, memo=self.memo)
+
+    # ---------------------------------------------------------------------
+    @property
+    def saved(self):
+        return self.memo.get("saved")
+
+    @property
+    def lost(self):
+        return self.sender is not None and self.sender.lost.is_set()
+
+    def put(self, *a, **kw):
+        if self.sender is not None:
+            self.sender.put(*a, **kw)
+
+    def _try(self):
+        """One hello, maybe a search, one open. -> bulb or BulbUnreachable."""
+        self.moved_note = None
+        seen = self._hello(self.ip)
+        if self.did is not None and seen != self.did:
+            gone = seen is None
+            self.status("searching", ("warn", (
+                f"Nothing answers at {self.ip}." if gone
+                else f"{self.ip} is another device now.")
+                + " Looking for the bulb on this network."))
+            found = self._find(self.did, self.ip)
+            if not found:
+                raise BulbUnreachable("no_device" if gone else "not_bulb",
+                                      self.ip, searched=True)
+            seen = self.did
+            if found != self.ip:
+                old, self.ip = self.ip, found
+                self.moved(found, self.did)
+                self.moved_note = ("ok", f"The bulb moved from {old} to {found}.")
+            # found at its own address: the first hello was simply lost, which
+            # this Wi-Fi does often enough - carry on rather than call it gone
+            self.status("connecting", self.moved_note)
+        try:
+            bulb = self._open(self.ip)
+        except Exception as exc:
+            known = self.did is not None and seen == self.did
+            raise BulbUnreachable(classify(exc, seen is not None, known),
+                                  self.ip, detail=exc) from exc
+        if seen is not None and seen != self.did:
+            self.did = seen
+            self.moved(self.ip, seen)
+        return bulb
+
+    def _start(self, bulb):
+        bulb.bulbd_saved = self.saved
+        self.bulb = bulb
+        self.sender = Sender(bulb)
+        self.sender.start()
+
+    def _wait(self, secs, tick=None):
+        """Sleep `secs` unless stopped; `tick(left)` once a second. -> stopped."""
+        end = time.monotonic() + secs
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return self.stopped.is_set()
+            if tick:
+                tick(int(math.ceil(left)))
+            if self.stopped.wait(min(left, 1.0)):
+                return True
+
+    def open(self):
+        """Connect for a new session. -> True, or False if stopped first."""
+        waits = (0.0,) + tuple(self.START_WAITS)
+        for i, wait in enumerate(waits):
+            if wait and self._wait(wait):
+                return False
+            if self.stopped.is_set():
+                return False
+            self.status("connecting" if i == 0 else f"connecting {i + 1}/{len(waits)}")
+            try:
+                bulb = self._try()
+            except BulbUnreachable as exc:
+                if exc.kind not in ("busy", "other") or i == len(waits) - 1:
+                    raise
+                continue
+            self._start(bulb)
+            return True
+        return False                                          # pragma: no cover
+
+    def recover(self):
+        """After a drop: let go of the dead link, then try again on RETRY.
+        -> True when back, False when stopped. Raises BulbUnreachable when
+        every try failed."""
+        self._drop()
+        last, n = None, len(self.RETRY)
+        for i, wait in enumerate(self.RETRY, 1):
+            word = f"reconnecting {i}/{n}"
+            if self._wait(wait, lambda left: self.status(word, (
+                    "warn", f"Lost the bulb. Trying again in {left} s."))):
+                return False
+            self.status(word, ("warn", "Lost the bulb. Trying again now."))
+            try:
+                bulb = self._try()
+            except BulbUnreachable as exc:
+                last = exc
+                continue
+            self._start(bulb)
+            self.status("connected", self.moved_note)
+            return True
+        raise BulbUnreachable(last.kind, last.ip, detail=last.detail,
+                              searched=last.searched, lost=True)
+
+    def _drop(self):
+        if self.sender is not None:
+            self.sender.stop(timeout=2.5)
+            self.sender = None
+        bulb, self.bulb = self.bulb, None
+        if bulb is not None:
+            abandon_bulb(bulb)
+
+    def close(self, restore=False):
+        """End the session: put the lamp back if asked and it can be reached.
+        -> True if it was restored."""
+        lost = self.lost
+        if self.sender is not None:
+            self.sender.stop()
+            self.sender = None
+        bulb, self.bulb = self.bulb, None
+        if bulb is None:
+            return False
+        if lost:
+            abandon_bulb(bulb)
+            return False
+        return release_bulb(bulb, restore=(self.saved or False) if restore else False)
 
 
 # ---------------------------------------------------------------------------
@@ -1067,35 +1873,53 @@ def pick_recorder(mic_name=None, quiet=False):
     return sc.default_microphone()
 
 
+def cli_link(args):
+    """Open the bulb for a CLI run, printing what the desk would show."""
+    said = []
+
+    def say(word, notice=None):
+        # a reconnect counts down once a second; print each step once
+        if notice and not notice[1].startswith("Lost the bulb. Trying again in") \
+                and notice[1] not in said[-1:]:
+            said.append(notice[1])
+            print(notice[1], file=sys.stderr)
+
+    link = Link(args.ip, remember=args.restore, status=say)
+    link.open()
+    return link
+
+
 def run(args):
-    bulb = open_bulb(args.ip, remember=args.restore)
-    print(f"Music mode active on {args.ip}. Ctrl-C to stop.")
+    recorder = pick_recorder(args.mic)
+    link = cli_link(args)
+    sender = link
+    print(f"Music mode active on {link.ip}. Ctrl-C to stop.")
 
     analyser = Analyser()
     color = ColorEngine(args.palette, calm=args.calm, fade=args.fade)
-    sender = Sender(bulb)
-    sender.start()
-    recorder = pick_recorder(args.mic)
 
     dt = analyser.dt
     min_gap = 1.0 / args.fps
     lvl = LevelEngine(calm=args.calm)
+    sync = BeatSync()
     last_sent = 0.0
     last_hsv = None
 
     try:
         with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
             while True:
+                if link.lost:
+                    link.recover()
+                    last_hsv = None
                 f = analyser.feed(rec.record(numframes=BLOCK))
-
-                if lvl.feed(f, dt):
-                    color.step(f["t"], f["beat"])
+                fired = sync.feed(f, lvl, dt, args.lead / 1000.0, color)
 
                 color.maybe_switch(f["t"], f["bands"])
                 hue, sat = color.tick(dt, f["treble"], f["t"])
 
                 now = time.monotonic()
-                if now - last_sent < min_gap:
+                # a predicted beat goes out on its block, not the next free one
+                if now - last_sent < (LED_GAP if fired else min_gap):
                     continue
 
                 # perceptual gamma: a linear duty cycle looks washed out
@@ -1103,9 +1927,7 @@ def run(args):
                     4 + 96 * (lvl.brightness ** args.gamma), 1, 100)))
                 hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
-                if last_hsv and abs(hsv[2] - last_hsv[2]) < 2 \
-                        and abs(hsv[1] - last_hsv[1]) < 3 \
-                        and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 2:
+                if not fired and same_light(hsv, last_hsv, hue_tol=2):
                     continue
 
                 # a sweep in progress must never be cut into by a hard set,
@@ -1115,8 +1937,7 @@ def run(args):
                            duration=int(np.clip(min_gap * 1000, 30, 150)))
                 last_sent, last_hsv = now, hsv
     finally:
-        sender.stop()
-        release_bulb(bulb, restore=args.restore)
+        link.close(restore=args.restore)
 
 
 def run_screen(args):
@@ -1128,14 +1949,13 @@ def run_screen(args):
         return
 
     grab = ScreenGrabber(args.monitor, args.screen_region, args.screen_width)
-    bulb = open_bulb(args.ip, remember=args.restore)
-    print(f"Screen mode active on {args.ip}, monitor {args.monitor}, "
+    link = cli_link(args)
+    sender = link
+    print(f"Screen mode active on {link.ip}, monitor {args.monitor}, "
           f"{args.screen_fps} fps. Ctrl-C to stop.")
 
     color = ScreenColorEngine(min_sat=args.min_sat, sat_boost=args.sat_boost,
                               gamma=args.screen_gamma, calm=args.calm)
-    sender = Sender(bulb)
-    sender.start()
 
     pacer = CapturePacer()
     last = time.monotonic()
@@ -1143,6 +1963,9 @@ def run_screen(args):
 
     try:
         while True:
+            if link.lost:
+                link.recover()
+                last_hsv = None
             now = time.monotonic()
             dt, last = now - last, now
 
@@ -1152,25 +1975,20 @@ def run_screen(args):
             period = pacer.period(frame, args.screen_fps, now)
 
             v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
-            hsv = (int(round(hue)) % 360, int(round(sat)), v)
+            light = screen_frame(color, hue, sat, v)
 
             # skip sends the LEDs could not resolve anyway
-            settled = (last_hsv and not cut
-                       and abs(hsv[2] - last_hsv[2]) < 2
-                       and abs(hsv[1] - last_hsv[1]) < 3
-                       and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
-            if not settled:
+            if cut or not same_light(light, last_hsv):
                 # ramp for one frame gap so consecutive colours join up
-                sender.put(hsv, sudden=cut,
-                           duration=int(np.clip(period * 1000, 30, 150)))
-                last_hsv = hsv
+                sender.put(light, sudden=cut,
+                           duration=ramp_ms(light, last_hsv, period))
+                last_hsv = light
 
             slack = period - (time.monotonic() - now)
             if slack > 0:
                 time.sleep(slack)
     finally:
-        sender.stop()
-        release_bulb(bulb, restore=args.restore)
+        link.close(restore=args.restore)
         grab.close()
 
 
@@ -1187,15 +2005,15 @@ def run_fusion(args):
     color = ScreenColorEngine(min_sat=args.min_sat, sat_boost=args.sat_boost,
                               gamma=args.screen_gamma, calm=args.calm)
     screen = ScreenColorThread(grab, color, fps=args.screen_fps)
-    bulb = open_bulb(args.ip, remember=args.restore)
-    print(f"Fusion mode active on {args.ip}: colour from monitor "
+    recorder = pick_recorder(args.mic)
+    link = cli_link(args)
+    sender = link
+    print(f"Fusion mode active on {link.ip}: colour from monitor "
           f"{args.monitor}, brightness from audio. Ctrl-C to stop.")
 
     analyser = Analyser()
     lvl = LevelEngine(calm=args.calm)
-    recorder = pick_recorder(args.mic)
-    sender = Sender(bulb)
-    sender.start()
+    sync = BeatSync()
     screen.start()
 
     dt = analyser.dt
@@ -1206,36 +2024,35 @@ def run_fusion(args):
     try:
         with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
             while True:
+                if link.lost:
+                    link.recover()
+                    last_hsv = None
                 # the audio loop sets the pace; accents move brightness only,
                 # because here the display owns the colour
-                lvl.feed(analyser.feed(rec.record(numframes=BLOCK)), dt)
+                fired = sync.feed(analyser.feed(rec.record(numframes=BLOCK)),
+                                  lvl, dt, args.lead / 1000.0)
 
                 if screen.error:
                     raise RuntimeError(f"screen capture stopped: {screen.error}")
 
                 now = time.monotonic()
-                if now - last_sent < min_gap:
+                if now - last_sent < (LED_GAP if fired else min_gap):
                     continue
 
                 hue, sat, _val, cut = screen.read()
                 val = int(round(np.clip(
                     4 + 96 * (lvl.brightness ** args.gamma), 1, 100)))
-                hsv = (int(round(hue)) % 360, int(round(sat)), val)
+                light = screen_frame(screen, hue, sat, val)
 
-                settled = (last_hsv and not cut
-                           and abs(hsv[2] - last_hsv[2]) < 2
-                           and abs(hsv[1] - last_hsv[1]) < 3
-                           and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
-                if settled:
+                if not (cut or fired) and same_light(light, last_hsv):
                     continue
 
-                sender.put(hsv, sudden=cut or lvl.hit > 0.35,
-                           duration=int(np.clip(min_gap * 1000, 30, 150)))
-                last_sent, last_hsv = now, hsv
+                sender.put(light, sudden=cut or lvl.hit > 0.35,
+                           duration=ramp_ms(light, last_hsv, min_gap))
+                last_sent, last_hsv = now, light
     finally:
-        sender.stop()
         screen.close()
-        release_bulb(bulb, restore=args.restore)
+        link.close(restore=args.restore)
 
 
 def parse_region(text):
@@ -1266,6 +2083,10 @@ def main():
     p.add_argument("--no-restore", dest="restore", action="store_false",
                    help="leave the lamp on the last colour sent when this "
                         "exits, instead of putting back what it showed before")
+    p.add_argument("--lead", type=int, default=80, metavar="MS",
+                   help="beat sync: once the tempo holds, send each flash this "
+                        "many ms early so it lands on the beat over Wi-Fi "
+                        "(0 = flash when the beat is heard; default 80)")
     p.add_argument("--fade", type=float, default=0.0, metavar="SECONDS",
                    help="smooth colour mode: sweep between palette anchors "
                         "over this many seconds instead of snapping "
@@ -1308,6 +2129,9 @@ def main():
     if args.fusion and args.screen:
         p.error("--fusion already includes the screen; drop --screen")
 
+    if not 0 <= args.lead <= 250:
+        p.error("--lead must be between 0 and 250 ms")
+
     if not 0.0 <= args.fade <= 10.0:
         p.error("--fade must be between 0 and 10 seconds")
 
@@ -1337,6 +2161,9 @@ def main():
             run(args)
     except KeyboardInterrupt:
         print("\nbye")
+    except BulbUnreachable as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

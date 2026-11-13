@@ -6,7 +6,8 @@ from functools import lru_cache
 
 import numpy as np
 
-from music_bulb import BLOCK, SAMPLERATE, Analyser, ColorEngine, LevelEngine, ScreenColorEngine, crop_letterbox
+from music_bulb import (BLOCK, LED_GAP, SAMPLERATE, Analyser, BeatSync, ColorEngine, LevelEngine,
+                        ScreenColorEngine, crop_letterbox, same_light)
 
 SR = SAMPLERATE
 GATE = 0.12          # LevelEngine ignores onsets weaker than this (0.30 in calm mode)
@@ -104,22 +105,27 @@ def caught(onsets, kicks, after=5.0, offset=0.0, gate=GATE):
     return got, len(want)
 
 
-def run_music(pcm, palette=None, calm=False, fade=0.0, fps=25):
+def run_music(pcm, palette=None, calm=False, fade=0.0, fps=25, lead=0.0, colour=True):
     """The audio loop of music mode without the audio device and the bulb.
+    `lead` is beat sync in seconds (0 = off); colour=False runs it the way
+    fusion mode does, brightness only.
 
     -> dict with `rows` (t, hue, sat, brightness, hit, beat, palette per
-    frame), `onsets`, `steps` (t, from_hue, to_hue per colour step) and
-    `sends` (t, (h, s, v), sudden) as music mode would hand them to Sender.
+    frame), `onsets`, `steps` (t, from_hue, to_hue per colour step), `sends`
+    (t, (h, s, v), sudden) as music mode would hand them to Sender, and
+    `flashes` (t, predicted) for every frame that started a flash.
     """
     an, lv, ce = Analyser(), LevelEngine(calm=calm), ColorEngine(palette, calm=calm, fade=fade)
-    rows, onsets, steps, sends = [], [], [], []
+    sync = BeatSync()
+    rows, onsets, steps, sends, flashes = [], [], [], [], []
     last_sent, last_hsv, prev_target = -1.0, None, ce.target_hue
     for i in range(0, len(pcm) - BLOCK, BLOCK):
         f = an.feed(pcm[i:i + BLOCK])
         if f["onset"]:
             onsets.append((f["t"], f["strength"]))
-        if lv.feed(f, an.dt):
-            ce.step(f["t"], f["beat"])
+        fired = sync.feed(f, lv, an.dt, lead, ce if colour else None)
+        if lv.flashed:
+            flashes.append((f["t"], fired))
         ce.maybe_switch(f["t"], f["bands"])
         hue, sat = ce.tick(an.dt, f["treble"], f["t"])
         if ce.target_hue != prev_target:
@@ -127,16 +133,15 @@ def run_music(pcm, palette=None, calm=False, fade=0.0, fps=25):
             prev_target = ce.target_hue
         rows.append((f["t"], hue, sat, lv.brightness, lv.hit, f["beat"], ce.pal))
         now = f["t"]                         # the loop is paced by record(): audio time == wall time
-        if now - last_sent < 1.0 / fps:
+        if now - last_sent < (LED_GAP if fired else 1.0 / fps):
             continue
         val = int(round(np.clip(4 + 96 * (lv.brightness ** 1.9), 1, 100)))
         hsv = (int(round(hue)) % 360, int(round(sat)), val)
-        if last_hsv and abs(hsv[2] - last_hsv[2]) < 2 and abs(hsv[1] - last_hsv[1]) < 3 \
-                and abs(hue_gap(hsv[0], last_hsv[0])) < 2:
+        if not fired and same_light(hsv, last_hsv, hue_tol=2):
             continue
         sends.append((now, hsv, lv.hit > 0.35 and ce.fade_t is None))
         last_sent, last_hsv = now, hsv
-    return dict(rows=rows, onsets=onsets, steps=steps, sends=sends)
+    return dict(rows=rows, onsets=onsets, steps=steps, sends=sends, flashes=flashes)
 
 
 def hue_gap(a, b):

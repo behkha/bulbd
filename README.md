@@ -71,16 +71,21 @@ hard-coded to a particular network. Three ways to find it, best first:
    that works *before* developer mode is on, and you have to do that login
    anyway — so in practice you never hunt for the address separately. See
    [Getting the token](#getting-the-token).
-2. **SSDP discovery**, once developer mode is on:
+2. **The miio hello**, which every Xiaomi device answers on UDP 54321 with
+   its device id (SSDP discovery returns nothing on some Macs, this one
+   included):
    ```bash
-   python -c "from yeelight import discover_bulbs; print(discover_bulbs())"
+   python tools/check_link.py "$BULB_IP" hello    # is it there, and which id
+   python tools/check_link.py "$BULB_IP" find     # where that id is now
    ```
 3. **Your router's DHCP lease table**, or `arp -a`, and match the MAC the
    cloud reported.
 
-Give the bulb a DHCP reservation while you are in the router anyway. A lease
-that expires and moves the bulb to a new address looks exactly like a dead
-bulb from here.
+A DHCP reservation is still worth making. Without one the desk copes: it
+remembers the bulb's device id the first time it connects, and when the
+address stops answering with that id it broadcasts the hello on your LAN
+(then asks every address of the /24 if the router drops broadcasts), moves to
+wherever the bulb answers and saves the new address.
 
 The rest of this README writes that address as `BULB_IP`.
 
@@ -103,12 +108,27 @@ python music_bulb.py --ip "$BULB_IP"                    # music
 python music_bulb.py --ip "$BULB_IP" --screen           # screen
 python music_bulb.py --ip "$BULB_IP" --fusion           # both
 python music_bulb.py --ip "$BULB_IP" --fade 1.5         # sweep, don't snap
+python music_bulb.py --ip "$BULB_IP" --lead 0           # flash when heard
 ```
 
 `--fade SECONDS` keeps the palette anchors and the onsets that pick them;
 only the traversal between two anchors becomes a timed sweep on a smoothstep
 ramp. Steps are spaced at least `fade` apart so one sweep lands before the
 next begins.
+
+`--lead MS` (default 80) is **Beat sync**. A flash sent when the beat is
+heard lands late: the onset shows at the end of its 23 ms block, then comes
+the Wi-Fi hop and the bulb's 50 ms ramp. Once four beats in a row sit on the
+tempo, the next beat is predicted and its flash sent that many ms early. A
+beat gives one flash: the real onset arriving for a beat already flashed is
+claimed, not flashed again. When the music stops or holds a note, at most
+the one beat already due is flashed before it falls back to flashing what it
+hears. Colour still steps only on accents that were really heard; an accent
+on a predicted beat makes its step land with the next predicted flash. 80 ms
+is about half the measured round trip plus half the ramp, aimed slightly
+early because a light that leads the sound is noticed only past ~125 ms and
+one that trails it past ~45 ms; it was confirmed on the lamp here. Raise it if
+flashes still trail the beat on your network, lower it if your speakers lag.
 
 ## The desk
 
@@ -121,6 +141,25 @@ The desk swaps its controls to match the mode. Fusion shows both halves minus
 what it can't use: the palettes, the colour fade and the dark lift have
 nothing to act on when the display owns the hue and the audio owns the
 brightness.
+
+- **Auto** (beside Calm) picks the mode from what is happening: sound and a
+  moving picture → Fusion, sound only → Music, a moving picture only →
+  Screen, neither → Screen (a still picture is read twice a second and the
+  lamp holds its colour, so a paused film keeps its light). The mode picker
+  shows the mode it picked; picking one by hand turns Auto off. It holds
+  through ordinary gaps: sound counts after 2 s and is let go after 10 s of
+  silence, a picture counts as moving after two looks in a row and as still
+  after 15 s, and a pick stays at least 10 s. Watching the input the current
+  mode does not use is cheap: in Music one screen grab every 2 s (every 4 s
+  after a still minute), in Screen the input's level only. Without Screen
+  Recording permission Auto stays on Music.
+- **Presets** sit under Start: one click sets mode, Auto, palette, Calm and
+  every fader. Club, Lounge, Cinema and Concert are built in; **Save as
+  preset** keeps the current look under a name, **Edit** renames or deletes
+  your own. A preset never touches the address, input, display, area or Beat
+  sync, which describe your room rather than a look. The chip of the preset
+  the desk matches is pressed; move a fader and none is.
+- **Beat sync** is the fader for `--lead` (music and fusion), Off at 0.
 
 - **Input** (music and fusion) lists every capture device plus *Automatic*,
   which names the device it resolves to. The bar under it is the raw input
@@ -139,8 +178,8 @@ brightness.
   connection. **Stop** puts the lamp back the way it was before Start —
   power, brightness, and colour or white temperature — and so does Ctrl-C;
   `--no-restore` leaves it on the last colour sent. The CLI does the same.
-- Settings — address, input, mode, palette, Calm, every fader, display and
-  area — are saved to `~/Library/Application Support/bulbd/settings.json`
+- Settings — address, the bulb's device id, input, mode, Auto, palette,
+  Calm, every fader, display, area and your presets — are saved to `~/Library/Application Support/bulbd/settings.json`
   a second after the last change and loaded at start (`--settings PATH` to
   move it, `--settings ''` to keep nothing). Start/Stop is not saved: the lamp
   never turns on by itself. `--ip` and `--mic` win over the file, and a
@@ -245,6 +284,19 @@ python music_bulb.py --ip "$BULB_IP" --screen --screen-region 0,40,1800,1000
 
 ## When the bulb stops answering
 
+The desk says why in plain words, with **Open Setup** where the fix is there:
+nothing answers at the address (and, if it knows the bulb's id, not anywhere
+else on the LAN either); the address is another device; the bulb is there but
+LAN control is off (**Enable LAN** in Setup); the bulb is there but takes no
+more connections (wait, then power-cycle); or it could not connect back to
+this computer, which music mode needs (a firewall). It finds out with one
+miio hello and the connect and `get_prop` that starting does anyway.
+
+If the link drops mid-session it reconnects on its own - 6 tries over about a
+minute, 1, 2, 4, 8, 15 and 30 s apart, through the same open and release as
+Start - and stops trying the moment you press Stop. The top bar counts the
+tries. A power cycle at the wall was back in about 9 s here.
+
 **"Bulb closed the connection."** The bulb accepts only a handful of LAN
 connections at once, and every dropped session used to burn a slot until it
 timed out — a few failed starts could lock it out completely. `open_bulb()`
@@ -253,11 +305,11 @@ the socket on every exit path. Nothing should construct `yeelight.Bulb`
 directly.
 
 If it's already wedged, that fix can't reach it — power-cycle at the switch.
-To tell a wedged bulb from a dead one, ask the channels that don't use the
+To tell a wedged bulb from a dead one, ask the channel that doesn't use the
 control socket:
 
 ```bash
-python -c "from yeelight import discover_bulbs; print(discover_bulbs())"
+python tools/check_link.py "$BULB_IP" hello
 ```
 
 SSDP keeps advertising power/bright/hue/sat, and a raw miio hello on UDP
@@ -265,14 +317,22 @@ SSDP keeps advertising power/bright/hue/sat, and a raw miio hello on UDP
 Both alive plus 55443 refusing means burnt connection slots — not a network
 or firmware problem.
 
-And ping the bulb before blaming the code. Round trips here run 40–90 ms over
-Wi-Fi, which is high for a LAN and shows up as lag at 25 updates/sec.
+And ping the bulb before blaming the code. Round trips here run 23–106 ms over
+Wi-Fi, which is high for a LAN; Beat sync hides the average, not the jitter.
 
 ## Limits worth knowing
 
-- Don't exceed ~30 updates/sec. The LEDs can't resolve past it, so both loops
-  clamp the rate and drop frames whose HSV sits inside the perceptual
-  deadband of the last one sent.
+- Don't exceed ~30 updates/sec. The LEDs can't resolve past it, so the loops
+  clamp the rate and drop frames inside the perceptual deadband of the last
+  one sent. A predicted beat may go out between two regular sends, but never
+  within 33 ms of the last one.
+- Grey scenes in Screen and Fusion go to the bulb's white LEDs: a colour
+  temperature from the picture's neutral light (6500 K for a white page,
+  warmer for warm greys, 2700 K at the floor), sent at 0.4 of the colour
+  frame's brightness number, because the white LEDs are that much brighter.
+  The gap between going white and coming back keeps a scene on the line from
+  flapping, and the switch crossfades over 300 ms. The match was set on the
+  lamp with `tools/check_white.py`.
 - In fusion mode the audio loop must call `record()` every ~23 ms or the input
   buffer backs up and onsets arrive late. A full-display grab costs ~26 ms, so
   capture runs on its own thread and publishes the latest colour; its scene-cut
@@ -289,7 +349,8 @@ Offline and deterministic: no bulb, no screen-recording permission, no audio
 device, no network (a test that opens a socket fails). It feeds synthetic
 drums, tones, noise and solid frames through the analyser, colour engines,
 capture pacer and sender, and checks the yeelight wire format against a fake
-socket. About 20 seconds.
+socket; the connection recovery, Beat sync, white frames, Auto and presets
+run against fakes of the bulb, the LAN and the clock. About 35 seconds.
 
 ## Layout
 
@@ -299,6 +360,10 @@ music_bulb_dash.py   the web desk; CloudSession drives the login
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
 tests/               pytest suite (synthetic signals in tests/signals.py)
 tools/check_bulb.py  manual check against a real bulb; not part of the suite
+tools/check_link.py  hello, find, diagnose and a power-cycle reconnect, real bulb
+tools/check_white.py white-LED brightness match and temperature sweep, real bulb
+tools/check_sync.py  Beat sync against a click track on your speakers, real bulb
+tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
 ```
 
 ## Credits
