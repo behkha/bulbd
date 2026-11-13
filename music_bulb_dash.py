@@ -602,377 +602,267 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>bulbd :: control surface</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<title>bulbd</title>
 <style>
+/* Split: the live colour fills the left, controls sit in one column on the
+   right; under 1000 px the colour folds into a band under the top bar.
+   The only colour on the page is the light's own - chrome is neutral, the
+   selected state is plain ink. Nothing animates on its own: every repaint
+   comes from a poll that carried new state. */
 :root{
-  --bg:#05070A; --panel:#0A0D13; --panel-hi:#0E131B;
-  --line:#18212C; --line-hot:#2B3B4E;
-  --ink:#C6D4E3; --dim:#6C7C90; --faint:#3E4B5B;
-  --acc:#5EEAD4; --acc2:#A78BFA;
-  --ok:#7CFFB2; --warn:#F0B67F; --err:#FF6B6B;
-  --grid:rgba(94,234,212,.045);
+  --bg:#f4f5f6; --sf:#ffffff; --sf2:#eceef0; --ink:#17181a; --dim:#686c73; --line:#dadde1;
+  --ok:#1f8a4c; --warn:#a86a00; --err:#c9362c;
+  color-scheme:light;
 }
+@media (prefers-color-scheme:dark){:root{
+  --bg:#141517; --sf:#1c1d20; --sf2:#242529; --ink:#e9eaec; --dim:#8d9199; --line:#2e3035;
+  --ok:#5fc58a; --warn:#e0a948; --err:#ef6b62;
+  color-scheme:dark;
+}}
 *{box-sizing:border-box}
 [hidden]{display:none !important}
-html,body{margin:0;height:100%}
-body{
-  background:
-    linear-gradient(180deg,#03050700 0,#030507 92%),
-    repeating-linear-gradient(0deg,var(--grid) 0 1px,transparent 1px 34px),
-    repeating-linear-gradient(90deg,var(--grid) 0 1px,transparent 1px 34px),
-    var(--bg);
-  color:var(--ink);
-  font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-size:13px; font-variant-numeric:tabular-nums;
-  display:flex; flex-direction:column; min-height:100%;
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);
+  font:14px/1.4 system-ui,-apple-system,"SF Pro Text","Segoe UI",sans-serif;
+  font-variant-numeric:tabular-nums}
+button,input,select{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+a{color:inherit}
+
+/* ---------- frame ---------- */
+.app{display:grid;grid-template-columns:1fr 520px;grid-template-rows:auto 1fr;
+  grid-template-areas:"lamp top" "lamp side";min-height:100vh}
+.lamp{grid-area:lamp;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;
+  border-right:1px solid var(--line)}
+.top{grid-area:top;display:flex;align-items:center;gap:18px;padding:14px 22px;min-height:56px}
+.side{grid-area:side;padding:10px 22px 28px;display:grid;gap:20px;align-content:start}
+body[data-deck="cloud"] .app{grid-template-columns:1fr;grid-template-areas:"top" "side"}
+body[data-deck="cloud"] .lamp{display:none}
+@media (max-width:999px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto;grid-template-areas:"top" "lamp" "side";min-height:0}
+  .lamp{position:static;height:auto;border-right:0}
+  .lamp .field{flex:0 0 190px}
+  .side{padding-top:18px}
 }
-body::after{
-  content:""; position:fixed; inset:0; pointer-events:none; z-index:9;
-  background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 1px,transparent 1px 3px);
-  mix-blend-mode:multiply; opacity:.5;
-}
-a{color:var(--acc)}
 
-/* ---------- masthead ---------- */
-.bar{position:sticky;top:0;z-index:8;display:flex;align-items:center;gap:14px;
-  padding:9px 16px;border-bottom:1px solid var(--line);
-  background:rgba(5,7,10,.92);backdrop-filter:blur(6px);flex-wrap:wrap}
-.brand{font-weight:700;letter-spacing:.16em;color:var(--acc)}
-.brand em{font-style:normal;color:var(--faint)}
-.led{width:7px;height:7px;border-radius:50%;background:var(--faint);box-shadow:0 0 0 0 rgba(124,255,178,.6)}
-.led[data-on="true"]{background:var(--ok);animation:beat 1.6s ease-out infinite}
-@keyframes beat{0%{box-shadow:0 0 0 0 rgba(124,255,178,.55)}70%{box-shadow:0 0 0 7px rgba(124,255,178,0)}100%{box-shadow:0 0 0 0 rgba(124,255,178,0)}}
-.bar .meta{color:var(--dim);letter-spacing:.05em}
-.bar .meta b{color:var(--ink);font-weight:500}
-.decks{margin-left:auto;display:flex;gap:6px}
-.deck-tab{font:inherit;letter-spacing:.14em;background:transparent;border:1px solid var(--line);
-  color:var(--dim);padding:5px 12px;cursor:pointer;border-radius:2px}
-.deck-tab:hover{border-color:var(--line-hot);color:var(--ink)}
-.deck-tab[aria-selected="true"]{color:#04110E;background:var(--acc);border-color:var(--acc);font-weight:700}
-.deck-tab:focus-visible{outline:2px solid var(--acc2);outline-offset:2px}
+/* ---------- top bar ---------- */
+.name{font-weight:680;font-size:15px;letter-spacing:-.01em}
+.st{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:13.5px;min-width:0}
+.st i{flex:none;width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.st.on{color:var(--ink)} .st.on i{background:var(--ok)}
+.st.busy i{background:var(--warn)}
+.st.bad{color:var(--err)} .st.bad i{background:var(--err)}
+#stxt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sp{flex:1}
+.addr{flex:none;font-size:13.5px;color:var(--dim);background:transparent;border:1px solid var(--line);
+  border-radius:7px;padding:5px 10px;cursor:pointer}
+.addr b{color:var(--ink);font-weight:500}
+.addr:hover{border-color:var(--dim)}
+.addr.need{color:var(--bg);background:var(--ink);border-color:var(--ink);font-weight:600}
+body[data-deck="cloud"] #addr, body[data-deck="cloud"] #status,
+body[data-deck="runtime"] #done{display:none}
 
-/* ---------- stage ---------- */
-.stage{position:relative;flex:0 0 auto;height:34vh;min-height:210px;display:grid;place-items:center;overflow:hidden;
-  border-bottom:1px solid var(--line)}
-.field{position:absolute;inset:0;background:#000;transition:background 70ms linear;opacity:.9}
-.vignette{position:absolute;inset:0;pointer-events:none;
-  background:radial-gradient(120% 92% at 50% 46%,transparent 26%,rgba(3,5,7,.86) 100%)}
-.crosshair{position:absolute;inset:0;pointer-events:none;
-  background:linear-gradient(90deg,transparent calc(50% - .5px),rgba(255,255,255,.07) 50%,transparent calc(50% + .5px)),
-             linear-gradient(0deg,transparent calc(50% - .5px),rgba(255,255,255,.07) 50%,transparent calc(50% + .5px))}
-.pulse{position:relative;width:min(40vmin,240px);aspect-ratio:1;border-radius:50%;
-  border:1px solid rgba(255,255,255,.18);transform:scale(1);transition:transform 60ms ease-out}
-.pulse::before{content:"";position:absolute;inset:-14px;border-radius:50%;border:1px dashed rgba(255,255,255,.10)}
-.readout{position:absolute;left:0;right:0;bottom:10px;display:flex;justify-content:center;flex-wrap:wrap;
-  gap:8px 20px;font-size:12px;color:rgba(255,255,255,.62);letter-spacing:.06em;
-  text-shadow:0 1px 8px rgba(0,0,0,.9)}
-.readout b{font-weight:700;color:#fff}
-.corner{position:absolute;width:12px;height:12px;border:1px solid rgba(255,255,255,.22)}
-.corner.tl{top:8px;left:8px;border-right:0;border-bottom:0}
-.corner.tr{top:8px;right:8px;border-left:0;border-bottom:0}
-.corner.bl{bottom:8px;left:8px;border-right:0;border-top:0}
-.corner.br{bottom:8px;right:8px;border-left:0;border-top:0}
+/* ---------- live colour ---------- */
+.field{position:relative;flex:1;min-height:0;background:var(--sf2)}
+.ro{position:absolute;left:20px;bottom:14px;right:20px;display:flex;flex-wrap:wrap;gap:4px 18px;
+  font-size:13.5px;font-weight:500;opacity:.82}
+.ro .pal{text-transform:capitalize}
+#tape{display:block;width:100%;height:16px}
+.spec{display:flex;align-items:flex-end;gap:3px;height:50px;padding:6px 20px 10px;border-bottom:1px solid var(--line)}
+.spec i{flex:1;height:3px;border-radius:2px 2px 0 0;background:var(--line)}
 
-.spectrum{display:flex;gap:2px;align-items:flex-end;height:40px;padding:6px 16px 0;
-  border-bottom:1px solid var(--line);background:var(--panel)}
-.spectrum i{flex:1;background:var(--line-hot);height:2px;transition:height 60ms linear,background 60ms linear}
+/* ---------- controls ---------- */
+.transport{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.seg{display:inline-flex;background:var(--sf2);border-radius:9px;padding:3px;gap:2px}
+.seg button{border:0;background:transparent;padding:6px 15px;border-radius:7px;color:var(--dim);cursor:pointer}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed="true"]{background:var(--sf);color:var(--ink);font-weight:600;box-shadow:0 0 0 1px var(--line)}
+.go{border:0;padding:8px 20px;border-radius:9px;background:var(--ink);color:var(--bg);font-weight:650;cursor:pointer}
+.go[data-on="true"]{background:transparent;color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--ink)}
+.chk{display:flex;align-items:center;gap:8px;cursor:pointer}
+.chk input{width:16px;height:16px;margin:0;accent-color:var(--ink)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:flex;align-items:center;gap:8px;padding:6px 11px 6px 7px;border-radius:8px;border:0;cursor:pointer;
+  background:var(--sf);box-shadow:inset 0 0 0 1px var(--line);font-size:13.5px;text-transform:capitalize}
+.chip s{display:block;width:30px;height:12px;border-radius:3px}
+.chip:hover{box-shadow:inset 0 0 0 1px var(--dim)}
+.chip[aria-pressed="true"]{box-shadow:inset 0 0 0 1.5px var(--ink);font-weight:600}
+.rows{display:grid;gap:4px}
+.r{display:grid;grid-template-columns:150px 1fr 54px;gap:16px;align-items:center;min-height:34px}
+.r output{text-align:right;color:var(--dim);font-size:13.5px}
+@media (max-width:520px){.r{grid-template-columns:110px 1fr 46px;gap:10px}}
+input[type=range]{--p:50%;-webkit-appearance:none;appearance:none;width:100%;height:20px;margin:0;background:transparent;cursor:pointer}
+input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;
+  background:linear-gradient(90deg,var(--dim) var(--p),var(--line) var(--p))}
+input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:var(--line)}
+input[type=range]::-moz-range-progress{height:4px;border-radius:2px;background:var(--dim)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+  background:var(--ink);margin-top:-6px;border:0}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--ink);border:0}
+.in{display:grid;gap:6px;font-size:13.5px}
+.in>span,.in>label{color:var(--dim)}
+select,input.tx{border:1px solid var(--line);background:var(--sf);border-radius:8px;padding:7px 11px;
+  min-height:36px;width:100%;font-size:14px}
+input.tx::placeholder{color:var(--dim)}
+.note{font-size:13.5px;margin:0}
+.note:empty{display:none}
+.warn{color:var(--warn)} .err{color:var(--err)} .ok{color:var(--ok)}
+.line{display:flex;gap:8px}
+.line>input{flex:1;min-width:0}
+.btn{border:0;padding:8px 16px;border-radius:8px;background:var(--sf2);font-weight:550;white-space:nowrap;cursor:pointer}
+.btn.pri{background:var(--ink);color:var(--bg)}
+.btn:disabled{opacity:.4;cursor:default}
+.mini{border:0;padding:4px 10px;border-radius:7px;background:transparent;box-shadow:inset 0 0 0 1px var(--line);
+  font-size:13px;white-space:nowrap;cursor:pointer}
+.mini:hover{box-shadow:inset 0 0 0 1px var(--dim)}
+.mini:disabled{opacity:.5}
 
-/* ---------- panels ---------- */
-.desk{padding:16px;display:grid;gap:14px;max-width:1000px;width:100%;margin:0 auto}
-.panel{position:relative;border:1px solid var(--line);background:var(--panel);padding:14px 14px 16px}
-.panel>h2{margin:0 0 12px;font-size:11px;letter-spacing:.2em;color:var(--dim);font-weight:500;
-  display:flex;align-items:center;gap:10px}
-.panel>h2 s{flex:1;height:1px;background:var(--line);text-decoration:none}
-.panel>h2 u{text-decoration:none;color:var(--acc);font-weight:700}
-.panel::before,.panel::after{content:"";position:absolute;width:8px;height:8px;border:1px solid var(--line-hot)}
-.panel::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
-.panel::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
-.hint{color:var(--faint);font-size:12px;margin:0;line-height:1.6}
-.hint b{color:var(--dim);font-weight:500}
-
-.chips{display:flex;flex-wrap:wrap;gap:6px}
-.chip{border:1px solid var(--line);background:transparent;padding:5px 10px 5px 7px;border-radius:2px;
-  color:var(--dim);font:inherit;font-size:12px;display:flex;align-items:center;gap:7px;cursor:pointer;
-  letter-spacing:.06em}
-.chip:hover{border-color:var(--line-hot);color:var(--ink)}
-.chip[aria-pressed="true"]{border-color:var(--acc);color:var(--acc);background:rgba(94,234,212,.07)}
-.chip s{width:24px;height:8px;text-decoration:none;display:block}
-.chip:focus-visible{outline:2px solid var(--acc2);outline-offset:2px}
-.chip.mode{padding:5px 13px;letter-spacing:.14em}
-
-.faders{display:grid;grid-template-columns:repeat(auto-fit,minmax(216px,1fr));gap:14px 22px}
-.fader{display:grid;gap:5px}
-.fader label{font-size:11px;letter-spacing:.14em;color:var(--dim);display:flex;justify-content:space-between;gap:10px}
-.fader label span{color:var(--acc);font-weight:700}
-input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:20px;background:transparent}
-input[type=range]::-webkit-slider-runnable-track{height:1px;background:var(--line-hot)}
-input[type=range]::-moz-range-track{height:1px;background:var(--line-hot)}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:16px;border-radius:1px;
-  background:var(--acc);margin-top:-8px;cursor:ew-resize}
-input[type=range]::-moz-range-thumb{width:10px;height:16px;border:0;border-radius:1px;background:var(--acc);cursor:ew-resize}
-input[type=range]:focus-visible{outline:2px solid var(--acc2);outline-offset:4px}
-
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button.act{font:inherit;font-size:12px;letter-spacing:.14em;border-radius:2px;padding:9px 18px;cursor:pointer;
-  border:1px solid var(--line-hot);background:var(--panel-hi);color:var(--ink)}
-button.act:hover{border-color:var(--acc);color:var(--acc)}
-button.act:disabled{opacity:.4;cursor:not-allowed}
-button.act:focus-visible{outline:2px solid var(--acc2);outline-offset:2px}
-button.go[data-on="true"]{background:var(--err);border-color:var(--err);color:#180505;font-weight:700}
-button.go[data-on="false"]{background:var(--acc);border-color:var(--acc);color:#04110E;font-weight:700}
-.status{font-size:12px;color:var(--faint);margin-left:auto;letter-spacing:.06em}
-.toggle{display:flex;align-items:center;gap:7px;font-size:11px;letter-spacing:.14em;color:var(--dim);cursor:pointer}
-select,input.txt{font:inherit;font-size:12px;color:var(--ink);background:var(--panel-hi);
-  border:1px solid var(--line);border-radius:2px;padding:8px 9px;width:100%}
-select:focus-visible,input.txt:focus-visible{outline:2px solid var(--acc2);outline-offset:1px}
-.field-lbl{font-size:11px;letter-spacing:.14em;color:var(--dim);display:block;margin-bottom:5px}
-.warn{color:var(--warn)}
-.err{color:var(--err)}
-.ok{color:var(--ok)}
-
-/* one desk, three modes - show only the controls that apply.
-   Fusion draws from both sides, so it hides .no-fusion instead: the
-   palette, the colour fade and the dark lift have nothing to act on
-   when the display owns the hue and the audio owns the brightness. */
+/* one desk, three modes - show only the controls that apply. Fusion draws
+   from both sides, so it hides .no-fusion instead: the palette, the colour
+   fade and the dark lift have nothing to act on when the display owns the
+   hue and the audio owns the brightness. */
 body[data-mode="music"] .only-screen,
 body[data-mode="screen"] .only-music,
-body[data-mode="fusion"] .no-fusion{display:none}
+body[data-mode="fusion"] .no-fusion{display:none !important}
 body[data-deck="runtime"] .deck-cloud,
-body[data-deck="cloud"] .deck-runtime{display:none}
-body[data-deck="cloud"] .stage,
-body[data-deck="cloud"] .spectrum{display:none}
+body[data-deck="cloud"] .deck-runtime{display:none !important}
 
-/* ---------- cloud deck ---------- */
-.console{background:#04060A;border:1px solid var(--line);padding:10px 12px;height:230px;overflow:auto;
-  font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
-.console div{color:var(--dim)}
-.console div.info{color:var(--acc)}
-.console div.ok{color:var(--ok)}
-.console div.warn{color:var(--warn)}
-.console div.error{color:var(--err)}
-.console div.entry{color:var(--ink)}
-.console .caret{color:var(--acc);animation:blink 1.1s step-end infinite}
-@keyframes blink{50%{opacity:0}}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-.qr{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-top:12px}
-.qr img{width:190px;height:190px;image-rendering:pixelated;border:1px solid var(--line-hot);background:#fff;padding:6px}
-table.dev{width:100%;border-collapse:collapse;font-size:12px}
-table.dev th{text-align:left;font-weight:500;letter-spacing:.14em;font-size:11px;color:var(--dim);
-  border-bottom:1px solid var(--line);padding:6px 8px}
-table.dev td{border-bottom:1px solid var(--line);padding:7px 8px;vertical-align:middle}
-table.dev tr:hover td{background:var(--panel-hi)}
-table.dev code{color:var(--acc);word-break:break-all}
-.mini{font:inherit;font-size:11px;letter-spacing:.1em;padding:4px 8px;border-radius:2px;cursor:pointer;
-  border:1px solid var(--line-hot);background:transparent;color:var(--dim)}
-.mini:hover{color:var(--acc);border-color:var(--acc)}
-.tag{font-size:10px;letter-spacing:.14em;border:1px solid var(--line-hot);color:var(--dim);padding:1px 5px}
-.tag.on{color:var(--ok);border-color:var(--ok)}
+/* ---------- setup ---------- */
+.setup{display:grid;grid-template-columns:380px 1fr;gap:24px;align-items:start}
+.login{display:grid;gap:12px}
+.log{background:var(--sf);border-radius:10px;padding:12px 14px;height:420px;overflow:auto;
+  font:12.5px/1.65 ui-monospace,Menlo,monospace;color:var(--dim);white-space:pre-wrap;word-break:break-word}
+.log .info{color:var(--ink)} .log .ok{color:var(--ok)} .log .warn{color:var(--warn)} .log .error{color:var(--err)}
+@media (max-width:999px){.setup{grid-template-columns:1fr}.log{height:180px}}
+.qr{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
+.qr img{max-width:190px;background:#fff;padding:8px;border-radius:6px;image-rendering:pixelated}
 .scroll{overflow-x:auto}
-@media (prefers-reduced-motion:reduce){
-  .field,.pulse,.spectrum i{transition:none}
-  .led[data-on="true"],.console .caret{animation:none}
-  body::after{display:none}
-}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;font-weight:500;color:var(--dim);padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+td code{font:12.5px ui-monospace,Menlo,monospace;color:var(--dim);margin-right:6px}
+td.acts{text-align:right}
+td .mini+.mini{margin-left:6px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-left:8px;vertical-align:1px}
+.empty{color:var(--dim);padding:12px 0;margin:0}
 </style></head><body data-mode="music" data-deck="runtime">
 
-<div class="bar">
-  <span class="brand">BULBD<em>/desk</em></span>
-  <span class="led" id="led" data-on="false"></span>
-  <span class="meta">bulb <b id="mip">-</b></span>
-  <span class="meta">mode <b id="mmode">music</b></span>
-  <span class="meta" id="mstatus">idle</span>
-  <div class="decks" role="tablist">
-    <button class="deck-tab" type="button" role="tab" data-deck="runtime" aria-selected="true">RUNTIME</button>
-    <button class="deck-tab" type="button" role="tab" data-deck="cloud" aria-selected="false">CLOUD</button>
-  </div>
-</div>
-
-<div class="stage">
-  <div class="field" id="field"></div>
-  <div class="crosshair"></div>
-  <div class="pulse" id="pulse"></div>
-  <div class="vignette"></div>
-  <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-  <div class="readout">
-    <span>hue <b id="rh">0</b></span>
-    <span>sat <b id="rs">0</b></span>
-    <span>bright <b id="rv">0</b></span>
-    <span class="only-music">bpm <b id="rb">0</b></span>
-    <span class="only-music no-fusion">palette <b id="rp">-</b></span>
-    <span class="only-screen">scene <b id="rc">-</b></span>
-    <span>input <b id="rd">-</b></span>
-  </div>
-</div>
-
-<div class="spectrum" id="spec"></div>
-
-<div class="desk">
-
-  <!-- ============================ RUNTIME ============================ -->
-  <div class="panel deck-runtime">
-    <h2><u>01</u> TRANSPORT <s></s></h2>
-    <div class="chips" id="modes" style="margin-bottom:12px">
-      <button class="chip mode" type="button" data-mode="music" aria-pressed="true">MUSIC</button>
-      <button class="chip mode" type="button" data-mode="screen" aria-pressed="false">SCREEN</button>
-      <button class="chip mode" type="button" data-mode="fusion" aria-pressed="false">FUSION</button>
-    </div>
-    <p class="hint" id="sub"></p>
-    <div class="row" style="margin-top:12px">
-      <button class="act go" id="go" data-on="false">START</button>
-      <label class="toggle"><input type="checkbox" id="calm"> CALM MODE</label>
-      <span class="status" id="status">idle</span>
-    </div>
+<div class="app">
+  <div class="top">
+    <span class="name">bulbd</span>
+    <span class="st" id="status"><i></i><span id="stxt">idle</span></span>
+    <span class="sp"></span>
+    <button class="addr" id="addr" type="button">Set up bulb</button>
+    <button class="btn" id="done" type="button">Done</button>
   </div>
 
-  <div class="panel deck-runtime only-music no-fusion">
-    <h2><u>02</u> PALETTE <s></s></h2>
-    <div class="chips" id="chips"></div>
-  </div>
-
-  <div class="panel deck-runtime only-screen">
-    <h2><u>02</u> CAPTURE <s></s></h2>
-    <div class="faders">
-      <div class="fader">
-        <label for="monitor">DISPLAY</label>
-        <select id="monitor"></select>
+  <div class="lamp deck-runtime">
+    <div class="field" id="field">
+      <div class="ro" id="ro" hidden>
+        <span id="rh"></span><span id="rs"></span><span id="rv"></span>
+        <span class="only-music" id="rb"></span>
+        <span class="only-music no-fusion pal" id="rp"></span>
+        <span class="only-music" id="rd"></span>
       </div>
     </div>
-    <p class="hint" id="permnote" style="margin-top:10px"></p>
+    <canvas id="tape" hidden></canvas>
+    <div class="spec" id="spec"></div>
   </div>
 
-  <div class="panel deck-runtime only-music">
-    <h2><u>03</u> AUDIO CHAIN <s></s></h2>
-    <div class="faders">
-      <div class="fader">
-        <label for="sens">BEAT SENSITIVITY <span id="v-sens">1.40</span></label>
-        <input type="range" id="sens" min="0.6" max="2.6" step="0.05" value="1.4">
-      </div>
-      <div class="fader">
-        <label for="gamma">CONTRAST <span id="v-gamma">1.90</span></label>
-        <input type="range" id="gamma" min="1" max="3" step="0.05" value="1.9">
-      </div>
-      <div class="fader">
-        <label for="punch">PUNCH <span id="v-punch">0.78</span></label>
-        <input type="range" id="punch" min="0.2" max="1" step="0.02" value="0.78">
-      </div>
-      <div class="fader">
-        <label for="fps">REFRESH RATE <span id="v-fps">25</span></label>
-        <input type="range" id="fps" min="8" max="30" step="1" value="25">
-      </div>
-      <div class="fader no-fusion">
-        <label for="fade">COLOUR FADE <span id="v-fade">0.00</span></label>
-        <input type="range" id="fade" min="0" max="6" step="0.1" value="0">
-      </div>
+  <div class="side">
+    <!-- ============================ RUNTIME ============================ -->
+    <p class="note err deck-runtime" id="errnote"></p>
+    <div class="transport deck-runtime">
+      <span class="seg" id="modes">
+        <button type="button" data-mode="music" aria-pressed="true">Music</button>
+        <button type="button" data-mode="screen" aria-pressed="false">Screen</button>
+        <button type="button" data-mode="fusion" aria-pressed="false">Fusion</button>
+      </span>
+      <span class="sp"></span>
+      <label class="chk"><input type="checkbox" id="calm">Calm</label>
+      <button class="go" id="go" type="button" data-on="false">Start</button>
     </div>
-  </div>
 
-  <div class="panel deck-runtime only-screen">
-    <h2><u>03</u> PICTURE CHAIN <s></s></h2>
-    <div class="faders">
-      <div class="fader no-fusion">
-        <label for="sgamma">DARK LIFT <span id="v-sgamma">0.75</span></label>
-        <input type="range" id="sgamma" min="0.4" max="1.6" step="0.05" value="0.75">
-      </div>
-      <div class="fader">
-        <label for="minsat">COLOUR FLOOR <span id="v-minsat">55</span></label>
-        <input type="range" id="minsat" min="0" max="90" step="1" value="55">
-      </div>
-      <div class="fader">
-        <label for="sboost">SATURATION BOOST <span id="v-sboost">1.35</span></label>
-        <input type="range" id="sboost" min="0.8" max="2" step="0.05" value="1.35">
-      </div>
-      <div class="fader">
-        <label for="sfps">CAPTURE RATE <span id="v-sfps">10</span></label>
-        <input type="range" id="sfps" min="4" max="30" step="1" value="10">
-      </div>
+    <div class="chips deck-runtime only-music no-fusion" id="chips"></div>
+
+    <div class="in deck-runtime only-screen">
+      <label for="monitor">Display</label>
+      <select id="monitor"></select>
+      <p class="note warn" id="permnote"></p>
     </div>
-  </div>
 
-  <!-- ============================= CLOUD ============================= -->
-  <div class="panel deck-cloud">
-    <h2><u>01</u> BULB ADDRESS <s></s></h2>
-    <div class="grid2">
-      <div>
-        <label class="field-lbl" for="ip">LAN ADDRESS</label>
-        <input class="txt" id="ip" placeholder="the bulb's LAN address" autocomplete="off" spellcheck="false">
-      </div>
-      <div style="display:flex;align-items:flex-end">
-        <button class="act" id="ipset">SET</button>
-      </div>
+    <div class="rows deck-runtime">
+      <div class="r only-music"><label for="sens">Beat sensitivity</label>
+        <input type="range" id="sens" min="0.6" max="2.6" step="0.05" value="1.4"><output id="v-sens"></output></div>
+      <div class="r only-music"><label for="gamma">Contrast</label>
+        <input type="range" id="gamma" min="1" max="3" step="0.05" value="1.9"><output id="v-gamma"></output></div>
+      <div class="r only-music"><label for="punch">Punch</label>
+        <input type="range" id="punch" min="0.2" max="1" step="0.02" value="0.78"><output id="v-punch"></output></div>
+      <div class="r only-music"><label for="fps">Refresh rate</label>
+        <input type="range" id="fps" min="8" max="30" step="1" value="25"><output id="v-fps"></output></div>
+      <div class="r only-music no-fusion"><label for="fade">Colour fade</label>
+        <input type="range" id="fade" min="0" max="6" step="0.1" value="0"><output id="v-fade"></output></div>
+      <div class="r only-screen no-fusion"><label for="sgamma">Dark lift</label>
+        <input type="range" id="sgamma" min="0.4" max="1.6" step="0.05" value="0.75"><output id="v-sgamma"></output></div>
+      <div class="r only-screen"><label for="minsat">Colour floor</label>
+        <input type="range" id="minsat" min="0" max="90" step="1" value="55"><output id="v-minsat"></output></div>
+      <div class="r only-screen"><label for="sboost">Saturation boost</label>
+        <input type="range" id="sboost" min="0.8" max="2" step="0.05" value="1.35"><output id="v-sboost"></output></div>
+      <div class="r only-screen"><label for="sfps">Capture rate</label>
+        <input type="range" id="sfps" min="4" max="30" step="1" value="10"><output id="v-sfps"></output></div>
     </div>
-    <p class="hint" style="margin-top:10px">The desk talks to the bulb over the Yeelight LAN API on port
-      55443. That port is only open once developer mode has been switched on with the bulb's miio token,
-      which is what the deck below fetches.</p>
-  </div>
 
-  <div class="panel deck-cloud">
-    <h2><u>02</u> XIAOMI CLOUD LOGIN <s></s></h2>
-    <p class="hint" id="cloudnote" style="margin-bottom:12px"></p>
-    <div id="cform">
-      <div class="chips" id="cmethods" style="margin-bottom:12px">
-        <button class="chip mode" type="button" data-method="password" aria-pressed="true">PASSWORD</button>
-        <button class="chip mode" type="button" data-method="qr" aria-pressed="false">QR CODE</button>
-      </div>
-      <div class="grid2" id="cpw">
-        <div>
-          <label class="field-lbl" for="cuser">ACCOUNT</label>
-          <input class="txt" id="cuser" autocomplete="username" spellcheck="false"
-                 placeholder="email, phone or user ID">
+    <!-- ============================== SETUP ============================== -->
+    <div class="setup deck-cloud">
+      <div class="login">
+        <div class="in">
+          <label for="ip">Bulb address</label>
+          <div class="line">
+            <input class="tx" id="ip" autocomplete="off" spellcheck="false">
+            <button class="btn" id="ipset" type="button">Set</button>
+          </div>
         </div>
-        <div>
-          <label class="field-lbl" for="cpass">PASSWORD</label>
-          <input class="txt" id="cpass" type="password" autocomplete="current-password">
+        <span class="seg" id="cmethods" style="justify-self:start;margin-top:6px">
+          <button type="button" data-method="password" aria-pressed="true">Password</button>
+          <button type="button" data-method="qr" aria-pressed="false">QR code</button>
+        </span>
+        <div class="login" id="cpw">
+          <div class="in"><label for="cuser">Account</label>
+            <input class="tx" id="cuser" autocomplete="username" spellcheck="false" placeholder="Email, phone or user ID"></div>
+          <div class="in"><label for="cpass">Password</label>
+            <input class="tx" id="cpass" type="password" autocomplete="current-password"></div>
+        </div>
+        <div class="in"><label for="cserver">Region</label><select id="cserver"></select></div>
+        <p class="note warn" id="cloudnote"></p>
+        <div class="line">
+          <button class="btn pri" id="cstart" type="button">Log in</button>
+          <button class="btn" id="ccancel" type="button" disabled>Abort</button>
+        </div>
+        <p class="note err" id="cerr"></p>
+        <div class="qr" id="cimgwrap" hidden>
+          <img id="cimg" alt="Verification image from the Xiaomi cloud">
+          <p class="note" id="cqr"></p>
+        </div>
+        <div class="in" id="cprompt" hidden>
+          <label id="cplabel" for="cpinput"></label>
+          <div class="line">
+            <input class="tx" id="cpinput" autocomplete="off" spellcheck="false">
+            <button class="btn pri" id="cpsend" type="button">Send</button>
+          </div>
         </div>
       </div>
-      <div class="grid2" style="margin-top:12px">
-        <div>
-          <label class="field-lbl" for="cserver">REGION</label>
-          <select id="cserver"></select>
-        </div>
-        <div style="display:flex;align-items:flex-end;gap:8px">
-          <button class="act" id="cstart">LOG IN</button>
-          <button class="act" id="ccancel" disabled>ABORT</button>
-        </div>
-      </div>
+      <div class="log" id="clog"><div class="info">ready</div></div>
     </div>
 
-    <div id="cprompt" hidden style="margin-top:14px">
-      <label class="field-lbl" id="cplabel" for="cpinput">ANSWER</label>
-      <div class="grid2">
-        <input class="txt" id="cpinput" autocomplete="off" spellcheck="false">
-        <div style="display:flex;align-items:flex-end;gap:8px">
-          <button class="act" id="cpsend">SEND</button>
-          <button class="act" id="cpcancel">ABORT</button>
-        </div>
-      </div>
+    <div class="deck-cloud">
+      <p class="empty" id="cdevnote">Log in to list the devices on your Xiaomi account.</p>
+      <div class="scroll"><table id="cdevtable" hidden>
+        <thead><tr><th>Name</th><th>Model</th><th>Address</th><th>Token</th><th></th></tr></thead>
+        <tbody id="cdevs"></tbody>
+      </table></div>
+      <p class="note" id="clan" style="padding-top:10px"></p>
     </div>
-
-    <div class="qr" id="cimgwrap" hidden>
-      <img id="cimg" alt="verification image from the Xiaomi cloud">
-      <p class="hint" id="cqr"></p>
-    </div>
-
-    <h2 style="margin-top:16px"><u>LOG</u> <s></s></h2>
-    <div class="console" id="clog"><div class="info">ready<span class="caret"> _</span></div></div>
   </div>
-
-  <div class="panel deck-cloud">
-    <h2><u>03</u> DEVICES <s></s></h2>
-    <p class="hint" id="cdevnote">Nothing fetched yet. A successful login lists every device on the account
-      with its LAN address and miio token.</p>
-    <div class="scroll"><table class="dev" id="cdevtable" hidden>
-      <thead><tr><th>NAME</th><th>MODEL</th><th>IP</th><th>TOKEN</th><th></th></tr></thead>
-      <tbody id="cdevs"></tbody>
-    </table></div>
-    <p class="hint" id="clan" style="margin-top:10px"></p>
-    <p class="hint" style="margin-top:10px"><b>USE</b> points the desk at that address.
-      <b>ENABLE LAN</b> sends the token to the bulb and turns developer mode on, which is what opens
-      port 55443. Tokens are account secrets - treat them like a password.</p>
-  </div>
-
 </div>
 
 <script>
@@ -999,7 +889,7 @@ const chips = $('chips');
   const s=document.createElement('s');
   s.style.background = anchors
     ? 'linear-gradient(90deg,'+anchors.map(a=>`rgb(${hsv2rgb(a[0],a[1],92)})`).join(',')+')'
-    : 'repeating-linear-gradient(90deg,#2B3B4E 0 3px,#0A0D13 3px 6px)';
+    : 'repeating-linear-gradient(90deg,var(--dim) 0 2px,transparent 2px 5px)';
   b.append(s, document.createTextNode(name));
   b.onclick=()=>{
     [...chips.children].forEach(c=>c.setAttribute('aria-pressed', c===b));
@@ -1019,10 +909,27 @@ function setBars(n){
 }
 setBars(10);
 
+// the last 30 s of colour, drawn only when a poll brings a new state
+const tape=$('tape'), tctx=tape.getContext('2d'), TAPE_MS=30000;
+let tbuf=[];
+function drawTape(col){
+  const now=performance.now();
+  tbuf.push([now,col]);
+  while(tbuf.length>1 && tbuf[1][0] < now-TAPE_MS) tbuf.shift();
+  const dpr=devicePixelRatio||1, W=Math.round(tape.clientWidth*dpr), H=Math.round(tape.clientHeight*dpr);
+  if(tape.width!==W || tape.height!==H){ tape.width=W; tape.height=H; }
+  tctx.clearRect(0,0,W,H);
+  const x=t=>(t-(now-TAPE_MS))/TAPE_MS*W;
+  tbuf.forEach(([t,c],i)=>{
+    const x0=Math.max(0,x(t)), x1=i+1<tbuf.length ? x(tbuf[i+1][0]) : W;
+    tctx.fillStyle=c; tctx.fillRect(Math.floor(x0),0,Math.ceil(x1-x0)+1,H);
+  });
+}
+
 async function send(patch){
   holdUntil = Date.now()+700;
   try{ await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
-       body:JSON.stringify(patch)}); }catch(e){ $('status').textContent='server unreachable'; }
+       body:JSON.stringify(patch)}); }catch(e){ setStatus('server unreachable'); }
   poll();   // an idle desk polls slowly, so pick the change up now
 }
 async function post(path, body){
@@ -1035,41 +942,52 @@ const KEYS = {sens:'sensitivity', gamma:'gamma', punch:'punch', fps:'fps',
               fade:'fade',
               sgamma:'screen_gamma', minsat:'min_sat', sboost:'sat_boost',
               sfps:'screen_fps'};
-const WHOLE = new Set(['fps','sfps','minsat']);
+function fmt(id, v){
+  v=+v;
+  if(id==='fps' || id==='sfps') return v+'/s';
+  if(id==='fade') return v ? v.toFixed(1)+' s' : 'Off';
+  if(id==='minsat') return String(v);
+  return v.toFixed(2);
+}
+function paint(id){
+  const el=$(id);
+  el.style.setProperty('--p', (el.value-el.min)/(el.max-el.min)*100+'%');
+  $('v-'+id).textContent = fmt(id, el.value);
+}
 Object.keys(KEYS).forEach(id=>{
-  const el=$(id), out=$('v-'+id);
-  el.addEventListener('input',()=>{
-    out.textContent = WHOLE.has(id) ? el.value : (+el.value).toFixed(2);
-    send({[KEYS[id]]: +el.value});
-  });
+  const el=$(id);
+  paint(id);
+  el.addEventListener('input',()=>{ paint(id); send({[KEYS[id]]: +el.value}); });
 });
 
-const SUBS = {
-  music:'Colour moves in discrete palette steps on onsets. AUTO lets the palette follow section changes in the music. COLOUR FADE at 0 snaps between anchors; above 0 it sweeps between them over that many seconds.',
-  screen:'The lamp tracks the dominant colour on the display and interpolates continuously, snapping only on scene cuts. Bars show where the hue mass sits.',
-  fusion:'The display picks hue and saturation, the audio drives brightness. CAPTURE RATE is how often the screen is read; REFRESH RATE is how often the bulb is told.'
-};
-$('sub').textContent = SUBS.music;
+function setStatus(text){
+  const st=$('status');
+  // a failure arrives with a paragraph of advice: the bar says "error" and
+  // the advice goes in a note, where it has room to wrap
+  const m = /^error:\s*([\s\S]*)$/.exec(text);
+  $('stxt').textContent = m ? 'error' : text.replace('on the cloud deck','in Setup');
+  $('errnote').textContent = m ? m[1].charAt(0).toUpperCase() + m[1].slice(1) : '';
+  st.className = 'st' + (text==='running' ? ' on'
+    : /^(connecting|starting)/.test(text) ? ' busy'
+    : /^(error|no bulb|server)/.test(text) ? ' bad' : '');
+}
+
 [...$('modes').children].forEach(b=>{
   b.onclick=()=>{
     const m=b.dataset.mode;
     [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c===b));
     document.body.dataset.mode = m;
-    $('sub').textContent = SUBS[m];
     send({mode:m});
   };
 });
 function showDeck(name){
-  const tabs=[...document.querySelectorAll('.deck-tab')];
-  const tab = tabs.find(t=>t.dataset.deck===name) || tabs[0];
-  tabs.forEach(c=>c.setAttribute('aria-selected', c===tab));
-  document.body.dataset.deck = tab.dataset.deck;
-  if(tab.dataset.deck==='cloud' && window.cloudUp) cloudPoll();   // not before its state exists
+  const deck = name==='cloud' ? 'cloud' : 'runtime';
+  document.body.dataset.deck = deck;
+  if(deck==='cloud' && window.cloudUp) cloudPoll();   // not before its state exists
 }
-[...document.querySelectorAll('.deck-tab')].forEach(b=>{
-  b.onclick=()=>{ showDeck(b.dataset.deck); location.hash = b.dataset.deck; };
-});
-// #cloud in the URL opens straight onto that deck, so a link can point at it
+$('addr').onclick=()=>{ location.hash='cloud'; };
+$('done').onclick=()=>{ location.hash='runtime'; };
+// #cloud in the URL opens straight onto Setup, so a link can point at it
 showDeck(location.hash.slice(1));
 addEventListener('hashchange', ()=>showDeck(location.hash.slice(1)));
 
@@ -1088,7 +1006,7 @@ $('ip').addEventListener('input',()=>{ipTouched=true;});
 // Poll only as fast as there is something new to draw: the engine's own
 // rate while a session runs, once a second on an idle desk, slower when the
 // page is not on screen.
-let busy=false, pollTimer=0, live=null;
+let busy=false, pollTimer=0, live=null, wasRunning=false;
 function pollDelay(){
   if(document.hidden) return 2000;
   if(!live || !live.running) return 1000;
@@ -1101,51 +1019,52 @@ async function poll(){
     const s = await (await fetch('/api/state')).json();
     live = s;
     const [r,g,b] = hsv2rgb(s.hue, s.sat, s.val);
-    $('field').style.background = `rgb(${r},${g},${b})`;
-    $('pulse').style.transform = `scale(${1 + 0.10*s.hit})`;
-    $('pulse').style.boxShadow = `0 0 ${40+160*s.level}px rgba(${r},${g},${b},${0.35+0.5*s.level})`;
-    $('rh').textContent=s.hue; $('rs').textContent=s.sat; $('rv').textContent=s.val;
-    $('rb').textContent=s.bpm.toFixed(0); $('rp').textContent=s.active_palette;
-    $('rc').textContent = s.hit > 0.5 ? 'cut' : 'held';
-    $('rd').textContent=s.device;
-    $('status').textContent = s.status;
-    $('mstatus').textContent = s.status;
-    $('mip').textContent = s.ip || 'unset';
-    $('mmode').textContent = s.mode;
-    $('led').dataset.on = s.running;
-    $('go').dataset.on = s.running; $('go').textContent = s.running ? 'STOP' : 'START';
+    const col = `rgb(${r},${g},${b})`;
+    $('field').style.background = s.running ? col : '';
+    $('ro').hidden = $('tape').hidden = !s.running;
+    if(s.running){
+      if(!wasRunning) tbuf=[];
+      $('ro').style.color = (0.299*r+0.587*g+0.114*b) > 150 ? '#111' : '#fff';
+      $('rh').textContent=s.hue+'°'; $('rs').textContent=s.sat+'%'; $('rv').textContent=s.val+'%';
+      $('rb').textContent=s.bpm.toFixed(0)+' bpm'; $('rp').textContent=s.active_palette;
+      $('rd').textContent=s.device;
+      drawTape(col);
+    }
+    wasRunning = s.running;
+    setStatus(s.status);
+    const addr=$('addr');
+    addr.classList.toggle('need', !s.ip);
+    if(s.ip){ addr.innerHTML='Bulb <b></b>'; addr.lastChild.textContent=s.ip; }
+    else addr.textContent='Set up bulb';
+    $('go').dataset.on = s.running; $('go').textContent = s.running ? 'Stop' : 'Start';
     if(!ipTouched && document.activeElement !== $('ip')) $('ip').value = s.ip || '';
 
     const screenMode = s.mode === 'screen';
     setBars(s.bands.length);
     s.bands.forEach((v,i)=>{
-      bars[i].style.height = (2 + 36*v) + 'px';
+      const bar=bars[i];
+      bar.style.height = (3 + 34*v) + 'px';
       // in screen mode each bar owns a hue, so paint it with that hue
-      bars[i].style.background = screenMode
-        ? `hsl(${Math.round((i+0.5)*360/s.bands.length)},68%,${22+42*v}%)`
-        : `rgba(${r},${g},${b},${0.25 + 0.7*v})`;
+      bar.style.background = screenMode
+        ? `hsl(${Math.round((i+0.5)*360/s.bands.length)},62%,${30+34*v}%)`
+        : (s.running ? `rgba(${r},${g},${b},${0.35+0.65*v})` : '');
     });
 
     if(!monitorsBuilt && s.monitors.length){
       monitorsBuilt = true;
       $('monitor').innerHTML = s.monitors
-        .map(m=>`<option value="${m.i}">display ${m.i} - ${m.w}x${m.h}</option>`).join('');
+        .map(m=>`<option value="${m.i}">Display ${m.i}, ${m.w} × ${m.h}</option>`).join('');
       $('monitor').value = s.monitor;
     }
-    if(!s.monitors.length)
-      $('permnote').innerHTML = '<span class="warn">mss is not installed - run pip install mss</span>';
-    else if(!s.screen_ok)
-      $('permnote').innerHTML = '<span class="warn">No Screen Recording permission: '
-        + 'every frame would read as the desktop wallpaper. Grant it in '
-        + 'System Settings &gt; Privacy &amp; Security &gt; Screen Recording.</span>';
-    else $('permnote').textContent = '';
+    $('permnote').textContent = !s.monitors.length ? 'mss is not installed. Run pip install mss.'
+      : !s.screen_ok ? 'No Screen Recording permission. Grant it in System Settings › Privacy & Security › Screen Recording.'
+      : '';
 
     if(Date.now() > holdUntil){
       $('calm').checked = s.calm;
       [...chips.children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.name===s.palette));
       [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.mode===s.mode));
       document.body.dataset.mode = s.mode;
-      $('sub').textContent = SUBS[s.mode];
       $('monitor').value = s.monitor;
       // faders follow the desk too, or a reload leaves them showing whatever
       // the browser restored rather than what is running
@@ -1153,37 +1072,36 @@ async function poll(){
         const el=$(id), v=s[KEYS[id]];
         if(document.activeElement===el || +el.value===v) return;
         el.value = v;
-        $('v-'+id).textContent = WHOLE.has(id) ? el.value : (+el.value).toFixed(2);
+        paint(id);
       });
     }
-  }catch(e){ live=null; $('status').textContent='server unreachable'; }
+  }catch(e){ live=null; setStatus('server unreachable'); }
   busy=false;
   pollTimer = setTimeout(poll, pollDelay());
 }
 poll();
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ poll(); cloudPoll(); } });
 
-/* ------------------------------ cloud deck ------------------------------ */
+/* ------------------------------ setup deck ------------------------------ */
 let method='password', serversBuilt=false, logLen=-1, devKey='';
 [...$('cmethods').children].forEach(b=>{
   b.onclick=()=>{
     method=b.dataset.method;
     [...$('cmethods').children].forEach(c=>c.setAttribute('aria-pressed', c===b));
-    $('cpw').style.display = method==='qr' ? 'none' : '';
+    $('cpw').hidden = method==='qr';
   };
 });
 $('cstart').addEventListener('click', async ()=>{
   $('cstart').disabled = true;
+  $('cerr').textContent = '';
   const r = await post('/api/cloud/start', {
     method, server:$('cserver').value,
     username:$('cuser').value.trim(), password:$('cpass').value});
   $('cpass').value='';
-  if(!r.ok) $('clan').innerHTML = '<span class="err">'+(r.error||'could not start')+'</span>';
+  if(!r.ok) $('cerr').textContent = r.error || 'could not start';
   cloudPoll();
 });
-const abort = async ()=>{ await post('/api/cloud/cancel'); cloudPoll(); };
-$('ccancel').addEventListener('click', abort);
-$('cpcancel').addEventListener('click', abort);
+$('ccancel').addEventListener('click', async ()=>{ await post('/api/cloud/cancel'); cloudPoll(); });
 const answer = async ()=>{
   const v = $('cpinput').value;
   $('cpinput').value='';
@@ -1193,55 +1111,55 @@ const answer = async ()=>{
 $('cpsend').addEventListener('click', answer);
 $('cpinput').addEventListener('keydown', e=>{ if(e.key==='Enter') answer(); });
 
+function mini(text){
+  const b=document.createElement('button');
+  b.className='mini'; b.type='button'; b.textContent=text;
+  return b;
+}
 function renderDevices(devs){
   const key = devs.map(d=>d.did).join(',');
   if(key===devKey) return;
   devKey = key;
   $('cdevtable').hidden = devs.length===0;
-  $('cdevnote').textContent = devs.length
-    ? devs.length+' device(s) on the account.'
-    : 'Nothing fetched yet. A successful login lists every device on the account with its LAN address and miio token.';
+  $('cdevnote').hidden = devs.length>0;
   $('cdevs').innerHTML='';
+  const MASK='•'.repeat(16);
   devs.forEach(d=>{
     const tr=document.createElement('tr');
     const name=document.createElement('td');
     name.textContent = d.name || '(unnamed)';
-    if(d.online){ const t=document.createElement('span'); t.className='tag on'; t.textContent='ONLINE';
-                  name.append(' ', t); }
+    if(d.online){ const t=document.createElement('span'); t.className='dot';
+                  t.title='online'; t.setAttribute('aria-label','online'); name.append(t); }
     const model=document.createElement('td'); model.textContent=d.model||'-';
     const ip=document.createElement('td'); ip.textContent=d.ip||'-';
     const tok=document.createElement('td');
-    const code=document.createElement('code'); code.textContent='•'.repeat(16);
-    const reveal=document.createElement('button');
-    reveal.className='mini'; reveal.textContent='SHOW'; reveal.style.marginLeft='8px';
+    const code=document.createElement('code'); code.textContent=MASK;
+    const reveal=mini('Show'), copy=mini('Copy');
     let shown=false;
     reveal.onclick=()=>{ shown=!shown;
-      code.textContent = shown ? (d.token||'-') : '•'.repeat(16);
-      reveal.textContent = shown ? 'HIDE' : 'SHOW'; };
-    const copy=document.createElement('button');
-    copy.className='mini'; copy.textContent='COPY'; copy.style.marginLeft='6px';
+      code.textContent = shown ? (d.token||'-') : MASK;
+      reveal.textContent = shown ? 'Hide' : 'Show'; };
     copy.onclick=async()=>{ try{ await navigator.clipboard.writeText(d.token||'');
-      copy.textContent='COPIED'; setTimeout(()=>copy.textContent='COPY',1200);}catch(e){ shown=true;
-      code.textContent=d.token||'-'; reveal.textContent='HIDE'; } };
+      copy.textContent='Copied'; setTimeout(()=>copy.textContent='Copy',1200);}catch(e){ shown=true;
+      code.textContent=d.token||'-'; reveal.textContent='Hide'; } };
     tok.append(code, reveal, copy);
-    const act=document.createElement('td');
-    const use=document.createElement('button');
-    use.className='mini'; use.textContent='USE';
+    const act=document.createElement('td'); act.className='acts';
+    const use=mini('Use');
     use.onclick=()=>{ $('ip').value = d.ip||''; ipTouched=false; send({ip:d.ip||''}); };
-    const lan=document.createElement('button');
-    lan.className='mini'; lan.textContent='ENABLE LAN'; lan.style.marginLeft='6px';
-    lan.onclick=async()=>{ lan.disabled=true; lan.textContent='...';
+    const lan=mini('Enable LAN');
+    lan.onclick=async()=>{ lan.disabled=true; lan.textContent='Enabling...';
       const r = await post('/api/cloud/lan', {ip:d.ip, token:d.token});
-      lan.disabled=false; lan.textContent='ENABLE LAN';
-      $('clan').innerHTML = '<span class="'+(r.ok?'ok':'err')+'">'+(r.message||r.error||'')+'</span>'; };
+      lan.disabled=false; lan.textContent='Enable LAN';
+      $('clan').className = 'note ' + (r.ok?'ok':'err');
+      $('clan').textContent = r.message||r.error||''; };
     act.append(use, lan);
     tr.append(name, model, ip, tok, act);
     $('cdevs').append(tr);
   });
 }
 
-// The cloud deck only changes during a login, so poll it only while it is
-// on screen, and quickly only while a login is in flight.
+// Setup only changes during a login, so poll it only while it is on
+// screen, and quickly only while a login is in flight.
 let cbusy=false, cloudTimer=0, cloudActive=false;
 function cloudDelay(){
   if(document.hidden || document.body.dataset.deck!=='cloud') return 0;
@@ -1255,46 +1173,42 @@ async function cloudPoll(){
     cloudActive = (c.phase==='running' || c.phase==='prompt');
     if(!serversBuilt && c.servers.length){
       serversBuilt = true;
-      $('cserver').innerHTML = '<option value="">all regions (slow)</option>'
+      $('cserver').innerHTML = '<option value="">All regions</option>'
         + c.servers.map(s=>`<option value="${s}">${s}</option>`).join('');
     }
-    if(!c.available){
-      $('cloudnote').innerHTML = '<span class="warn">'+c.reason+'</span>';
-      $('cstart').disabled = true;
-    }else{
-      $('cloudnote').innerHTML = 'Credentials go to Xiaomi over TLS from this machine and are never stored. '
-        + 'The account password is not kept after the login and the desk never writes tokens to disk.';
-      $('cstart').disabled = (c.phase==='running' || c.phase==='prompt');
-    }
-    $('ccancel').disabled = !(c.phase==='running' || c.phase==='prompt');
+    $('cloudnote').textContent = c.available ? '' : c.reason;
+    $('cstart').disabled = !c.available || cloudActive;
+    $('ccancel').disabled = !cloudActive;
 
     if(c.log.length !== logLen){
       logLen = c.log.length;
-      $('clog').innerHTML='';
+      const log=$('clog');
+      log.innerHTML='';
+      if(!c.log.length){ log.innerHTML='<div class="info">ready</div>'; }
       c.log.forEach(l=>{
         const d=document.createElement('div');
-        d.className=l.s||''; d.textContent=' '.repeat(l.i||0)+l.t;
-        $('clog').append(d);
+        d.className=l.s||''; d.textContent=(' '.repeat(l.i||0)+l.t) || ' ';
+        log.append(d);
       });
-      const tail=document.createElement('div');
-      tail.className='info'; tail.innerHTML='<span class="caret">_</span>';
-      $('clog').append(tail);
-      $('clog').scrollTop = $('clog').scrollHeight;
+      log.scrollTop = log.scrollHeight;
     }
 
     const p = c.prompt;
     $('cprompt').hidden = !p;
     if(p){
-      $('cplabel').textContent = (p.label + (p.hint ? ' ('+p.hint+')' : '')).toUpperCase();
+      $('cplabel').textContent = p.label + (p.hint ? ' ('+p.hint+')' : '');
       $('cpinput').type = p.secret ? 'password' : 'text';
       if(document.activeElement !== $('cpinput')) $('cpinput').focus();
     }
     $('cimgwrap').hidden = !c.image;
     if(c.image && $('cimg').src !== c.image){
       $('cimg').src = c.image;
-      $('cqr').innerHTML = c.login_url
-        ? 'Scan it in the Mi Home app, or open <a href="'+c.login_url+'" target="_blank" rel="noopener">this link</a>.'
-        : 'Type the characters shown, exactly, case included.';
+      $('cqr').innerHTML = '';
+      if(c.login_url){
+        const a=document.createElement('a');
+        a.href=c.login_url; a.target='_blank'; a.rel='noopener'; a.textContent='open the login link';
+        $('cqr').append('Scan in Mi Home, or ', a, '.');
+      }
     }
     renderDevices(c.devices);
   }catch(e){ /* the runtime poll already reports an unreachable server */ }

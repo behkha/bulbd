@@ -697,7 +697,7 @@ def open_bulb(ip, attempts=3, on_attempt=None):
             if i < attempts - 1:
                 time.sleep(1.5 * (i + 1))
     raise RuntimeError(f"could not open music mode on {ip} after {attempts} "
-                       f"tries: {last}. If the bulb answers discovery but not "
+                       f"tries: {str(last).rstrip('.')}. If the bulb answers discovery but not "
                        f"port 55443, its LAN slots are wedged - power-cycle it")
 
 

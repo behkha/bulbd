@@ -14,7 +14,7 @@ DSP in, hue out — plus a built-in Xiaomi cloud token extractor.
 
 <img src="assets/desk-runtime.png" alt="the bulbd desk in screen mode: live colour field, hue histogram, and the capture controls" width="820">
 
-<sub>Screen mode, mid-run. The address in the masthead is this machine's — yours will differ.</sub>
+<sub>Screen mode, mid-run. The address in the top bar is this machine's — yours will differ.</sub>
 
 </div>
 
@@ -51,7 +51,7 @@ pip install -r requirements.txt
 The first line is the light engine. The second is the cloud/token half
 (`requests`, `pycryptodome`, `Pillow`, `colorama`). If you already have a
 token, you can skip it — the dashboard imports the extractor inside a
-`try`/`except` and simply greys out the cloud deck when it isn't there.
+`try`/`except` and simply turns off the Xiaomi login in Setup when it isn't there.
 
 macOS only, as written.
 
@@ -61,7 +61,7 @@ Every command below wants `--ip`, and that address is whatever your own
 router handed the bulb — there is no default, and nothing in this repo is
 hard-coded to a particular network. Three ways to find it, best first:
 
-1. **The CLOUD deck.** The device table has an **IP** column: the cloud
+1. **The desk's Setup page.** The device table has an **Address** column: the cloud
    already knows every device's LAN address, so the same login that fetches
    your token hands you the address to point `--ip` at. It is the only route
    that works *before* developer mode is on, and you have to do that login
@@ -90,8 +90,8 @@ python music_bulb_dash.py --ip "$BULB_IP"
 ```
 
 Open the URL it prints. Everything is live: mode, palette, sensitivity,
-capture rate, the lot. The desk can also take the address from the CLOUD
-deck, in which case you can start it with no `--ip` at all. Or drive it
+capture rate, the lot. The desk can also take the address from its Setup
+page, in which case you can start it with no `--ip` at all. Or drive it
 headless:
 
 ```bash
@@ -130,17 +130,18 @@ normally means a second checkout of
 That extractor is vendored here and wired into the desk instead, so the whole
 setup is one repo:
 
-1. Open the **CLOUD** deck.
+1. Open **Setup**: click the bulb address in the top bar, or **Set up bulb**
+   when none is set yet.
 2. Log in with your Xiaomi account password, or scan a QR code in the Mi Home
    app. Captchas and 2FA codes are answered in the page.
-3. The device table lists everything on the account: name, model, **IP**,
+3. The device table lists everything on the account: name, model, **Address**,
    token. Both halves of what you need are on that one row — the token to
    unlock the LAN API, and the address to talk to it on afterwards.
-4. **USE** points the desk at that address, so you never have to type it.
-   **ENABLE LAN** sends the token to the bulb, turns developer mode on and
+4. **Use** points the desk at that address, so you never have to type it.
+   **Enable LAN** sends the token to the bulb, turns developer mode on and
    opens port 55443.
 
-<img src="assets/desk-cloud.png" alt="the CLOUD deck: bulb address field, password or QR login, region picker and a log pane" width="820">
+<img src="assets/desk-cloud.png" alt="the Setup page: bulb address field, password or QR login, region picker and a log pane" width="820">
 
 That's the entire provisioning path, and it is also the easiest way to answer
 "what is my bulb's IP?" — the cloud knows, and the table shows it. Afterwards
