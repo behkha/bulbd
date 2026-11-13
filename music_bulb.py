@@ -83,6 +83,11 @@ def hue_lerp(a, b, k):
 # analysis
 # ---------------------------------------------------------------------------
 class Analyser:
+    BAND_FLOOR = 0.02                 # -34 dB under a band's own recent peak
+    MIX_FLOOR = 0.003                 # -50 dB under the loudest band's peak...
+    MIX_FLOOR_LOW = 0.01              # ...-40 dB for the bands by DC (see feed)
+    TEMPO_BANDS = 4                   # 40-390 Hz, where the beat lives
+
     def __init__(self, sr=SAMPLERATE, block=BLOCK, n_bands=10):
         self.dt = block / sr
         self.window = np.hanning(block).astype(np.float32)
@@ -97,12 +102,23 @@ class Analyser:
                 m[np.argmin(np.abs(freqs - edges[i]))] = True
             self.masks.append(m)
         self.n_bands = n_bands
+        # Bands of one or two bins sit next to DC, where a steady note higher
+        # up leaks in from both its positive and negative image. The two beat
+        # against each other, so the band swings 10 dB with nothing playing
+        # in it, and needs the higher floor.
+        self.by_dc = np.array([m.sum() < 4 for m in self.masks])
+        self.mix_floor = np.where(self.by_dc, self.MIX_FLOOR_LOW,
+                                  self.MIX_FLOOR).astype(np.float32)
 
         # beats live low, so weight the flux sum towards the bottom
         self.flux_w = np.linspace(1.6, 0.5, n_bands).astype(np.float32)
 
         self.prev_log = np.zeros(n_bands, dtype=np.float32)
+        self.recent = deque(maxlen=3)             # last band levels, ~70 ms
         self.prev_flux = 0.0
+        self.peaks = np.full(n_bands, 1e-6, dtype=np.float32)   # slow-decay band peaks
+        self.lag = None                           # autocorrelation peak in use
+        self.blur = np.array([1, 2, 3, 2, 1], dtype=np.float32) / 9.0
         self.levels = deque(maxlen=220)           # ~5 s, for percentile AGC
         self.flux_hist = deque(maxlen=64)         # ~1.5 s, for the threshold
         self.env = deque(maxlen=180)              # ~4 s, for tempo
@@ -120,14 +136,39 @@ class Analyser:
         if len(self.env) < self.env.maxlen:
             return
         x = np.fromiter(self.env, dtype=np.float32)
+        # An onset is one frame wide and a beat is rarely a whole number of
+        # frames, so without a blur the true lag falls between two samples
+        # and loses to whichever multiple happens to land on one.
+        x = np.convolve(x, self.blur, mode="same")
         x -= x.mean()
-        ac = np.correlate(x, x, mode="full")[len(x) - 1:]
+        n = len(x)
+        # divide by the overlap, or short lags win just by having more of it
+        ac = np.correlate(x, x, mode="full")[n - 1:] / np.arange(n, 0, -1)
         lo = max(1, int(round(0.33 / self.dt)))              # 180 BPM
-        hi = min(len(ac) - 1, int(round(0.92 / self.dt)))    # 65 BPM
+        hi = min(n - 2, int(round(0.92 / self.dt)))          # 65 BPM
         if hi <= lo:
             return
-        est = (lo + int(np.argmax(ac[lo:hi]))) * self.dt
-        self.beat += (est - self.beat) * 0.15                # slew, don't jump
+        seg = ac[lo:hi + 1]
+        top = float(seg.max())
+        if top <= 0.0:
+            return                                           # nothing periodic
+        # A beat correlates at every multiple of itself, and a backbeat or a
+        # loud off-beat makes two of those peaks nearly equal. Stay on the
+        # peak chosen last time if it is still a strong one; otherwise take
+        # the shortest strong one. Without the first rule the estimate flips
+        # between two readings and, being slewed, settles on neither.
+        peaks = [i for i in range(lo, hi + 1)
+                 if ac[i] >= 0.75 * top and ac[i] >= ac[i - 1] and ac[i] >= ac[i + 1]]
+        if not peaks:
+            return
+        cur = self.lag
+        held = [i for i in peaks if abs(i - cur) <= 0.08 * cur] if cur else []
+        k = min(held, key=lambda i: abs(i - cur)) if held else peaks[0]
+        self.lag = k
+        a, b, c = float(ac[k - 1]), float(ac[k]), float(ac[k + 1])
+        curve = a - 2.0 * b + c
+        lag = k + (0.5 * (a - c) / curve if curve < 0.0 else 0.0)   # sub-frame peak
+        self.beat += (lag * self.dt - self.beat) * 0.15      # slew, don't jump
 
     def feed(self, pcm):
         self.t += self.dt
@@ -137,18 +178,46 @@ class Analyser:
 
         spec = np.abs(np.fft.rfft(mono * self.window))
         raw = np.array([spec[m].mean() for m in self.masks], dtype=np.float32)
-        log = np.log1p(raw * 200.0)
+        # Bands are compared as ratios, but each one only down to 34 dB
+        # under its own recent peak, and none below 40-50 dB under the loudest.
+        # Under those floors a band holds hiss and window leakage, and its
+        # frame-to-frame wobble is as big, as a ratio, as a real hit. The
+        # floor is per band because music tilts: a hi-hat sits tens of dB
+        # under the kick and must still count.
+        self.peaks = np.maximum(raw, self.peaks * 0.997)
+        log = np.log(raw + self.BAND_FLOOR * self.peaks
+                     + self.mix_floor * float(self.peaks.max()) + 1e-7)
 
         # --- onset: half-wave-rectified spectral flux vs adaptive threshold
-        flux = float(np.dot(self.flux_w, np.maximum(log - self.prev_log, 0.0)))
+        # The bands by DC have to rise above their last three frames, not
+        # just the last one. A held bass note beats against its own mirror
+        # image there and the band ripples every three or four frames;
+        # against one previous frame each ripple reads as a rise, against the
+        # recent maximum it does not. A kick clears either reference. The
+        # other bands keep the single frame: with the maximum, steady noise
+        # turns into rare spikes over a floor of zero, which is what beats
+        # look like to the threshold below.
+        ref = self.prev_log
+        if self.recent:
+            ref = np.where(self.by_dc, np.max(self.recent, axis=0), ref)
+        rise = self.flux_w * np.maximum(log - ref, 0.0)
+        flux = float(rise.sum())
+        self.recent.append(log)
         self.prev_log = log
         self.flux_hist.append(flux)
-        self.env.append(flux)
+        # tempo listens to the low bands only: an off-beat hi-hat is an onset
+        # worth a flash, but it would make the half beat look like the beat
+        self.env.append(float(rise[:self.TEMPO_BANDS].sum()))
 
         onset, strength = False, 0.0
         if len(self.flux_hist) == self.flux_hist.maxlen:
             h = np.fromiter(self.flux_hist, dtype=np.float32)
-            thr = float(np.median(h) + self.sensitivity * h.std()) + 1e-4
+            med = float(np.median(h))
+            # Three bars to clear. The usual spread; a multiple of the typical
+            # frame, which steady noise never reaches however its spread works
+            # out; and a floor, so a held note with no events has no beats.
+            s = self.sensitivity
+            thr = max(med + s * float(h.std()), med * (1.0 + 2.0 * s), 0.35 * s)
             rising = flux > self.prev_flux
             if flux > thr and rising and (self.t - self.last_onset) > 0.13:
                 onset = True
@@ -223,7 +292,9 @@ class ColorEngine:
 
     def step(self, t, beat):
         """Move to the next palette anchor - at most once every two beats."""
-        gap = max(2.0 * beat, 0.9) * (2.2 if self.calm else 1.0)
+        # 60 ms of slack: the hit two beats on arrives a frame early as often
+        # as late, and an exact gap would turn every second one away
+        gap = max(2.0 * beat - 0.06, 0.9) * (2.2 if self.calm else 1.0)
         if self.fade > 0.0:
             gap = max(gap, self.fade)             # let a sweep land first
         if t - self.last_step < gap:
@@ -471,6 +542,9 @@ class ScreenColorEngine:
     """
 
     N_BINS = 36
+    GREY_SAT = 18.0                   # saturation of a colourless scene
+    FULL_SHARE = 0.2                  # share of the light that earns full colour
+    MOVED = 0.12                      # per-channel change that counts for a pixel
 
     def __init__(self, min_sat=55.0, sat_boost=1.35, gamma=0.75, calm=False):
         self.min_sat = float(min_sat)
@@ -483,11 +557,20 @@ class ScreenColorEngine:
         self.prev_luma = None
         self.kern = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
         self.hist = np.zeros(self.N_BINS, dtype=np.float32)   # last frame, for UI
+        self._prev = None                 # last frame, to tell a cut from motion
+        self.changed = 0.0                # share of pixels that moved since it
+        self.share = 0.0                  # share of the light the hue carries
 
     def measure(self, rgb):
         """One frame -> (hue or None if colourless, sat 0..1, luma 0..1)."""
+        prev, self._prev = self._prev, rgb
+        self.changed = (
+            float((np.abs(rgb - prev).max(axis=-1) > self.MOVED).mean())
+            if prev is not None and prev.shape == rgb.shape else 0.0)
+
         h, s, v = rgb_to_hsv(rgb)
         luma = float((rgb @ _LUMA).mean())
+        self.share = 0.0
 
         keep = (v > 0.09) & (s > 0.14)              # drop crushed and grey
         if int(keep.sum()) < 24:
@@ -512,6 +595,10 @@ class ScreenColorEngine:
         if float(ww.sum()) <= 0.0:
             return None, 0.0, luma
 
+        # How much of the picture's light this colour is. A small vivid patch
+        # on a neutral screen should tint the lamp, not paint it.
+        self.share = float(vk[near].sum() / max(float(v.sum()), 1e-9))
+
         ang = np.radians(hk[near])
         hue = float(np.degrees(np.arctan2(float((np.sin(ang) * ww).sum()),
                                           float((np.cos(ang) * ww).sum()))) % 360.0)
@@ -519,7 +606,15 @@ class ScreenColorEngine:
 
     def tick(self, dt, hue_m, sat_m, luma):
         """-> (hue, sat 0..100, value 0..1, scene_cut)."""
-        cut = self.prev_luma is not None and abs(luma - self.prev_luma) > 0.16
+        # A cut is a jump in brightness, or most of the picture changing at
+        # once while the colour lands far from where the lamp is. The second
+        # test catches a cut between two scenes that are equally bright; the
+        # pixel share keeps it from firing when the picture holds and only
+        # the winning hue bin flips.
+        far = hue_m is not None and abs(
+            ((hue_m - self.hue + 180.0) % 360.0) - 180.0) > 40.0
+        cut = ((self.prev_luma is not None and abs(luma - self.prev_luma) > 0.16)
+               or (self.changed > 0.5 and far))
         self.prev_luma = luma
 
         t_hue = 0.10 if cut else (0.90 if self.calm else 0.45)
@@ -527,15 +622,22 @@ class ScreenColorEngine:
         t_val = 0.08 if cut else (0.45 if self.calm else 0.22)
 
         if hue_m is None:
-            want_sat = 18.0                         # grey scene -> near white
+            want_sat = self.GREY_SAT                # grey scene -> near white
         else:
-            self.hue = hue_lerp(self.hue, hue_m, 1.0 - math.exp(-dt / t_hue))
-            want_sat = float(np.clip(sat_m * 100.0 * self.sat_boost,
-                                     self.min_sat, 100.0))
+            self.hue = hue_m if cut else hue_lerp(
+                self.hue, hue_m, 1.0 - math.exp(-dt / t_hue))
+            full = float(np.clip(sat_m * 100.0 * self.sat_boost,
+                                 self.min_sat, 100.0))
+            # fade towards grey as the colour's share of the light shrinks
+            k = min(self.share / self.FULL_SHARE, 1.0)
+            want_sat = self.GREY_SAT + (full - self.GREY_SAT) * k
 
-        self.sat += (want_sat - self.sat) * (1.0 - math.exp(-dt / t_sat))
         want_val = float(np.clip(luma, 0.0, 1.0)) ** self.gamma
-        self.val += (want_val - self.val) * (1.0 - math.exp(-dt / t_val))
+        if cut:                                     # a cut lands, it does not ease
+            self.sat, self.val = want_sat, want_val
+        else:
+            self.sat += (want_sat - self.sat) * (1.0 - math.exp(-dt / t_sat))
+            self.val += (want_val - self.val) * (1.0 - math.exp(-dt / t_val))
         return self.hue, float(np.clip(self.sat, 0.0, 100.0)), self.val, cut
 
 
@@ -765,6 +867,27 @@ def list_monitors():
                   f"at ({m['left']},{m['top']})")
 
 
+VIRTUAL_INPUTS = ("blackhole", "loopback", "soundflower")
+
+
+def _output_feeds_a_cable(speaker):
+    """True if the system output is a virtual cable or a multi-output device.
+
+    Those are the two setups in which a virtual input such as BlackHole
+    carries what the Mac is playing; with a plain output it is silent.
+    """
+    name = speaker.name.lower()
+    if any(k in name for k in VIRTUAL_INPUTS + ("multi-output", "aggregate")):
+        return True
+    try:                                # the device may have been renamed
+        from soundcard import coreaudio
+        kind = int(coreaudio._CoreAudio.get_property(
+            speaker.id, 0x7472616E, "UInt32")[0])         # 'tran'
+        return kind in (0x67727570, 0x76697274)           # 'grup', 'virt'
+    except Exception:
+        return False
+
+
 def pick_recorder(mic_name=None):
     import soundcard as sc
     if mic_name:
@@ -780,8 +903,19 @@ def pick_recorder(mic_name=None):
     try:
         return sc.get_microphone(str(sc.default_speaker().name), include_loopback=True)
     except Exception:
-        print("No loopback device found; using the microphone.", file=sys.stderr)
-        return sc.default_microphone()
+        pass
+    # macOS has no loopback of an output. If the output is routed into a
+    # virtual cable, that cable is the clean feed - better than a microphone
+    # hearing the room.
+    try:
+        cables = [m for m in sc.all_microphones()
+                  if any(k in m.name.lower() for k in VIRTUAL_INPUTS)]
+        if cables and _output_feeds_a_cable(sc.default_speaker()):
+            return cables[0]
+    except Exception:
+        pass
+    print("No loopback device found; using the microphone.", file=sys.stderr)
+    return sc.default_microphone()
 
 
 def run(args):
@@ -1024,6 +1158,10 @@ def main():
 
     if not 0.0 <= args.fade <= 10.0:
         p.error("--fade must be between 0 and 10 seconds")
+
+    if not 1 <= args.fps <= 30:
+        p.error("--fps must be between 1 and 30; the LEDs cannot resolve "
+                "faster")
 
     if not 1 <= args.screen_fps <= 30:
         p.error("--screen-fps must be between 1 and 30; the LEDs cannot "

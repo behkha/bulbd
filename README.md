@@ -186,6 +186,11 @@ python music_bulb.py --ip "$BULB_IP" --mic "BlackHole 2ch"
 python music_bulb.py --list-devices
 ```
 
+With a Multi-Output device (or BlackHole itself) selected as the system
+output, `--mic` is optional: the virtual cable is picked automatically, in the
+CLI and on the desk. With a plain output selected it falls back to the
+microphone.
+
 Multi-Output devices ignore the hardware volume keys: set the level in the
 playing app, and leave BlackHole's own gain at full or the capture goes quiet.
 
