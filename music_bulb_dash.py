@@ -26,7 +26,11 @@ import contextlib
 import io
 import json
 import math
+import os
 import re
+import signal
+import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,26 +58,220 @@ HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62})$")
 
 # ---------------------------------------------------------------------------
 def screen_monitors():
-    """[{i, w, h}] for every real display, or [] if mss is unavailable."""
+    """[{i, w, h, x, y}] for every real display, or [] if mss is unavailable.
+    x, y is the display's origin in the desktop, which a region is offset by."""
     try:
         import mss
         with mss.MSS() as sct:
-            return [{"i": i, "w": m["width"], "h": m["height"]}
+            return [{"i": i, "w": m["width"], "h": m["height"],
+                     "x": m["left"], "y": m["top"]}
                     for i, m in enumerate(sct.monitors) if i > 0]
     except Exception:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Every setting the desk can change goes through clean_patch(), whether it
+# came from the page or from the settings file, so a hand-edited or stale
+# file is held to the same limits as a POST.
+NUMERIC = {                         # key: (low, high, type) - the faders' ranges
+    "sensitivity": (0.6, 2.6, float), "gamma": (1.0, 3.0, float),
+    "punch": (0.2, 1.0, float), "fps": (5, 30, int), "fade": (0.0, 6.0, float),
+    "screen_fps": (4, 30, int), "screen_gamma": (0.4, 1.6, float),
+    "min_sat": (0.0, 90.0, float), "sat_boost": (0.8, 2.0, float),
+}
+MODES = ("music", "screen", "fusion")
+MIN_REGION = 32                     # points; smaller than this is a mis-click
+# what survives a restart. Never `running` (the lamp must not start on its
+# own) and nothing from the cloud login (no secret touches disk).
+SAVED_KEYS = ("ip", "mic", "mode", "palette", "calm", *NUMERIC,
+              "monitor", "region")
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def clean_region(region, mon):
+    """[x, y, w, h] in the display's own points, or None for the whole
+    display. Raises ValueError for anything that does not fit `mon`."""
+    if region is None:
+        return None
+    if mon is None or not isinstance(region, (list, tuple)) or len(region) != 4 \
+            or not all(_number(v) for v in region):
+        raise ValueError("region")
+    x, y, w, h = (int(round(v)) for v in region)
+    if x < 0 or y < 0 or w < MIN_REGION or h < MIN_REGION \
+            or x + w > mon["w"] or y + h > mon["h"]:
+        raise ValueError("region")
+    if (x, y, w, h) == (0, 0, mon["w"], mon["h"]):
+        return None
+    return [x, y, w, h]
+
+
+def clean_patch(patch, snap):
+    """The subset of `patch` that is valid against the current state, with
+    numbers clamped to the faders' ranges. Unknown keys are dropped."""
+    if not isinstance(patch, dict):
+        return {}
+    out = {}
+    for key, (lo, hi, kind) in NUMERIC.items():
+        v = patch.get(key)
+        if _number(v):
+            v = min(max(v, lo), hi)
+            out[key] = int(round(v)) if kind is int else float(v)
+    for key in ("running", "calm"):
+        if isinstance(patch.get(key), bool):
+            out[key] = patch[key]
+    if patch.get("palette") == "auto" or patch.get("palette") in PALETTES:
+        out["palette"] = patch["palette"]
+    if patch.get("mode") in MODES:
+        out["mode"] = patch["mode"]
+    if "ip" in patch:
+        ip = str(patch["ip"] or "").strip()
+        if HOSTNAME_RE.match(ip):
+            out["ip"] = ip
+    if "mic" in patch:                  # None is the automatic choice
+        mic = patch["mic"]
+        if mic is None or mic == "":
+            out["mic"] = None
+        elif isinstance(mic, str) and len(mic) <= 200 and mic.isprintable():
+            out["mic"] = mic
+    mons = {m["i"]: m for m in snap.get("monitors", [])}
+    v = patch.get("monitor")
+    if _number(v) and int(v) == v and int(v) in mons:
+        out["monitor"] = int(v)
+        if out["monitor"] != snap.get("monitor"):
+            out["region"] = None        # a box drawn on one display means nothing on another
+    if "region" in patch:
+        try:
+            out["region"] = clean_region(
+                patch["region"], mons.get(out.get("monitor", snap.get("monitor"))))
+        except ValueError:
+            pass
+    return out
+
+
+def settings_path():
+    """Where the desk keeps its settings: the platform's per-user config dir."""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "bulbd", "settings.json")
+
+
+class SettingsStore:
+    """The desk's settings file: read once at start, written after changes.
+
+    A fader drag posts many patches a second, so writes wait for a 1 s lull
+    (5 s at most) and go to a temp file that replaces the old one, so a
+    crash mid-write leaves the previous file whole. Anything wrong with the
+    file - missing, unreadable, not JSON, out of range - costs only the
+    settings it affects; the desk always starts.
+    """
+
+    VERSION = 1
+
+    def __init__(self, path, quiet=1.0, longest=5.0):
+        self.path = path
+        self.quiet, self.longest = quiet, longest
+        self.state = None
+        self._dirty = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._written = None
+        self._thread = None
+
+    def load(self):
+        """The saved settings, unvalidated (State runs them through
+        clean_patch), or {} if there is nothing usable."""
+        if not self.path:
+            return {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            settings = data.get("settings") if isinstance(data, dict) else None
+            if not isinstance(settings, dict):
+                raise ValueError("no settings object")
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            print(f"ignoring unreadable settings file {self.path}: {exc}", file=sys.stderr)
+            return {}
+        return {k: v for k, v in settings.items() if k in SAVED_KEYS}
+
+    def attach(self, state):
+        self.state = state
+        self._written = self._payload()      # what was loaded needs no rewrite
+        if self.path:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def touch(self):
+        self._dirty.set()
+
+    def _payload(self):
+        snap = self.state.snapshot()
+        return {k: snap[k] for k in SAVED_KEYS}
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._dirty.wait()
+            first = time.monotonic()
+            while not self._stop.is_set():   # wait for a lull in the changes
+                self._dirty.clear()
+                left = self.longest - (time.monotonic() - first)
+                if left <= 0 or not self._dirty.wait(min(self.quiet, left)):
+                    break
+            self.flush()
+
+    def flush(self):
+        if not self.path or self.state is None:
+            return
+        with self._lock:
+            payload = self._payload()
+            if payload == self._written:
+                return
+            folder = os.path.dirname(self.path)
+            try:
+                os.makedirs(folder, mode=0o700, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=folder)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump({"version": self.VERSION, "settings": payload}, f,
+                                  indent=2, sort_keys=True)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, self.path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
+                self._written = payload
+            except OSError as exc:
+                print(f"could not save settings to {self.path}: {exc}", file=sys.stderr)
+
+    def close(self):
+        self._stop.set()
+        self._dirty.set()
+        self.flush()
+
+
 class State:
-    def __init__(self, ip, mic):
+    def __init__(self, saved=None, store=None, local=True):
         self._lock = threading.Lock()
         # the engine parks on `started` instead of polling for a session, and
         # a loop idling on a still picture ends its wait early on `changed`
         self.started = threading.Event()
         self.changed = threading.Event()
+        self.store = store
         mons = screen_monitors()
+        screen_ok = screen_permission() is not False
         self._d = {
-            "ip": ip, "mic": mic,
+            "ip": "", "mic": None,
             "running": False, "status": "idle",
             "mode": "music",
             "palette": "auto", "calm": False,
@@ -83,13 +281,20 @@ class State:
             "monitor": mons[0]["i"] if mons else 1,
             "screen_fps": 10, "screen_gamma": 0.75,
             "min_sat": 55.0, "sat_boost": 1.35, "screen_width": 192,
+            "region": None,
             "monitors": mons,
-            "screen_ok": screen_permission() is not False,
+            "screen_ok": screen_ok,
+            # a still of the display for drawing the region; it is a picture
+            # of the user's screen, so only a desk bound to loopback serves it
+            "snapshot_ok": bool(local and mons and screen_ok),
             # telemetry
             "hue": 0, "sat": 0, "val": 0, "bpm": 0.0,
             "level": 0.0, "hit": 0.0, "bands": [0.0] * 10,
+            "input_db": None, "signal": True,
             "active_palette": "ember", "device": "-",
         }
+        if saved:
+            self._d.update(clean_patch(saved, self._d))
 
     def snapshot(self):
         with self._lock:
@@ -105,6 +310,89 @@ class State:
         """set(), for a change that came from the desk rather than telemetry."""
         self.set(**kw)
         self.changed.set()
+        if self.store:
+            self.store.touch()
+
+
+class SignalWatch:
+    """The input's level in dBFS, and whether it has gone quiet.
+
+    A silent input looks exactly like a broken lamp - the bulb idles at a few
+    percent - so the desk says so outright once the raw RMS has stayed under
+    -70 dBFS for 1.5 s. BlackHole fed by nothing is exactly 0, a quiet room
+    on a built-in microphone sits around -60.
+    """
+
+    FLOOR_DB = -70.0
+    HOLD = 1.5
+
+    def __init__(self):
+        self.quiet_since = None
+        self.peak = 0.0
+
+    def feed(self, rms, now):
+        self.peak = max(self.peak, rms)
+        if 20 * math.log10(max(rms, 1e-7)) >= self.FLOOR_DB:
+            self.quiet_since = None
+        elif self.quiet_since is None:
+            self.quiet_since = now
+
+    def read(self, now):
+        """(dB of the loudest block since the last read, signal present)."""
+        db = round(max(20 * math.log10(max(self.peak, 1e-7)), -120.0), 1)
+        self.peak = 0.0
+        return db, not (self.quiet_since is not None
+                        and now - self.quiet_since >= self.HOLD)
+
+
+def open_recorder(name):
+    """pick_recorder(), with the desk's wording when a saved input is gone."""
+    try:
+        return pick_recorder(name, quiet=True)
+    except RuntimeError:
+        if name:
+            raise RuntimeError(f"{name} is not connected. Choose another input.")
+        raise
+
+
+def audio_inputs():
+    """What the input picker lists: every capture device, and the name the
+    automatic choice resolves to right now."""
+    import soundcard as sc
+    names = []
+    with contextlib.suppress(Exception):
+        names = [m.name for m in sc.all_microphones()]
+    auto = ""
+    with contextlib.suppress(Exception):
+        auto = str(pick_recorder(None, quiet=True).name)
+    return {"inputs": names, "auto": auto}
+
+
+def region_box(cfg):
+    """The absolute X, Y, W, H for ScreenGrabber, or None for the whole display."""
+    region = cfg.get("region")
+    if not region:
+        return None
+    mon = next((m for m in cfg["monitors"] if m["i"] == cfg["monitor"]), None)
+    if mon is None:
+        return None
+    x, y, w, h = region
+    return (mon["x"] + x, mon["y"] + y, w, h)
+
+
+def display_snapshot(monitor, width=640):
+    """One PNG still of a display, about `width` px wide, for drawing a region."""
+    import mss
+    import mss.tools
+    with mss.MSS() as sct:
+        mons = sct.monitors
+        if not 1 <= monitor < len(mons):
+            raise ValueError("no such display")
+        shot = sct.grab(mons[monitor])
+    a = np.asarray(shot)                                  # BGRA, device pixels
+    step = max(1, int(math.ceil(a.shape[1] / width)))
+    rgb = np.ascontiguousarray(a[::step, ::step, 2::-1])
+    return mss.tools.to_png(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +410,18 @@ def apply_palette(color, name):
 class Engine(threading.Thread):
     daemon = True
 
-    def __init__(self, state):
+    def __init__(self, state, restore=True):
         super().__init__()
         self.state = state
+        self.restore = restore
+        self.idle = threading.Event()           # set while parked, for a clean exit
+        self.idle.set()
 
     def run(self):
         while True:
+            self.idle.set()
             self.state.started.wait()           # parked while the desk is stopped
+            self.idle.clear()
             try:
                 self._session()
             except Exception as exc:
@@ -136,7 +429,14 @@ class Engine(threading.Thread):
                 time.sleep(0.5)
 
     def _session(self):
-        """Own the bulb for one run; the loops return on stop or mode change."""
+        """Own the bulb from Start to Stop.
+
+        A mode, display, input or region change only swaps the loop: each
+        loop returns when its own configuration moves, and the next one picks
+        up on the same connection. So the lamp is restored once, when the
+        desk really stops (or the process exits), and a change of mode does
+        not cost the bulb a reconnect.
+        """
         st = self.state
         cfg = st.snapshot()
         if not cfg["ip"]:
@@ -144,23 +444,35 @@ class Engine(threading.Thread):
                    status="no bulb address - find one on the cloud deck")
             time.sleep(0.3)
             return
+        # fail on a missing input or permission before the bulb is touched:
+        # opening it turns the lamp on, and a restore right after would flash
+        if cfg["mode"] != "screen" and cfg["mic"]:
+            open_recorder(cfg["mic"])
+        if cfg["mode"] != "music" and screen_permission() is False:
+            raise RuntimeError("no Screen Recording permission - grant it in "
+                               "System Settings > Privacy & Security")
         st.set(status="connecting")
 
-        bulb = open_bulb(cfg["ip"], on_attempt=lambda n, total, err: st.set(
-            status=f"connecting {n}/{total}" + (f" - {err}" if err else "")))
+        bulb = open_bulb(cfg["ip"], remember=self.restore,
+                         on_attempt=lambda n, total, err: st.set(
+                             status=f"connecting {n}/{total}" + (f" - {err}" if err else "")))
         sender = Sender(bulb)
         sender.start()
+        loops = {"music": self._audio_loop, "screen": self._screen_loop,
+                 "fusion": self._fusion_loop}
         try:
-            if cfg["mode"] == "screen":
-                self._screen_loop(st, sender)
-            elif cfg["mode"] == "fusion":
-                self._fusion_loop(st, sender)
-            else:
-                self._audio_loop(st, sender)
+            while True:
+                cfg = st.snapshot()
+                if not cfg["running"] or cfg["ip"] != bulb._ip:
+                    break
+                loops.get(cfg["mode"], self._audio_loop)(st, sender)
         finally:
             sender.stop()
-            release_bulb(bulb)
-            st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10)
+            if self.restore and bulb.bulbd_saved:
+                st.set(status="restoring the lamp")
+            release_bulb(bulb, restore=self.restore)
+            st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10,
+                   input_db=None, signal=True)
 
     # -- screen mode --------------------------------------------------------
     def _screen_loop(self, st, sender):
@@ -169,8 +481,8 @@ class Engine(threading.Thread):
             raise RuntimeError("no Screen Recording permission - grant it in "
                                "System Settings > Privacy & Security")
 
-        monitor = cfg["monitor"]
-        grab = ScreenGrabber(monitor, None, cfg["screen_width"])
+        monitor, region = cfg["monitor"], cfg["region"]
+        grab = ScreenGrabber(monitor, region_box(cfg), cfg["screen_width"])
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
                                   sat_boost=cfg["sat_boost"],
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
@@ -188,8 +500,8 @@ class Engine(threading.Thread):
                 cfg = st.snapshot()
                 if not cfg["running"] or cfg["mode"] != "screen":
                     break
-                if cfg["monitor"] != monitor:
-                    break                       # restart the session on the new display
+                if cfg["monitor"] != monitor or cfg["region"] != region:
+                    break                       # recapture the new display or box
 
                 color.calm = cfg["calm"]
                 color.min_sat = float(cfg["min_sat"])
@@ -243,9 +555,11 @@ class Engine(threading.Thread):
         analyser = Analyser()
         color = ColorEngine(None, calm=cfg["calm"], fade=cfg["fade"])
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
-        recorder = pick_recorder(cfg["mic"])
+        mic = cfg["mic"]
+        recorder = open_recorder(mic)
         st.set(device=str(getattr(recorder, "name", recorder))[:48])
         dt = analyser.dt
+        watch = SignalWatch()
 
         last_sent = 0.0
         last_hsv = None
@@ -255,7 +569,8 @@ class Engine(threading.Thread):
             with recorder.recorder(samplerate=SAMPLERATE, channels=2) as rec:
                 while True:
                     cfg = st.snapshot()
-                    if not cfg["running"] or cfg["mode"] != "music":
+                    if not cfg["running"] or cfg["mode"] != "music" \
+                            or cfg["mic"] != mic:
                         break
 
                     analyser.sensitivity = cfg["sensitivity"]
@@ -272,6 +587,7 @@ class Engine(threading.Thread):
                     hue, sat = color.tick(dt, f["treble"], f["t"])
 
                     now = time.monotonic()
+                    watch.feed(f["rms"], now)
                     if now - last_sent < 1.0 / max(cfg["fps"], 5):
                         continue
 
@@ -279,11 +595,13 @@ class Engine(threading.Thread):
                         4 + 96 * (lvl.brightness ** cfg["gamma"]), 1, 100)))
                     hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
+                    input_db, signal = watch.read(now)
                     st.set(hue=hsv[0], sat=hsv[1], val=hsv[2],
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            level=round(lvl.brightness, 3),
                            hit=round(lvl.hit, 3),
                            bands=[round(float(b), 3) for b in f["bands"]],
+                           input_db=input_db, signal=signal,
                            active_palette=color.pal)
 
                     if last_hsv and abs(hsv[2] - last_hsv[2]) < 2 \
@@ -297,7 +615,7 @@ class Engine(threading.Thread):
                                    1000.0 / max(cfg["fps"], 5), 30, 150)))
                     last_sent, last_hsv = now, hsv
         finally:
-            st.set(bands=[0.0] * 10)
+            st.set(bands=[0.0] * 10, input_db=None, signal=True)
 
     # -- fusion mode: colour from the display, brightness from the audio ----
     def _fusion_loop(self, st, sender):
@@ -306,7 +624,7 @@ class Engine(threading.Thread):
             raise RuntimeError("no Screen Recording permission - grant it in "
                                "System Settings > Privacy & Security")
 
-        monitor = cfg["monitor"]
+        monitor, region, mic = cfg["monitor"], cfg["region"], cfg["mic"]
         analyser = Analyser()
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
@@ -314,10 +632,11 @@ class Engine(threading.Thread):
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
         # the grab runs on its own thread: a ~26 ms capture inline would
         # starve rec.record() and drag the onsets behind the music
-        screen = ScreenColorThread(ScreenGrabber(monitor, None,
+        recorder = open_recorder(mic)
+        screen = ScreenColorThread(ScreenGrabber(monitor, region_box(cfg),
                                                  cfg["screen_width"]),
                                    color, fps=cfg["screen_fps"])
-        recorder = pick_recorder(cfg["mic"])
+        watch = SignalWatch()
         dt = analyser.dt
         last_sent = 0.0
         last_hsv = None
@@ -333,8 +652,9 @@ class Engine(threading.Thread):
                     cfg = st.snapshot()
                     if not cfg["running"] or cfg["mode"] != "fusion":
                         break
-                    if cfg["monitor"] != monitor:
-                        break                   # restart on the new display
+                    if cfg["monitor"] != monitor or cfg["region"] != region \
+                            or cfg["mic"] != mic:
+                        break                   # recapture on the new source
                     if screen.error:
                         raise RuntimeError(f"screen capture stopped: "
                                            f"{screen.error}")
@@ -353,6 +673,7 @@ class Engine(threading.Thread):
                     lvl.feed(f, dt)             # accents move brightness only
 
                     now = time.monotonic()
+                    watch.feed(f["rms"], now)
                     if now - last_sent < 1.0 / max(cfg["fps"], 5):
                         continue
 
@@ -362,11 +683,13 @@ class Engine(threading.Thread):
                     hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
                     cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
+                    input_db, signal = watch.read(now)
                     st.set(hue=hsv[0], sat=hsv[1], val=hsv[2],
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            level=round(lvl.brightness, 3),
                            hit=round(max(lvl.hit, cut_env), 3),
-                           bands=[round(float(b), 3) for b in f["bands"]])
+                           bands=[round(float(b), 3) for b in f["bands"]],
+                           input_db=input_db, signal=signal)
 
                     settled = (last_hsv and not cut
                                and abs(hsv[2] - last_hsv[2]) < 2
@@ -381,7 +704,7 @@ class Engine(threading.Thread):
                     last_sent, last_hsv = now, hsv
         finally:
             screen.close()
-            st.set(bands=[0.0] * 10)
+            st.set(bands=[0.0] * 10, input_db=None, signal=True)
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +975,7 @@ body[data-deck="cloud"] .lamp{display:none}
 .st.on{color:var(--ink)} .st.on i{background:var(--ok)}
 .st.busy i{background:var(--warn)}
 .st.bad{color:var(--err)} .st.bad i{background:var(--err)}
+.st.quiet{color:var(--ink)} .st.quiet i{background:var(--warn)}
 #stxt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sp{flex:1}
 .addr{flex:none;font-size:13.5px;color:var(--dim);background:transparent;border:1px solid var(--line);
@@ -716,6 +1040,24 @@ input.tx::placeholder{color:var(--dim)}
   font-size:13px;white-space:nowrap;cursor:pointer}
 .mini:hover{box-shadow:inset 0 0 0 1px var(--dim)}
 .mini:disabled{opacity:.5}
+
+/* input level: raw RMS of the capture, -60..0 dBFS across the bar */
+.meter{display:grid;grid-template-columns:1fr 64px;gap:16px;align-items:center}
+.meter .bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden}
+.meter .bar i{display:block;height:100%;width:0;background:var(--ink)}
+.meter output{text-align:right;color:var(--dim)}
+.meter.none output{color:var(--warn);font-weight:600}
+
+/* capture area: a still of the display, the box drawn over it */
+.shot{position:relative;width:100%;aspect-ratio:16/10;border-radius:6px;overflow:hidden;background:var(--sf2);
+  box-shadow:inset 0 0 0 1px var(--line);touch-action:none;cursor:crosshair;user-select:none;-webkit-user-select:none}
+.shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none}
+.shot .shade{position:absolute;inset:0;background:rgba(0,0,0,.45);pointer-events:none}
+.shot .box{position:absolute;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.4);cursor:move}
+.shot .box i{position:absolute;width:11px;height:11px;background:#fff;border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+.shot .box i[data-h="nw"]{left:-6px;top:-6px;cursor:nwse-resize} .shot .box i[data-h="ne"]{right:-6px;top:-6px;cursor:nesw-resize}
+.shot .box i[data-h="sw"]{left:-6px;bottom:-6px;cursor:nesw-resize} .shot .box i[data-h="se"]{right:-6px;bottom:-6px;cursor:nwse-resize}
+.rline{display:flex;align-items:center;gap:10px;color:var(--dim);min-height:26px}
 
 /* one desk, three modes - show only the controls that apply. Fusion draws
    from both sides, so it hides .no-fusion instead: the palette, the colour
@@ -789,6 +1131,23 @@ td .mini+.mini{margin-left:6px}
       <label for="monitor">Display</label>
       <select id="monitor"></select>
       <p class="note warn" id="permnote"></p>
+    </div>
+
+    <div class="in deck-runtime only-screen">
+      <span id="arealabel">Area</span>
+      <div class="shot" id="shot" tabindex="0" role="group" aria-labelledby="arealabel" aria-describedby="areatxt">
+        <img id="shotimg" alt="" hidden>
+        <div class="shade" id="shade" hidden></div>
+        <div class="box" id="box" hidden><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i></div>
+      </div>
+      <div class="rline"><span id="areatxt">Whole display</span><span class="sp"></span>
+        <button class="mini" id="areaall" type="button" hidden>Whole display</button></div>
+    </div>
+
+    <div class="in deck-runtime only-music">
+      <label for="mic">Input</label>
+      <select id="mic"><option value="">Automatic</option></select>
+      <div class="meter" id="meter" hidden><span class="bar"><i id="meterbar"></i></span><output id="meterdb"></output></div>
     </div>
 
     <div class="rows deck-runtime">
@@ -869,6 +1228,7 @@ td .mini+.mini{margin-left:6px}
 const P = __PALETTES__;
 const $ = id => document.getElementById(id);
 let holdUntil = 0;   // don't let polling stomp a fader you're dragging
+let draft=null, drag=null, shotFor=null, shotStale=true, keyTimer=0;   // capture area
 
 function hsv2rgb(h,s,v){
   h=((h%360)+360)%360; s/=100; v/=100;
@@ -968,7 +1328,8 @@ function setStatus(text){
   $('stxt').textContent = m ? 'error' : text.replace('on the cloud deck','in Setup');
   $('errnote').textContent = m ? m[1].charAt(0).toUpperCase() + m[1].slice(1) : '';
   st.className = 'st' + (text==='running' ? ' on'
-    : /^(connecting|starting)/.test(text) ? ' busy'
+    : text==='no signal' ? ' quiet'
+    : /^(connecting|starting|stopping|restoring)/.test(text) ? ' busy'
     : /^(error|no bulb|server)/.test(text) ? ' bad' : '');
 }
 
@@ -976,6 +1337,7 @@ function setStatus(text){
   b.onclick=()=>{
     const m=b.dataset.mode;
     [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c===b));
+    if(m!=='music' && document.body.dataset.mode==='music') shotStale = true;
     document.body.dataset.mode = m;
     send({mode:m});
   };
@@ -984,6 +1346,7 @@ function showDeck(name){
   const deck = name==='cloud' ? 'cloud' : 'runtime';
   document.body.dataset.deck = deck;
   if(deck==='cloud' && window.cloudUp) cloudPoll();   // not before its state exists
+  if(deck==='runtime') shotStale = true;
 }
 $('addr').onclick=()=>{ location.hash='cloud'; };
 $('done').onclick=()=>{ location.hash='runtime'; };
@@ -992,6 +1355,7 @@ showDeck(location.hash.slice(1));
 addEventListener('hashchange', ()=>showDeck(location.hash.slice(1)));
 
 $('monitor').addEventListener('change',e=>send({monitor:+e.target.value}));
+$('mic').addEventListener('change',e=>send({mic:e.target.value || null}));
 $('calm').addEventListener('change',e=>send({calm:e.target.checked}));
 $('go').addEventListener('click',()=>{
   const on = $('go').dataset.on === 'true';
@@ -999,6 +1363,130 @@ $('go').addEventListener('click',()=>{
 });
 $('ipset').addEventListener('click',()=>send({ip:$('ip').value.trim()}));
 $('ip').addEventListener('keydown',e=>{ if(e.key==='Enter') send({ip:$('ip').value.trim()}); });
+
+/* ------------------------------ audio input ------------------------------ */
+// The device list costs a CoreAudio walk, so it is fetched on load and when
+// the picker gets focus (a device may have been plugged in), never per poll.
+let inputs={inputs:[],auto:''}, micKey='';
+async function loadInputs(){
+  try{ inputs = await (await fetch('/api/inputs')).json(); }catch(e){ return; }
+  buildMics();
+}
+function buildMics(){
+  const want = live ? (live.mic || '') : $('mic').value;
+  const names = inputs.inputs.slice();
+  const opts = [['', inputs.auto ? `Automatic (${inputs.auto})` : 'Automatic']]
+    .concat(names.map(n=>[n,n]));
+  if(want && !names.includes(want)) opts.push([want, want+' (not connected)']);
+  const key = JSON.stringify(opts);
+  if(key !== micKey){
+    micKey = key;
+    const sel=$('mic'); sel.innerHTML='';
+    opts.forEach(([v,t])=>{ const o=document.createElement('option'); o.value=v; o.textContent=t; sel.append(o); });
+  }
+  if(document.activeElement !== $('mic')) $('mic').value = want;
+}
+$('mic').addEventListener('focus', loadInputs);
+loadInputs();
+
+function paintMeter(s){
+  const on = s.running && s.mode!=='screen' && s.input_db !== null;
+  $('meter').hidden = !on;
+  if(!on) return;
+  $('meter').classList.toggle('none', !s.signal);
+  $('meterbar').style.width = s.signal ? Math.max(0, Math.min(1, (s.input_db+60)/60))*100+'%' : '0';
+  $('meterdb').textContent = s.signal ? (s.input_db >= -0.5 ? '0 dB' : '\u2212'+Math.round(-s.input_db)+' dB') : 'No signal';
+}
+
+/* ------------------------------ capture area ------------------------------ */
+// The box lives in the display's own points; the frame is the display at
+// its aspect ratio, with a still of it when the desk may serve one.
+function mon(){ return live && live.monitors.find(m=>m.i===live.monitor); }
+let regionKey='';
+function paintRegion(r, live_=false){
+  const m=mon(); if(!m) return;
+  // the poll calls this every frame; touch the DOM only when the box moved
+  const key=JSON.stringify([r,m.w,m.h]);
+  if(live_ && key===regionKey) return;
+  regionKey=key;
+  $('shot').style.aspectRatio = m.w+'/'+m.h;
+  const has=!!r;
+  $('box').hidden = $('shade').hidden = !has;
+  $('areaall').hidden = !has;
+  $('areatxt').textContent = has ? `${r[2]} \u00d7 ${r[3]} at ${r[0]}, ${r[1]}` : 'Whole display';
+  if(!has) return;
+  const L=r[0]/m.w*100, T=r[1]/m.h*100, W=r[2]/m.w*100, H=r[3]/m.h*100;
+  Object.assign($('box').style,{left:L+'%',top:T+'%',width:W+'%',height:H+'%'});
+  $('shade').style.clipPath = `polygon(0 0,100% 0,100% 100%,0 100%,0 ${T}%,${L}% ${T}%,${L}% ${T+H}%,${L+W}% ${T+H}%,${L+W}% ${T}%,0 ${T}%)`;
+}
+function maybeShot(s){
+  // one still when the area first shows, on a display change and on coming
+  // back to the page - never on a timer
+  if(!s.snapshot_ok || s.mode==='music' || document.body.dataset.deck!=='runtime' || document.hidden) return;
+  if(shotFor===s.monitor && !shotStale) return;
+  shotFor=s.monitor; shotStale=false;
+  const img=$('shotimg');
+  img.onload=()=>{ img.hidden=false; };
+  img.onerror=()=>{ img.hidden=true; };
+  img.src='/api/snapshot?monitor='+s.monitor+'&t='+Date.now();
+}
+function pt(e){
+  const m=mon(), b=$('shot').getBoundingClientRect();
+  return [Math.max(0,Math.min(m.w,(e.clientX-b.left)/b.width*m.w)),
+          Math.max(0,Math.min(m.h,(e.clientY-b.top)/b.height*m.h))];
+}
+function fit(x0,y0,x1,y1){
+  const m=mon();
+  const x=Math.round(Math.min(x0,x1)), y=Math.round(Math.min(y0,y1));
+  return [x, y, Math.round(Math.min(Math.abs(x1-x0), m.w-x)), Math.round(Math.min(Math.abs(y1-y0), m.h-y))];
+}
+const MIN_AREA=32;
+$('shot').addEventListener('pointerdown',e=>{
+  const m=mon(); if(!m || e.button>0) return;
+  const p=pt(e), r=draft || (live && live.region), h=e.target.dataset && e.target.dataset.h;
+  if(h && r){            // resize from the corner opposite the handle
+    drag={kind:'size', ax: h.includes('w') ? r[0]+r[2] : r[0], ay: h.includes('n') ? r[1]+r[3] : r[1]};
+  }else if(r && e.target===$('box')){
+    drag={kind:'move', dx:p[0]-r[0], dy:p[1]-r[1], w:r[2], h:r[3]};
+  }else{
+    drag={kind:'size', ax:p[0], ay:p[1], fresh:true};
+  }
+  $('shot').setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+$('shot').addEventListener('pointermove',e=>{
+  if(!drag) return;
+  const m=mon(), p=pt(e);
+  if(drag.kind==='move'){
+    const x=Math.round(Math.max(0,Math.min(m.w-drag.w,p[0]-drag.dx)));
+    const y=Math.round(Math.max(0,Math.min(m.h-drag.h,p[1]-drag.dy)));
+    draft=[x,y,drag.w,drag.h];
+  }else draft=fit(drag.ax,drag.ay,p[0],p[1]);
+  paintRegion(draft);
+});
+function endDrag(){
+  if(!drag) return;
+  const r=draft; drag=null; draft=null;
+  if(r && r[2]>=MIN_AREA && r[3]>=MIN_AREA) send({region:r});
+  else paintRegion(live && live.region);       // a click, not a box
+}
+$('shot').addEventListener('pointerup',endDrag);
+$('shot').addEventListener('pointercancel',endDrag);
+$('shot').addEventListener('keydown',e=>{
+  const m=mon(), r=(draft || (live && live.region));
+  const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];
+  if(!m || !r || !d) return;
+  e.preventDefault();
+  const sx=Math.round(m.w/100), sy=Math.round(m.h/100);
+  let [x,y,w,h]=r;
+  if(e.shiftKey){ w=Math.max(MIN_AREA,Math.min(m.w-x,w+d[0]*sx)); h=Math.max(MIN_AREA,Math.min(m.h-y,h+d[1]*sy)); }
+  else{ x=Math.max(0,Math.min(m.w-w,x+d[0]*sx)); y=Math.max(0,Math.min(m.h-h,y+d[1]*sy)); }
+  draft=[x,y,w,h]; paintRegion(draft);
+  holdUntil=Date.now()+1500;
+  clearTimeout(keyTimer);
+  keyTimer=setTimeout(()=>{ const r2=draft; draft=null; send({region:r2}); }, 400);
+});
+$('areaall').addEventListener('click',()=>{ draft=null; paintRegion(null); send({region:null}); });
 
 let monitorsBuilt=false;
 let ipTouched=false;
@@ -1031,7 +1519,11 @@ async function poll(){
       drawTape(col);
     }
     wasRunning = s.running;
-    setStatus(s.status);
+    // a session that runs on a silent input looks like a dead lamp, so the
+    // bar says so outright (screen mode has no input)
+    setStatus(s.running && s.status==='running' && !s.signal && s.mode!=='screen' ? 'no signal' : s.status);
+    paintMeter(s);
+    maybeShot(s);
     const addr=$('addr');
     addr.classList.toggle('need', !s.ip);
     if(s.ip){ addr.innerHTML='Bulb <b></b>'; addr.lastChild.textContent=s.ip; }
@@ -1066,6 +1558,8 @@ async function poll(){
       [...$('modes').children].forEach(c=>c.setAttribute('aria-pressed', c.dataset.mode===s.mode));
       document.body.dataset.mode = s.mode;
       $('monitor').value = s.monitor;
+      if(!drag && !draft) paintRegion(s.region, true);
+      buildMics();
       // faders follow the desk too, or a reload leaves them showing whatever
       // the browser restored rather than what is running
       Object.keys(KEYS).forEach(id=>{
@@ -1080,7 +1574,7 @@ async function poll(){
   pollTimer = setTimeout(poll, pollDelay());
 }
 poll();
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ poll(); cloudPoll(); } });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ shotStale=true; poll(); cloudPoll(); } });
 
 /* ------------------------------ setup deck ------------------------------ */
 let method='password', serversBuilt=false, logLen=-1, devKey='';
@@ -1230,6 +1724,7 @@ class Handler(BaseHTTPRequestHandler):
     # unless the operator asked for them with --allow-remote-login.
     cloud_enabled = True
     cloud_reason = ""
+    local = True                    # bound to loopback; see _host_ok
     # keep-alive: the page talks to the desk many times a second, and
     # HTTP/1.0 would cost a new connection and a new thread for each one.
     # Every response carries Content-Length, which 1.1 needs. The timeout
@@ -1266,7 +1761,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _host_ok(self):
+        """On a loopback bind, serve only a page that was itself opened on a
+        loopback name. Without this a website can point its own hostname at
+        127.0.0.1 (DNS rebinding) and read the desk as if it were same-origin
+        - and the desk now serves a still of the screen."""
+        if not self.local:
+            return True
+        host = self.headers.get("Host", "")
+        name = host[1:host.find("]")] if host.startswith("[") else host.split(":")[0]
+        name = name.lower()
+        if name in ("localhost", "127.0.0.1", "::1") or name.endswith(".localhost"):
+            return True
+        self.close_connection = True
+        self._send(403, "this desk answers on localhost only", "text/plain")
+        return False
+
     def do_GET(self):
+        if not self._host_ok():
+            return
         if self.path.startswith("/api/state"):
             self._send(200, json.dumps(self.state.snapshot()), "application/json")
         elif self.path.startswith("/api/cloud/state"):
@@ -1275,6 +1788,12 @@ class Handler(BaseHTTPRequestHandler):
             snap["reason"] = self._cloud_ready()
             snap["servers"] = list(cloud.SERVERS) if cloud else []
             self._json(200, snap)
+        elif self.path.startswith("/api/inputs"):
+            # enumerating devices costs a CoreAudio walk, so the page asks
+            # for it when it loads and when the picker gets focus, not per poll
+            self._json(200, audio_inputs())
+        elif self.path.startswith("/api/snapshot"):
+            self._snapshot()
         elif self.path in ("/", "/index.html"):
             page = PAGE.replace("__PALETTES__", json.dumps(PALETTES))
             self._send(200, page, "text/html; charset=utf-8")
@@ -1282,6 +1801,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        if not self._host_ok():
+            return
         if self.path.startswith("/api/cloud/"):
             self._do_cloud()
             return
@@ -1293,39 +1814,43 @@ class Handler(BaseHTTPRequestHandler):
         if patch is None:
             self._send(400, "bad json", "text/plain")
             return
-        allowed = {"running", "palette", "calm", "sensitivity", "gamma",
-                   "punch", "fps", "fade", "mode", "monitor", "screen_fps",
-                   "screen_gamma", "min_sat", "sat_boost", "ip"}
-        clean = {k: v for k, v in patch.items() if k in allowed}
-        if "palette" in clean and clean["palette"] != "auto" and clean["palette"] not in PALETTES:
-            clean.pop("palette")
-        if clean.get("mode") not in (None, "music", "screen", "fusion"):
-            clean.pop("mode")
-        if "monitor" in clean:
-            known = {m["i"] for m in self.state.snapshot()["monitors"]}
-            if clean["monitor"] not in known:
-                clean.pop("monitor")
+        snap = self.state.snapshot()
         # the LEDs cannot resolve past ~30/s, so clamp rather than trust the UI
-        for key, lo, hi in (("fps", 5, 30), ("screen_fps", 4, 30)):
-            if key in clean:
-                clean[key] = int(min(max(clean[key], lo), hi))
-        if "fade" in clean:
-            clean["fade"] = float(min(max(clean["fade"], 0.0), 6.0))
-        if "ip" in clean:
-            ip = str(clean["ip"]).strip()
-            if not HOSTNAME_RE.match(ip):
-                clean.pop("ip")
-            else:
-                clean["ip"] = ip
-                # the session reads the address once, at connect time, so a
-                # live run has to end before the new bulb can be opened
-                if self.state.snapshot()["running"] and ip != self.state.snapshot()["ip"]:
-                    clean["running"] = False
-                    clean["status"] = f"bulb address is now {ip} - press Start"
+        clean = clean_patch(patch, snap)
+        # a saved input may be unplugged (the desk then says so), but the
+        # page can only pick one that is there now
+        if clean.get("mic") and clean["mic"] != snap["mic"] \
+                and clean["mic"] not in audio_inputs()["inputs"]:
+            clean.pop("mic")
         if "running" in clean:
             clean["status"] = "starting" if clean["running"] else "stopping"
+        if "ip" in clean and snap["running"] and clean["ip"] != snap["ip"]:
+            # the session reads the address once, at connect time, so a
+            # live run has to end before the new bulb can be opened
+            clean["running"] = False
+            clean["status"] = f"bulb address is now {clean['ip']} - press Start"
         self.state.control(**clean)
         self._send(200, json.dumps({"ok": True}), "application/json")
+
+    def _snapshot(self):
+        snap = self.state.snapshot()
+        if not snap["snapshot_ok"]:
+            self._send(403, "snapshots are served only on loopback, with "
+                            "Screen Recording permission", "text/plain")
+            return
+        m = re.search(r"[?&]monitor=(\d+)", self.path)
+        monitor = int(m.group(1)) if m else snap["monitor"]
+        try:
+            png = display_snapshot(monitor)
+        except Exception as exc:
+            self._send(404, f"no snapshot: {exc}", "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(png)
 
     # -- cloud login --------------------------------------------------
     def _do_cloud(self):
@@ -1374,9 +1899,16 @@ def main():
                    "from the desk once the cloud login has found it")
     p.add_argument("--token", help="only for --enable-lan")
     p.add_argument("--enable-lan", action="store_true")
-    p.add_argument("--mic", help="exact audio device name to capture")
+    p.add_argument("--mic", help="exact audio device name to capture; "
+                   "can also be chosen on the desk")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--settings", default=settings_path(), metavar="PATH",
+                   help="where the desk remembers its settings "
+                        "(default: %(default)s); pass '' to keep nothing")
+    p.add_argument("--no-restore", dest="restore", action="store_false",
+                   help="leave the lamp on the last colour sent when the desk "
+                        "stops, instead of putting back what it showed before")
     p.add_argument("--allow-remote-login", action="store_true",
                    help="permit the Xiaomi cloud login from a non-loopback "
                         "bind; the desk has no authentication, so only on a "
@@ -1389,11 +1921,21 @@ def main():
         enable_lan(args.ip, args.token)
         return
 
-    state = State(args.ip, args.mic)
-    Engine(state).start()
+    loopback = args.host in ("127.0.0.1", "localhost", "::1", "")
+    store = SettingsStore(args.settings or None)
+    saved = store.load()
+    # the command line wins over the file for this run
+    if args.ip:
+        saved["ip"] = args.ip
+    if args.mic:
+        saved["mic"] = args.mic
+    state = State(saved, store=store, local=loopback)
+    store.attach(state)
+    engine = Engine(state, restore=args.restore)
+    engine.start()
     Handler.state = state
     Handler.cloud = CloudSession()
-    loopback = args.host in ("127.0.0.1", "localhost", "::1", "")
+    Handler.local = loopback
     Handler.cloud_enabled = loopback or args.allow_remote_login
     Handler.cloud_reason = ("" if Handler.cloud_enabled else
                             "cloud login is off because the desk is bound to "
@@ -1402,11 +1944,27 @@ def main():
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     shown = "localhost" if args.host == "127.0.0.1" else args.host
-    print(f"Desk ready at http://{shown}:{args.port}  (bulb {args.ip})")
+    ip = state.snapshot()["ip"]
+    print(f"Desk ready at http://{shown}:{args.port}  (bulb {ip or 'not set'})")
+
+    def terminate(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
+        pass
+    finally:
+        # end a running session the normal way, so the lamp is put back and
+        # its socket closed, before the daemon threads die with the process
+        if state.snapshot()["running"]:
+            print("\nstopping...")
+            state.set(running=False, status="stopping")
+            state.changed.set()
+            engine.idle.wait(10)
+        store.close()
+        srv.server_close()
+        print("bye")
 
 
 if __name__ == "__main__":

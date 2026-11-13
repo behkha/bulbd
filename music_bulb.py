@@ -47,8 +47,10 @@ Install:
 """
 
 import argparse
+import json
 import math
 import queue
+import socket
 import sys
 import threading
 import time
@@ -737,7 +739,7 @@ class Sender(threading.Thread):
         except queue.Full:
             pass
 
-    def stop(self):
+    def stop(self, timeout=2.0):
         """End the thread. It blocks on the queue rather than polling it, so
         it needs a sentinel to notice."""
         self.alive = False
@@ -749,6 +751,10 @@ class Sender(threading.Thread):
             self.box.put_nowait(None)
         except queue.Full:
             pass
+        # wait out a send already in flight: a set_hsv landing after
+        # release_bulb() would paint over the colour it just restored
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout)
 
     def run(self):
         while self.alive:
@@ -773,7 +779,114 @@ class Sender(threading.Thread):
                     time.sleep(1.0)
 
 
-def open_bulb(ip, attempts=3, on_attempt=None):
+# What the lamp was showing before a session took it, so stopping can put it
+# back. The exchange is our own rather than Bulb.send_command, which loops
+# forever on a socket the bulb has closed cleanly (recv keeps returning b""),
+# and nothing may hang a stop. It rides on the session's own connections
+# (pass `sock`), because the bulb has only a handful of slots and frees a
+# closed one slowly: a read and a restore should not cost two more.
+LAMP_PROPS = ("power", "bright", "color_mode", "rgb", "ct", "hue", "sat")
+LAMP_PORT = 55443
+
+
+def lamp_call(ip, commands, timeout=2.0, connect=socket.create_connection,
+              sock=None):
+    """Send [(method, params), ...] in order and return each command's
+    result list. Raises on the first error; the whole exchange is bounded by
+    `timeout`. With `sock` it uses that open connection and leaves it open
+    for its owner; without, it opens one of its own and always closes it."""
+    deadline = time.monotonic() + timeout
+    own = sock is None
+    if own:
+        sock = connect((ip, LAMP_PORT), timeout)
+    before = None if own else sock.gettimeout()
+    try:
+        buf = b""
+        results = []
+        for n, (method, params) in enumerate(commands, 1):
+            sock.sendall((json.dumps({"id": n, "method": method,
+                                      "params": params},
+                                     separators=(",", ":")) + "\r\n").encode())
+            # This firmware does not act on a command until another byte
+            # follows it: without this the bulb accepts the connection and
+            # says nothing, which reads exactly like wedged slots. yeelight
+            # sends the same lone space (its issue #61).
+            sock.sendall(b" ")
+            while True:
+                line, sep, rest = buf.partition(b"\r\n")
+                if not sep:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError(f"{method}: no answer")
+                    sock.settimeout(left)
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError(f"{method}: bulb closed the connection")
+                    buf += chunk
+                    continue
+                buf = rest
+                if not line.strip():
+                    continue
+                msg = json.loads(line)
+                if msg.get("method") == "props":       # a state push, not our reply
+                    continue
+                if msg.get("id") != n:
+                    continue
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                results.append(msg.get("result"))
+                break
+        return results
+    finally:
+        try:
+            if own:
+                sock.close()
+            else:
+                sock.settimeout(before)
+        except Exception:
+            pass
+
+
+def read_lamp(ip, **kw):
+    """The lamp's power, brightness and colour as ints (power as "on"/"off"),
+    or None if the bulb did not say."""
+    (values,) = lamp_call(ip, [("get_prop", list(LAMP_PROPS))], **kw)
+    raw = dict(zip(LAMP_PROPS, values or []))
+
+    def num(key):
+        try:
+            return int(raw.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    if raw.get("power") not in ("on", "off"):
+        return None
+    saved = {"power": raw["power"]}
+    saved.update({k: num(k) for k in LAMP_PROPS[1:]})
+    return saved
+
+
+def restore_commands(saved, ms=300):
+    """The commands that put `saved` back: colour first (so a lamp that was
+    off comes back on in its own colour next time), then brightness, then
+    power off if it was off."""
+    cmds = []
+    mode = saved.get("color_mode")
+    if mode == 1 and saved.get("rgb") is not None:
+        cmds.append(("set_rgb", [max(0, min(saved["rgb"], 0xFFFFFF)), "smooth", ms]))
+    elif mode == 2 and saved.get("ct"):
+        cmds.append(("set_ct_abx", [max(1700, min(saved["ct"], 6500)), "smooth", ms]))
+    elif mode == 3 and saved.get("hue") is not None:
+        cmds.append(("set_hsv", [saved["hue"] % 360,
+                                 max(0, min(saved.get("sat") or 0, 100)), "smooth", ms]))
+    if saved.get("bright"):
+        cmds.append(("set_bright", [max(1, min(saved["bright"], 100)), "smooth", ms]))
+    if saved.get("power") == "off":
+        cmds.append(("set_power", ["off", "smooth", ms]))
+    return cmds
+
+
+def open_bulb(ip, attempts=3, on_attempt=None, remember=True):
     """Connect and enter music mode, retrying a bulb that is still busy.
 
     A color5 accepts only a handful of LAN connections at once, so a slot
@@ -781,15 +894,29 @@ def open_bulb(ip, attempts=3, on_attempt=None):
     before the next one rather than left dangling. Retries take a few
     seconds, so `on_attempt(n, total, error)` reports progress - without it
     a caller showing "connecting" just looks hung.
+
+    With `remember`, the lamp's state is read first - on the connection the
+    session is about to use, not one of its own - and kept on the bulb as
+    `bulbd_saved`, for release_bulb(bulb, restore=True). It is read once: a
+    retry must not mistake what a failed attempt left behind for the lamp's
+    own look. An answer that makes no sense only means nothing is restored.
     """
     from yeelight import Bulb
 
+    saved, asked = None, False
     last = None
     for i in range(attempts):
         if on_attempt:
             on_attempt(i + 1, attempts, last)
         bulb = Bulb(ip, effect="sudden", duration=0, auto_on=True)
+        bulb.bulbd_saved = None
         try:
+            if remember and not asked:
+                # a bulb that will not answer this will not answer turn_on
+                # either, so a timeout here fails the attempt like any other
+                saved = read_lamp(ip, sock=bulb._socket)
+                asked = True
+            bulb.bulbd_saved = saved
             bulb.turn_on()
             bulb.start_music()
             return bulb
@@ -803,20 +930,40 @@ def open_bulb(ip, attempts=3, on_attempt=None):
                        f"port 55443, its LAN slots are wedged - power-cycle it")
 
 
-def release_bulb(bulb):
-    """Hand the bulb's LAN connection back.
+def release_bulb(bulb, restore=False):
+    """Hand the bulb's LAN connection back, and optionally its old look.
 
     yeelight.Bulb holds one persistent socket and never closes it on error;
     stop_music() closes it but then sends `set_music 0`, which lazily opens
     a *fresh* socket that leaks if that send also fails. Every leaked socket
     burns one of the bulb's few connection slots until it times them out
     minutes later, so a few failed sessions lock the bulb out entirely.
+
+    `restore=True` puts back what open_bulb() read (a dict from read_lamp()
+    works too). It goes out on the connection stop_music() has just opened,
+    before that is closed, so stopping costs the bulb no extra slot. A
+    failure is reported, never raised: stopping always finishes.
     """
+    saved = getattr(bulb, "bulbd_saved", None) if restore is True else restore
     try:
         bulb.stop_music()
     except Exception:
         pass
     sock = getattr(bulb, "_Bulb__socket", None)
+
+    restored = False
+    if saved:
+        try:
+            if sock is not None:
+                lamp_call(bulb._ip, restore_commands(saved), sock=sock)
+            else:
+                # stop_music() never reached the bulb: one bounded try on a
+                # fresh connection, which also has to end music mode
+                lamp_call(bulb._ip, [("set_music", [0])] + restore_commands(saved))
+            restored = True
+        except Exception as exc:
+            print(f"could not restore the lamp: {exc}", file=sys.stderr)
+
     if sock is not None:
         try:
             sock.close()
@@ -826,6 +973,7 @@ def release_bulb(bulb):
             bulb._Bulb__socket = None
         except Exception:
             pass
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +1036,7 @@ def _output_feeds_a_cable(speaker):
         return False
 
 
-def pick_recorder(mic_name=None):
+def pick_recorder(mic_name=None, quiet=False):
     import soundcard as sc
     if mic_name:
         for attempt in (lambda: sc.get_microphone(mic_name, include_loopback=True),
@@ -914,12 +1062,13 @@ def pick_recorder(mic_name=None):
             return cables[0]
     except Exception:
         pass
-    print("No loopback device found; using the microphone.", file=sys.stderr)
+    if not quiet:
+        print("No loopback device found; using the microphone.", file=sys.stderr)
     return sc.default_microphone()
 
 
 def run(args):
-    bulb = open_bulb(args.ip)
+    bulb = open_bulb(args.ip, remember=args.restore)
     print(f"Music mode active on {args.ip}. Ctrl-C to stop.")
 
     analyser = Analyser()
@@ -967,7 +1116,7 @@ def run(args):
                 last_sent, last_hsv = now, hsv
     finally:
         sender.stop()
-        release_bulb(bulb)
+        release_bulb(bulb, restore=args.restore)
 
 
 def run_screen(args):
@@ -979,7 +1128,7 @@ def run_screen(args):
         return
 
     grab = ScreenGrabber(args.monitor, args.screen_region, args.screen_width)
-    bulb = open_bulb(args.ip)
+    bulb = open_bulb(args.ip, remember=args.restore)
     print(f"Screen mode active on {args.ip}, monitor {args.monitor}, "
           f"{args.screen_fps} fps. Ctrl-C to stop.")
 
@@ -1021,7 +1170,7 @@ def run_screen(args):
                 time.sleep(slack)
     finally:
         sender.stop()
-        release_bulb(bulb)
+        release_bulb(bulb, restore=args.restore)
         grab.close()
 
 
@@ -1038,7 +1187,7 @@ def run_fusion(args):
     color = ScreenColorEngine(min_sat=args.min_sat, sat_boost=args.sat_boost,
                               gamma=args.screen_gamma, calm=args.calm)
     screen = ScreenColorThread(grab, color, fps=args.screen_fps)
-    bulb = open_bulb(args.ip)
+    bulb = open_bulb(args.ip, remember=args.restore)
     print(f"Fusion mode active on {args.ip}: colour from monitor "
           f"{args.monitor}, brightness from audio. Ctrl-C to stop.")
 
@@ -1086,7 +1235,7 @@ def run_fusion(args):
     finally:
         sender.stop()
         screen.close()
-        release_bulb(bulb)
+        release_bulb(bulb, restore=args.restore)
 
 
 def parse_region(text):
@@ -1114,6 +1263,9 @@ def main():
                    help="higher = more contrast between quiet and loud")
     p.add_argument("--calm", action="store_true",
                    help="gentler: softer hits, longer decays, slower colour steps")
+    p.add_argument("--no-restore", dest="restore", action="store_false",
+                   help="leave the lamp on the last colour sent when this "
+                        "exits, instead of putting back what it showed before")
     p.add_argument("--fade", type=float, default=0.0, metavar="SECONDS",
                    help="smooth colour mode: sweep between palette anchors "
                         "over this many seconds instead of snapping "

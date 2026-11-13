@@ -44,14 +44,18 @@ which lives in the Xiaomi cloud — see [Getting the token](#getting-the-token).
 ## Install
 
 ```bash
-pip install yeelight numpy soundcard python-miio mss
-pip install -r requirements.txt
+pip install -e .            # the light engine
+pip install -e ".[cloud]"   # plus the Xiaomi cloud / token half
 ```
 
-The first line is the light engine. The second is the cloud/token half
-(`requests`, `pycryptodome`, `Pillow`, `colorama`). If you already have a
+The base install is `yeelight numpy soundcard python-miio mss`; the `cloud`
+extra adds `requests`, `pycryptodome`, `charset-normalizer`, `Pillow` and
+`colorama` (`requirements.txt` lists the same five). If you already have a
 token, you can skip it — the dashboard imports the extractor inside a
 `try`/`except` and simply turns off the Xiaomi login in Setup when it isn't there.
+
+`python music_bulb.py` and `python music_bulb_dash.py` run straight from the
+checkout; the install also gives you them as `bulbd` and `bulbd-desk`.
 
 macOS only, as written.
 
@@ -91,8 +95,8 @@ python music_bulb_dash.py --ip "$BULB_IP"
 
 Open the URL it prints. Everything is live: mode, palette, sensitivity,
 capture rate, the lot. The desk can also take the address from its Setup
-page, in which case you can start it with no `--ip` at all. Or drive it
-headless:
+page, in which case you can start it with no `--ip` at all, and it remembers
+the address and every control for the next start. Or drive it headless:
 
 ```bash
 python music_bulb.py --ip "$BULB_IP"                    # music
@@ -108,16 +112,39 @@ next begins.
 
 ## The desk
 
-The stage across the top is the colour going to the bulb right now, with the
-ring pulsing on beats and the strip below it showing 10 audio bands — or 12
-hue bins in screen mode, each bar painted with the hue it counts. Underneath
-sit the numbered panels: transport, palette, and whichever signal chain the
-current mode uses.
+The left half is the colour going to the bulb right now, with the last 30
+seconds of colour under it and a strip of 10 audio bands — or 12 hue bins in
+screen mode, each bar painted with the hue it counts. The controls sit in one
+column on the right; under 1000 px the colour folds into a band at the top.
 
 The desk swaps its controls to match the mode. Fusion shows both halves minus
 what it can't use: the palettes, the colour fade and the dark lift have
 nothing to act on when the display owns the hue and the audio owns the
 brightness.
+
+- **Input** (music and fusion) lists every capture device plus *Automatic*,
+  which names the device it resolves to. The bar under it is the raw input
+  level in dBFS; after 1.5 s under -70 dBFS it reads **No signal** and so does
+  the top bar, because a silent input otherwise looks exactly like a broken
+  lamp. A saved input that is unplugged shows as *not connected* and Start
+  says so instead of touching the bulb.
+- **Area** (screen and fusion) shows a still of the chosen display; drag a box
+  on it to capture only that part — a player window without its controls, the
+  picture without the menu bar or the dock. Drag the box or its corners to
+  adjust, arrow keys nudge it (Shift resizes), **Whole display** clears it. The
+  still is taken when the area comes into view, on a display change and when
+  you come back to the page, never on a timer, and only a desk bound to
+  localhost serves it; elsewhere you draw on a blank outline.
+- Changing mode, input, display or area swaps the capture on the same bulb
+  connection. **Stop** puts the lamp back the way it was before Start —
+  power, brightness, and colour or white temperature — and so does Ctrl-C;
+  `--no-restore` leaves it on the last colour sent. The CLI does the same.
+- Settings — address, input, mode, palette, Calm, every fader, display and
+  area — are saved to `~/Library/Application Support/bulbd/settings.json`
+  a second after the last change and loaded at start (`--settings PATH` to
+  move it, `--settings ''` to keep nothing). Start/Stop is not saved: the lamp
+  never turns on by itself. `--ip` and `--mic` win over the file, and a
+  broken file costs only the values it breaks.
 
 Binds to localhost. `--host 0.0.0.0` reaches it from your phone — there is no
 authentication, so only on a network you trust.
@@ -164,7 +191,9 @@ python token_extractor.py -ni -u you@example.com -p secret -s de -o out.json
 - Cloud endpoints are refused unless the server is bound to loopback, or you
   started it with `--allow-remote-login`. Your Xiaomi password crosses that
   socket and the desk has no authentication.
-- The password is not kept after the login, and nothing is written to disk.
+- The password is not kept after the login, and nothing from the login is
+  written to disk. The desk's settings file holds only the controls listed
+  under [The desk](#the-desk).
 - Tokens are masked in the log pane; the device table reveals one row at a
   time, on request. They're account secrets — treat them like a password.
 
@@ -189,7 +218,8 @@ python music_bulb.py --list-devices
 With a Multi-Output device (or BlackHole itself) selected as the system
 output, `--mic` is optional: the virtual cable is picked automatically, in the
 CLI and on the desk. With a plain output selected it falls back to the
-microphone.
+microphone. On the desk the **Input** picker does what `--mic` does, and its
+level bar shows the silence straight away.
 
 Multi-Output devices ignore the hardware volume keys: set the level in the
 playing app, and leave BlackHole's own gain at full or the capture goes quiet.
@@ -207,7 +237,11 @@ wallpaper.
 
 ```bash
 python music_bulb.py --list-monitors     # index 0 is the union of all displays
+python music_bulb.py --ip "$BULB_IP" --screen --screen-region 0,40,1800,1000
 ```
+
+`--screen-region X,Y,W,H` is in desktop points; on the desk, draw the
+**Area** instead.
 
 ## When the bulb stops answering
 
@@ -244,12 +278,27 @@ Wi-Fi, which is high for a LAN and shows up as lag at 25 updates/sec.
   capture runs on its own thread and publishes the latest colour; its scene-cut
   flag is sticky until read, so a cut can't fall into the gap between sends.
 
+## Tests
+
+```bash
+pip install -e ".[test]"
+python -m pytest
+```
+
+Offline and deterministic: no bulb, no screen-recording permission, no audio
+device, no network (a test that opens a socket fails). It feeds synthetic
+drums, tones, noise and solid frames through the analyser, colour engines,
+capture pacer and sender, and checks the yeelight wire format against a fake
+socket. About 20 seconds.
+
 ## Layout
 
 ```
 music_bulb.py        DSP, screen capture, CLI, bulb lifecycle
 music_bulb_dash.py   the web desk; CloudSession drives the login
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
+tests/               pytest suite (synthetic signals in tests/signals.py)
+tools/check_bulb.py  manual check against a real bulb; not part of the suite
 ```
 
 ## Credits

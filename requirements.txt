@@ -1,3 +1,5 @@
+# The cloud / token half. Same list as the `cloud` extra in pyproject.toml:
+#   pip install -e ".[cloud]"
 requests
 pycryptodome
 charset-normalizer
