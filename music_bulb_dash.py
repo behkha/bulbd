@@ -36,8 +36,8 @@ import numpy as np
 from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
                         LevelEngine, Sender, pick_recorder, enable_lan,
                         ScreenGrabber, ScreenColorEngine, ScreenColorThread,
-                        crop_letterbox, screen_permission, open_bulb,
-                        release_bulb)
+                        CapturePacer, crop_letterbox, screen_permission,
+                        open_bulb, release_bulb)
 
 # The cloud half is optional: it pulls in requests/PIL/pycryptodome, and a
 # desk that only drives an already-provisioned bulb should still start
@@ -67,6 +67,10 @@ def screen_monitors():
 class State:
     def __init__(self, ip, mic):
         self._lock = threading.Lock()
+        # the engine parks on `started` instead of polling for a session, and
+        # a loop idling on a still picture ends its wait early on `changed`
+        self.started = threading.Event()
+        self.changed = threading.Event()
         mons = screen_monitors()
         self._d = {
             "ip": ip, "mic": mic,
@@ -77,7 +81,7 @@ class State:
             "fade": 0.0,
             # screen mode
             "monitor": mons[0]["i"] if mons else 1,
-            "screen_fps": 18, "screen_gamma": 0.75,
+            "screen_fps": 10, "screen_gamma": 0.75,
             "min_sat": 55.0, "sat_boost": 1.35, "screen_width": 192,
             "monitors": mons,
             "screen_ok": screen_permission() is not False,
@@ -94,6 +98,13 @@ class State:
     def set(self, **kw):
         with self._lock:
             self._d.update(kw)
+            if "running" in kw:
+                (self.started.set if kw["running"] else self.started.clear)()
+
+    def control(self, **kw):
+        """set(), for a change that came from the desk rather than telemetry."""
+        self.set(**kw)
+        self.changed.set()
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +128,7 @@ class Engine(threading.Thread):
 
     def run(self):
         while True:
-            if not self.state.snapshot()["running"]:
-                time.sleep(0.1)
-                continue
+            self.state.started.wait()           # parked while the desk is stopped
             try:
                 self._session()
             except Exception as exc:
@@ -149,7 +158,7 @@ class Engine(threading.Thread):
             else:
                 self._audio_loop(st, sender)
         finally:
-            sender.alive = False
+            sender.stop()
             release_bulb(bulb)
             st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10)
 
@@ -169,6 +178,7 @@ class Engine(threading.Thread):
                device=f"display {monitor} "
                       f"{grab.box['width']}x{grab.box['height']}")
 
+        pacer = CapturePacer()
         last = time.monotonic()
         last_hsv = None
         cut_env = 0.0
@@ -188,8 +198,11 @@ class Engine(threading.Thread):
 
                 now = time.monotonic()
                 dt, last = now - last, now
+                frame = grab.frame()
                 hue, sat, val, cut = color.tick(
-                    dt, *color.measure(crop_letterbox(grab.frame())))
+                    dt, *color.measure(crop_letterbox(frame)))
+                base = 1.0 / max(cfg["screen_fps"], 4)
+                period = pacer.period(frame, max(cfg["screen_fps"], 4), now)
 
                 v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
                 hsv = (int(round(hue)) % 360, int(round(sat)), v)
@@ -208,12 +221,19 @@ class Engine(threading.Thread):
                            and abs(hsv[1] - last_hsv[1]) < 3
                            and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
                 if not settled:
-                    sender.put(hsv, sudden=cut)
+                    # ramp for one frame gap so consecutive colours join up
+                    sender.put(hsv, sudden=cut,
+                               duration=int(np.clip(period * 1000, 30, 150)))
                     last_hsv = hsv
 
-                slack = 1.0 / max(cfg["screen_fps"], 4) - (time.monotonic() - now)
+                slack = base - (time.monotonic() - now)
                 if slack > 0:
                     time.sleep(slack)
+                # still picture: wait out the longer gap, but a moved control
+                # ends it so the desk never feels slow
+                if period > base and st.changed.wait(period - base):
+                    pacer.reset()
+                st.changed.clear()
         finally:
             grab.close()
 
@@ -325,6 +345,9 @@ class Engine(threading.Thread):
                     color.min_sat = float(cfg["min_sat"])
                     color.sat_boost = float(cfg["sat_boost"])
                     screen.fps = cfg["screen_fps"]
+                    if st.changed.is_set():     # a control moved: full rate
+                        st.changed.clear()
+                        screen.poke()
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
                     lvl.feed(f, dt)             # accents move brightness only
@@ -862,8 +885,8 @@ table.dev code{color:var(--acc);word-break:break-all}
         <input type="range" id="sboost" min="0.8" max="2" step="0.05" value="1.35">
       </div>
       <div class="fader">
-        <label for="sfps">CAPTURE RATE <span id="v-sfps">18</span></label>
-        <input type="range" id="sfps" min="4" max="30" step="1" value="18">
+        <label for="sfps">CAPTURE RATE <span id="v-sfps">10</span></label>
+        <input type="range" id="sfps" min="4" max="30" step="1" value="10">
       </div>
     </div>
   </div>
@@ -1000,6 +1023,7 @@ async function send(patch){
   holdUntil = Date.now()+700;
   try{ await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
        body:JSON.stringify(patch)}); }catch(e){ $('status').textContent='server unreachable'; }
+  poll();   // an idle desk polls slowly, so pick the change up now
 }
 async function post(path, body){
   const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1040,6 +1064,7 @@ function showDeck(name){
   const tab = tabs.find(t=>t.dataset.deck===name) || tabs[0];
   tabs.forEach(c=>c.setAttribute('aria-selected', c===tab));
   document.body.dataset.deck = tab.dataset.deck;
+  if(tab.dataset.deck==='cloud' && window.cloudUp) cloudPoll();   // not before its state exists
 }
 [...document.querySelectorAll('.deck-tab')].forEach(b=>{
   b.onclick=()=>{ showDeck(b.dataset.deck); location.hash = b.dataset.deck; };
@@ -1060,11 +1085,21 @@ $('ip').addEventListener('keydown',e=>{ if(e.key==='Enter') send({ip:$('ip').val
 let monitorsBuilt=false;
 let ipTouched=false;
 $('ip').addEventListener('input',()=>{ipTouched=true;});
-let busy=false;
+// Poll only as fast as there is something new to draw: the engine's own
+// rate while a session runs, once a second on an idle desk, slower when the
+// page is not on screen.
+let busy=false, pollTimer=0, live=null;
+function pollDelay(){
+  if(document.hidden) return 2000;
+  if(!live || !live.running) return 1000;
+  return live.mode==='screen' ? Math.max(60, 1000/live.screen_fps) : 60;
+}
 async function poll(){
   if(busy) return; busy=true;
+  clearTimeout(pollTimer);
   try{
     const s = await (await fetch('/api/state')).json();
+    live = s;
     const [r,g,b] = hsv2rgb(s.hue, s.sat, s.val);
     $('field').style.background = `rgb(${r},${g},${b})`;
     $('pulse').style.transform = `scale(${1 + 0.10*s.hit})`;
@@ -1112,11 +1147,21 @@ async function poll(){
       document.body.dataset.mode = s.mode;
       $('sub').textContent = SUBS[s.mode];
       $('monitor').value = s.monitor;
+      // faders follow the desk too, or a reload leaves them showing whatever
+      // the browser restored rather than what is running
+      Object.keys(KEYS).forEach(id=>{
+        const el=$(id), v=s[KEYS[id]];
+        if(document.activeElement===el || +el.value===v) return;
+        el.value = v;
+        $('v-'+id).textContent = WHOLE.has(id) ? el.value : (+el.value).toFixed(2);
+      });
     }
-  }catch(e){ $('status').textContent='server unreachable'; }
+  }catch(e){ live=null; $('status').textContent='server unreachable'; }
   busy=false;
+  pollTimer = setTimeout(poll, pollDelay());
 }
-setInterval(poll, 60); poll();
+poll();
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ poll(); cloudPoll(); } });
 
 /* ------------------------------ cloud deck ------------------------------ */
 let method='password', serversBuilt=false, logLen=-1, devKey='';
@@ -1134,14 +1179,16 @@ $('cstart').addEventListener('click', async ()=>{
     username:$('cuser').value.trim(), password:$('cpass').value});
   $('cpass').value='';
   if(!r.ok) $('clan').innerHTML = '<span class="err">'+(r.error||'could not start')+'</span>';
+  cloudPoll();
 });
-const abort = ()=>post('/api/cloud/cancel');
+const abort = async ()=>{ await post('/api/cloud/cancel'); cloudPoll(); };
 $('ccancel').addEventListener('click', abort);
 $('cpcancel').addEventListener('click', abort);
 const answer = async ()=>{
   const v = $('cpinput').value;
   $('cpinput').value='';
   await post('/api/cloud/answer', {value:v});
+  cloudPoll();
 };
 $('cpsend').addEventListener('click', answer);
 $('cpinput').addEventListener('keydown', e=>{ if(e.key==='Enter') answer(); });
@@ -1193,11 +1240,19 @@ function renderDevices(devs){
   });
 }
 
-let cbusy=false;
+// The cloud deck only changes during a login, so poll it only while it is
+// on screen, and quickly only while a login is in flight.
+let cbusy=false, cloudTimer=0, cloudActive=false;
+function cloudDelay(){
+  if(document.hidden || document.body.dataset.deck!=='cloud') return 0;
+  return cloudActive ? 500 : 3000;
+}
 async function cloudPoll(){
   if(cbusy) return; cbusy=true;
+  clearTimeout(cloudTimer);
   try{
     const c = await (await fetch('/api/cloud/state')).json();
+    cloudActive = (c.phase==='running' || c.phase==='prompt');
     if(!serversBuilt && c.servers.length){
       serversBuilt = true;
       $('cserver').innerHTML = '<option value="">all regions (slow)</option>'
@@ -1244,8 +1299,11 @@ async function cloudPoll(){
     renderDevices(c.devices);
   }catch(e){ /* the runtime poll already reports an unreachable server */ }
   cbusy=false;
+  const wait = cloudDelay();
+  if(wait) cloudTimer = setTimeout(cloudPoll, wait);
 }
-setInterval(cloudPoll, 500); cloudPoll();
+var cloudUp = true;
+cloudPoll();
 </script></body></html>
 """
 
@@ -1258,6 +1316,12 @@ class Handler(BaseHTTPRequestHandler):
     # unless the operator asked for them with --allow-remote-login.
     cloud_enabled = True
     cloud_reason = ""
+    # keep-alive: the page talks to the desk many times a second, and
+    # HTTP/1.0 would cost a new connection and a new thread for each one.
+    # Every response carries Content-Length, which 1.1 needs. The timeout
+    # reaps a connection the browser has stopped using.
+    protocol_version = "HTTP/1.1"
+    timeout = 30
 
     def log_message(self, *a):
         pass
@@ -1308,6 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
             self._do_cloud()
             return
         if not self.path.startswith("/api/control"):
+            self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
             return
         patch = self._body()
@@ -1345,7 +1410,7 @@ class Handler(BaseHTTPRequestHandler):
                     clean["status"] = f"bulb address is now {ip} - press Start"
         if "running" in clean:
             clean["status"] = "starting" if clean["running"] else "stopping"
-        self.state.set(**clean)
+        self.state.control(**clean)
         self._send(200, json.dumps({"ok": True}), "application/json")
 
     # -- cloud login --------------------------------------------------

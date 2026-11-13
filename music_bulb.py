@@ -418,6 +418,49 @@ class ScreenGrabber:
             pass
 
 
+class CapturePacer:
+    """How long to wait before the next grab; backs off while the picture holds.
+
+    A grab costs the same ~20 ms whatever its size, and most of that is
+    WindowServer compositing plus a TCC permission check in system daemons,
+    so the only real saving is making fewer of them. Each frame is compared
+    with the last one that moved (not the previous one, so a slow fade still
+    adds up to motion); once nothing has moved for a while the rate steps
+    down, and the first frame that differs puts it straight back.
+    """
+
+    PIXEL = 0.04                      # per-channel change that counts for a pixel
+    SHARE = 0.002                     # share of pixels that must change
+    STEPS = ((12.0, 2.0), (1.5, 5.0))  # (seconds still, fps cap), longest first
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Forget the stillness - the next frames run at the full rate."""
+        self.ref = None
+        self.still_since = None
+
+    def period(self, frame, fps, now):
+        """-> seconds from this grab to the next one."""
+        ref = self.ref
+        if (ref is None or ref.shape != frame.shape
+                or float((np.abs(frame - ref).max(axis=2) > self.PIXEL).mean())
+                > self.SHARE):
+            self.ref, self.still_since = frame, None
+        elif self.still_since is None:
+            self.still_since = now
+
+        fps = max(float(fps), 1.0)
+        if self.still_since is not None:
+            held = now - self.still_since
+            for after, cap in self.STEPS:
+                if held >= after:
+                    fps = min(fps, cap)
+                    break
+        return 1.0 / fps
+
+
 class ScreenColorEngine:
     """Dominant hue by weighted hue histogram, then smoothed over time.
 
@@ -507,9 +550,12 @@ class ScreenColorThread(threading.Thread):
 
     `cut` is sticky: a scene cut raised between two reads is held until the
     reader takes it, so a cut can never fall into the gap between sends.
+
+    The grab rate follows CapturePacer, so a still picture is read a few
+    times a second instead of `fps` times. `poke()` ends that idle wait.
     """
 
-    def __init__(self, grab, engine, fps=18):
+    def __init__(self, grab, engine, fps=10):
         super().__init__(daemon=True)
         self.grab = grab
         self.engine = engine
@@ -517,6 +563,8 @@ class ScreenColorThread(threading.Thread):
         self.alive = True
         self.error = None
         self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._pacer = CapturePacer()
         self._hue = engine.hue
         self._sat = engine.sat
         self._val = engine.val
@@ -528,8 +576,9 @@ class ScreenColorThread(threading.Thread):
             now = time.monotonic()
             dt, last = now - last, now
             try:
+                frame = self.grab.frame()
                 hue, sat, val, cut = self.engine.tick(
-                    dt, *self.engine.measure(crop_letterbox(self.grab.frame())))
+                    dt, *self.engine.measure(crop_letterbox(frame)))
             except Exception as exc:                # a display that went away
                 self.error = exc
                 self.alive = False
@@ -537,9 +586,15 @@ class ScreenColorThread(threading.Thread):
             with self._lock:
                 self._hue, self._sat, self._val = hue, sat, val
                 self._cut = self._cut or cut
-            slack = 1.0 / max(self.fps, 1) - (time.monotonic() - now)
+
+            base = 1.0 / max(self.fps, 1)
+            period = self._pacer.period(frame, self.fps, now)
+            slack = base - (time.monotonic() - now)
             if slack > 0:
                 time.sleep(slack)
+            if period > base:                       # idle stretch, interruptible
+                self._wake.wait(period - base)
+            self._wake.clear()
 
     def read(self):
         """-> (hue, sat 0..100, value 0..1, cut) - clears the pending cut."""
@@ -547,8 +602,14 @@ class ScreenColorThread(threading.Thread):
             cut, self._cut = self._cut, False
             return self._hue, self._sat, self._val, cut
 
+    def poke(self):
+        """A setting changed: read the screen at the full rate again."""
+        self._pacer.reset()
+        self._wake.set()
+
     def close(self):
         self.alive = False
+        self._wake.set()
         self.grab.close()
 
 
@@ -574,12 +635,25 @@ class Sender(threading.Thread):
         except queue.Full:
             pass
 
+    def stop(self):
+        """End the thread. It blocks on the queue rather than polling it, so
+        it needs a sentinel to notice."""
+        self.alive = False
+        try:
+            self.box.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.box.put_nowait(None)
+        except queue.Full:
+            pass
+
     def run(self):
         while self.alive:
-            try:
-                (h, s, v), sudden, duration = self.box.get(timeout=0.5)
-            except queue.Empty:
-                continue
+            item = self.box.get()                  # no wake-ups between frames
+            if item is None:
+                break
+            (h, s, v), sudden, duration = item
             try:
                 self.bulb.set_hsv(h, s, v,
                                   effect="sudden" if sudden else "smooth",
@@ -758,7 +832,7 @@ def run(args):
                            duration=int(np.clip(min_gap * 1000, 30, 150)))
                 last_sent, last_hsv = now, hsv
     finally:
-        sender.alive = False
+        sender.stop()
         release_bulb(bulb)
 
 
@@ -780,7 +854,7 @@ def run_screen(args):
     sender = Sender(bulb)
     sender.start()
 
-    period = 1.0 / args.screen_fps
+    pacer = CapturePacer()
     last = time.monotonic()
     last_hsv = None
 
@@ -789,8 +863,10 @@ def run_screen(args):
             now = time.monotonic()
             dt, last = now - last, now
 
+            frame = grab.frame()
             hue, sat, val, cut = color.tick(
-                dt, *color.measure(crop_letterbox(grab.frame())))
+                dt, *color.measure(crop_letterbox(frame)))
+            period = pacer.period(frame, args.screen_fps, now)
 
             v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
             hsv = (int(round(hue)) % 360, int(round(sat)), v)
@@ -801,14 +877,16 @@ def run_screen(args):
                        and abs(hsv[1] - last_hsv[1]) < 3
                        and abs(((hsv[0] - last_hsv[0] + 180) % 360) - 180) < 3)
             if not settled:
-                sender.put(hsv, sudden=cut)
+                # ramp for one frame gap so consecutive colours join up
+                sender.put(hsv, sudden=cut,
+                           duration=int(np.clip(period * 1000, 30, 150)))
                 last_hsv = hsv
 
             slack = period - (time.monotonic() - now)
             if slack > 0:
                 time.sleep(slack)
     finally:
-        sender.alive = False
+        sender.stop()
         release_bulb(bulb)
         grab.close()
 
@@ -872,7 +950,7 @@ def run_fusion(args):
                            duration=int(np.clip(min_gap * 1000, 30, 150)))
                 last_sent, last_hsv = now, hsv
     finally:
-        sender.alive = False
+        sender.stop()
         screen.close()
         release_bulb(bulb)
 
@@ -919,8 +997,9 @@ def main():
                    help="display index from --list-monitors (default: 1)")
     g.add_argument("--screen-region", type=parse_region, metavar="X,Y,W,H",
                    help="capture only this box - use it to skip player chrome")
-    g.add_argument("--screen-fps", type=int, default=18,
-                   help="capture rate, max 30 (default: 18)")
+    g.add_argument("--screen-fps", type=int, default=10,
+                   help="capture rate while the picture moves, max 30 "
+                        "(default: 10); a still picture is read less often")
     g.add_argument("--screen-width", type=int, default=192,
                    help="pixels the frame is sampled down to (default: 192)")
     g.add_argument("--screen-gamma", type=float, default=0.75,

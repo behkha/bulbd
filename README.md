@@ -190,8 +190,11 @@ playing app, and leave BlackHole's own gain at full or the capture goes quiet.
 
 ## Screen capture on macOS
 
-Uses `mss`, about 26 ms for a full-display grab, so ~33 fps is the practical
-ceiling. Without Screen Recording permission macOS hands back the desktop
+Uses `mss`, about 20-26 ms for a grab of any size, so ~33 fps is the practical
+ceiling. Most of that cost lands in macOS itself (WindowServer and the
+permission daemons), not in this process, so the capture rate is the battery
+dial: it defaults to 10 fps and drops to 5 and then 2 while the picture holds
+still, returning to full on the first frame that changes. Without Screen Recording permission macOS hands back the desktop
 wallpaper instead of an error, so the code preflights the permission and
 refuses to start rather than quietly lighting your room the colour of your
 wallpaper.
