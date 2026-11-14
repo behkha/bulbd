@@ -430,6 +430,19 @@ class LevelEngine:
             self.brightness += (level - self.brightness) * (1.0 - math.exp(-dt / 0.11))
         return accent
 
+    def peek(self, t, strength):
+        """The brightness a predicted beat of `strength` would flash to now,
+        or None if feed() would not flash it (too weak, or the input has gone
+        quiet). For a flash the bulb times itself: it is built before
+        feed() takes the beat."""
+        gate = 0.30 if self.calm else 0.12
+        if strength <= gate or (self.silent_since and t - self.silent_since > 1.2):
+            return None
+        punch = self.punch if self.punch is not None else (0.45 if self.calm else 0.78)
+        hit = max(self.hit, 0.35 + 0.65 * strength)
+        level = float(np.clip(0.10 + 0.42 * self.sustain + punch * hit, 0.0, 1.0))
+        return max(self.brightness, level)
+
 
 # ---------------------------------------------------------------------------
 # beat prediction - send the flash early so it lands on the beat
@@ -468,6 +481,11 @@ class BeatClock:
 
     def __init__(self, dt=BLOCK / SAMPLERATE):
         self.dt = dt
+        # Bulb-timed beats: hand a beat over `ahead` s before it is due, for
+        # a flow that waits `hold` s on the bulb's clock and then flashes.
+        # 0 = fire on the block nearest the beat, as always.
+        self.ahead = 0.0
+        self.hold = 0.0
         self.reset()
 
     def reset(self):
@@ -504,10 +522,14 @@ class BeatClock:
             self.streak = 0
 
         fire = None
+        self.hold = 0.0
         if self.trusted:
             nxt = self.last + self.period
-            if self.fired != nxt and nxt - lead - 0.5 * self.dt <= t < nxt:
+            due = nxt - lead
+            if self.fired != nxt and due - self.ahead - 0.5 * self.dt <= t < nxt - self.ahead:
                 self.fired = nxt
+                if self.ahead:
+                    self.hold = max(0.0, due - t)
                 fire = float(np.median(self.strengths)) if self.strengths else 0.5
         return fire, claimed
 
@@ -544,14 +566,34 @@ class BeatSync:
     instead of trailing the flash it belongs to by the lead time. Without a
     trusted grid it steps at once, as it always did."""
 
-    def __init__(self):
+    def __init__(self, timed=False):
         self.clock = BeatClock()
         self.pending = False
+        # bulb-timed beats (`timed`): a predicted beat is handed over
+        # BULB_AHEAD early as `hold` (s the bulb waits) and `flash` (the
+        # brightness it flashes to), for the loop to send as one flow; the
+        # brightness engine takes the beat when it is due, as before
+        self.timed = timed
+        self.hold = 0.0
+        self.flash = None
+        self.due = None                   # (audio time the flash lands, strength)
 
     def feed(self, f, lvl, dt, lead, color=None):
-        """-> True if this frame flashed a predicted beat."""
+        """-> True if this frame flashed a predicted beat - in timed mode,
+        if it handed one over in `hold` and `flash`."""
+        self.clock.ahead = BULB_AHEAD if self.timed else 0.0
         fire, claimed = self.clock.frame(f, lead)
-        accent = lvl.feed(f, dt, predicted=fire, claimed=claimed)
+        predicted, self.hold, self.flash = fire, 0.0, None
+        if self.timed:
+            predicted = None
+            if fire is not None:
+                self.flash = lvl.peek(f["t"], fire)
+                if self.flash is not None:
+                    self.hold = self.clock.hold
+                    self.due = (f["t"] + self.hold, fire)
+            if self.due is not None and f["t"] >= self.due[0] - 0.5 * dt:
+                predicted, self.due = self.due[1], None
+        accent = lvl.feed(f, dt, predicted=predicted, claimed=claimed)
         if color is not None:
             if accent and claimed:
                 self.pending = True
@@ -560,7 +602,226 @@ class BeatSync:
             if self.pending and (fire is not None or not self.clock.trusted):
                 color.step(f["t"], f["beat"])
                 self.pending = False
+        if self.timed:
+            return self.flash is not None
         return fire is not None and lvl.flashed
+
+
+# Bulb-timed beats hand a beat over this long before it is due (plus up to
+# half a block either way), so the flow's wait is 48-72 ms: long enough for
+# any step this firmware runs, short enough that the loop holds its own
+# frames back for only a few blocks. tools/check_flow.py: a 2-step flow
+# ends within a few ms of the same time, run after run.
+BULB_AHEAD = 0.06
+
+
+def frame_step(frame, ms):
+    """One flow step that ramps to `frame` (an hsv tuple or White) over ms."""
+    if isinstance(frame, White):
+        return (int(ms), 2, frame.ct, frame.bright)
+    h, s, v = frame
+    return (int(ms), 1, hsv_rgb(h, s), int(v))
+
+
+def beat_flow(hold, now, flash):
+    """The flow for a bulb-timed beat: hold `now` for `hold` s on the bulb's
+    clock, then flash to `flash` in 50 ms (yeelight's own `sudden`), and stay."""
+    return Flow(2, 1, (frame_step(now, max(50, round(hold * 1000))), frame_step(flash, 50)))
+
+
+# ---------------------------------------------------------------------------
+# drops and build-ups - a breakdown, then the beat coming back
+# ---------------------------------------------------------------------------
+class DropWatch:
+    """Finds build-ups and drops in what Analyser.feed returns.
+
+    Built on the same beats BeatClock trusts (onsets with LOW_SHARE of their
+    flux in the beat bands). There is a groove once GROOVE of them fell in
+    GROOVE_SECS. A breakdown is the groove stopping for BREAK seconds while
+    the sound goes on (silence is a gap between tracks, not a breakdown), and
+    the drop is the first strong beat after one. Sustained sound has no beats
+    and so never has a groove: a held note, a chord or hiss can give neither.
+
+    A build-up is called once per breakdown, BUILD_AFTER seconds into it,
+    when the onsets speed up (the last 2 s hold half as many again as the 2 s
+    before, and at least ROLL) or, 4 s in, the level has climbed RISE_DB over
+    3.5 s and kept climbing through the middle. A steady hat or pad does
+    neither. During a breakdown only a strong beat ends it: a riser's noise
+    grazing the beat bands is not the kick coming back.
+    """
+
+    LOW_SHARE = BeatClock.LOW_SHARE
+    GATE = 0.12                       # LevelEngine's own onset gate
+    STRONG = 0.45                     # ...and its colour-step accent
+    GROOVE, GROOVE_SECS = 4, 4.0
+    BREAK = 5.0
+    BUILD_AFTER = 1.5
+    ROLL = 6                          # onsets in the last 2 s for a roll
+    RISE_DB = 6.0
+    QUIET = 0.004                     # rms: LevelEngine's silence
+    QUIET_SHARE = 0.3                 # more of the gap than this silent: no breakdown
+
+    def __init__(self, dt=BLOCK / SAMPLERATE):
+        self.dt = dt
+        self.beats = deque(maxlen=self.GROOVE)
+        self.last_beat = None
+        self.grooved = False
+        self.built = False
+        self.onsets = deque()
+        self.db = deque(maxlen=int(round(4.0 / dt)))
+        self.frames = self.quiet = 0
+
+    def feed(self, f):
+        """One analyser frame. -> "build", "drop" or None."""
+        t, rms = f["t"], f["rms"]
+        self.db.append(20.0 * math.log10(max(rms, 1e-7)))
+        gated = f["onset"] and f["strength"] > self.GATE
+        beat = gated and f["low"] >= self.LOW_SHARE * max(f["flux"], 1e-9)
+        if (beat and self.last_beat is not None and t - self.last_beat >= self.BUILD_AFTER
+                and f["strength"] < self.STRONG):
+            beat = False                # a riser's noise grazing the low bands is no kick
+        if beat:
+            event = None
+            gap = t - self.last_beat if self.last_beat is not None else 0.0
+            if (self.grooved and gap >= self.BREAK and f["strength"] >= self.STRONG
+                    and self.quiet <= self.QUIET_SHARE * max(self.frames, 1)):
+                event = "drop"
+            self.beats.append(t)
+            self.last_beat = t
+            self.grooved = (len(self.beats) == self.GROOVE
+                            and t - self.beats[0] <= self.GROOVE_SECS)
+            self.frames = self.quiet = 0
+            self.built = False
+            self.onsets.clear()
+            return event
+
+        if self.last_beat is None:
+            return None
+        self.frames += 1
+        self.quiet += rms < self.QUIET
+        if self.quiet > self.QUIET_SHARE * max(self.frames, 1) and t - self.last_beat > 1.0:
+            self.grooved = False                    # the music stopped, not a breakdown
+        if gated:
+            self.onsets.append(t)
+        while self.onsets and self.onsets[0] < t - 4.0:
+            self.onsets.popleft()
+        if (not self.grooved or self.built or t - self.last_beat < self.BUILD_AFTER):
+            return None
+        recent = sum(1 for x in self.onsets if x > t - 2.0)
+        before = len(self.onsets) - recent
+        rolling = recent >= self.ROLL and recent >= 1.5 * before + 1
+        rising = False
+        # the level is compared only within the breakdown: from the groove
+        # into a loud pad is a step, not a climb
+        if len(self.db) == self.db.maxlen and t - self.last_beat >= 4.0:
+            db = np.fromiter(self.db, dtype=np.float32)
+            n = int(round(0.5 / self.dt))
+            old, mid, new = db[:n].mean(), db[len(db) // 2 - n // 2:][:n].mean(), db[-n:].mean()
+            rising = new - old >= self.RISE_DB and old + 2.0 <= mid <= new - 2.0
+        if rolling or rising:
+            self.built = True
+            return "build"
+        return None
+
+
+# The flows a build-up and a drop are answered with. Flashing light is a
+# photosensitivity risk: a strobe stays at or under MAX_STROBE flashes a
+# second unless the owner chooses otherwise (WCAG 2.3.1's three flashes).
+MAX_STROBE = 3.0
+SWELL_MS = 2500                       # a build-up: rise to full over this
+SWELL_HOLD = 6.0                      # ...and hold it at most this long for the drop
+
+
+def swell_flow(hue, sat, white=None):
+    """A build-up: from wherever the lamp is, up to full over SWELL_MS, and stay."""
+    if white is not None:
+        return Flow(1, 1, ((SWELL_MS, 2, white, 100),))
+    return Flow(1, 1, ((SWELL_MS, 1, hsv_rgb(hue, sat), 100),))
+
+
+def strobe_flow(hue, sat, level, rate=MAX_STROBE, flashes=4, white=None):
+    """A drop: `flashes` flashes at `rate` a second (capped at MAX_STROBE),
+    each 50 ms up to full and back down to `level` (1..100). In the picture's
+    or palette's colour, or on the white LEDs at `white` kelvin."""
+    rate = min(float(rate), MAX_STROBE)
+    period = int(math.ceil(1000.0 / rate))
+    if white is not None:
+        on, off = (50, 2, white, 100), (period - 50, 2, white, max(1, level))
+    else:
+        rgb = hsv_rgb(hue, sat)
+        on, off = (50, 1, rgb, 100), (period - 50, 1, rgb, max(1, level))
+    return Flow(2 * flashes, 1, (on, off))
+
+
+class DropFx:
+    """What the audio loops do with DropWatch: on a build-up a swell, on a
+    drop a strobe, each one flow, then the normal loop again.
+
+    feed() every analyser frame (it listens even while the effect is off, so
+    switching it on mid-song finds a breakdown already under way). At the
+    send point, take() hands over the flow to send for a pending event, and
+    holding() says the loop must keep its own frames back: any send would
+    replace the flow. A drop cuts a swell short; a swell never interrupts a
+    strobe. When the effect ends, `handback` is True once, for a soft first
+    frame instead of a jump from full."""
+
+    HANDBACK_MS = 400
+
+    def __init__(self, rate=MAX_STROBE, flashes=4):
+        self.watch = DropWatch()
+        self.rate, self.flashes = rate, flashes
+        self.event = None
+        self.until = -1.0
+        self.kind = None
+        self.handback = False
+
+    def feed(self, f):
+        event = self.watch.feed(f)
+        if event == "drop" or (event == "build" and self.event is None):
+            self.event = event
+        return event
+
+    def take(self, now, frame, on=True):
+        """-> the Flow to send now for a pending event, or None. `frame` is
+        what the loop would send this tick (an hsv tuple or White)."""
+        event, self.event = self.event, None
+        if not on or event is None or (event == "build" and self.kind == "drop"
+                                       and now < self.until):
+            return None
+        if isinstance(frame, White):
+            hue = sat = 0
+            white, level = frame.ct, frame.bright
+        else:
+            (hue, sat, level), white = frame, None
+        if event == "build":
+            flow = swell_flow(hue, sat, white)
+            self.until = now + SWELL_HOLD
+        else:
+            flow = strobe_flow(hue, sat, level, self.rate, self.flashes, white)
+            self.until = now + flow_ms(flow)
+        if white is not None:                 # the white LEDs' full is 0.4 of theirs
+            flow = Flow(flow.count, flow.action, tuple(
+                (ms, mode, val, min(br, round(100 * WHITE_GAIN)) if br == 100 else br)
+                for ms, mode, val, br in flow.steps))
+        self.kind = event
+        return flow
+
+    def holding(self, now):
+        """True while an effect owns the bulb; the tick it ends sets
+        `handback`."""
+        if self.kind is None:
+            return False
+        if now < self.until:
+            return True
+        self.kind, self.handback = None, True
+        return False
+
+    def ramp(self, ms):
+        """The ramp for this tick's frame: soft right after an effect."""
+        if self.handback:
+            self.handback = False
+            return max(int(ms), self.HANDBACK_MS)
+        return int(ms)
 
 
 LED_GAP = 1.0 / 30                    # the fastest the LEDs can show a change
@@ -776,6 +1037,10 @@ class CapturePacer:
     def __init__(self):
         self.reset()
 
+        # when the picture last really moved: a reset (a control moved) is
+        # not motion, so it does not cut a pause light short
+        self.moved_at = None
+
     def reset(self):
         """Forget the stillness - the next frames run at the full rate."""
         self.ref = None
@@ -784,9 +1049,13 @@ class CapturePacer:
     def period(self, frame, fps, now):
         """-> seconds from this grab to the next one."""
         ref = self.ref
+        if self.moved_at is None:
+            self.moved_at = now
         if (ref is None or ref.shape != frame.shape
                 or float((np.abs(frame - ref).max(axis=2) > self.PIXEL).mean())
                 > self.SHARE):
+            if ref is not None:
+                self.moved_at = now
             self.ref, self.still_since = frame, None
         elif self.still_since is None:
             self.still_since = now
@@ -853,6 +1122,8 @@ def same_light(a, b, hue_tol=3):
     the colour LEDs is never the same."""
     if a is None or b is None or isinstance(a, White) != isinstance(b, White):
         return False
+    if isinstance(a, Flow) or isinstance(b, Flow):
+        return False
     if isinstance(a, White):
         return a.bright == b.bright and abs(a.ct - b.ct) < 100
     return (abs(a[2] - b[2]) < 2 and abs(a[1] - b[1]) < 3
@@ -882,6 +1153,78 @@ def ramp_ms(frame, last, period):
     if last is not None and isinstance(frame, White) != isinstance(last, White):
         return max(ms, SWITCH_MS)
     return ms
+
+
+# A colour flow for the bulb to run on its own clock: `steps` are
+# (ms, mode, value, bright) with mode 1 = rgb, 2 = colour temperature, 7 =
+# hold. tools/check_flow.py measured how this firmware runs them in music
+# mode: to the count, then it stays on the last step (action 1); any later
+# send - a frame, which is itself a one-step flow, or a plain set - replaces it.
+Flow = namedtuple("Flow", "count action steps")
+
+
+def flow_ms(flow):
+    """How long a flow with a count runs, in seconds."""
+    steps = flow.steps
+    return sum(steps[i % len(steps)][0] for i in range(flow.count)) / 1000.0
+
+
+def hsv_rgb(hue, sat, value=1.0):
+    """Hue 0..360 and saturation 0..100 -> the 0xRRGGBB the bulb takes,
+    the way yeelight's set_hsv converts it."""
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb((hue % 360) / 360.0, max(0, min(sat, 100)) / 100.0, value)
+    return (int(round(r * 255)) << 16) | (int(round(g * 255)) << 8) | int(round(b * 255))
+
+
+# ---------------------------------------------------------------------------
+# pause light - a soft warm white while the picture holds still
+# ---------------------------------------------------------------------------
+class PauseLight:
+    """Turns stillness into a soft warm white, for a paused film.
+
+    It reads stillness only - how long since CapturePacer last saw the
+    picture move - never brightness, so a paused film and a still slide
+    both count however dark they are, and a dark scene that moves never
+    does. `delay` seconds of stillness raise the light, faded in over RISE_MS
+    on the bulb's own ramp; the first frame that moves (CapturePacer's
+    test: 0.2% of the pixels by 0.04) hands back to the picture over
+    SWITCH_MS. In fusion the sound must be gone too (`quiet`): a still
+    picture with music playing is an album cover, not a pause.
+
+    The light is fixed rather than taken from the picture: a paused frame
+    may be black, and the point is to see the room.
+    """
+
+    CT = 2700                         # warm, the bottom of ScreenColorEngine's range
+    LEVEL = 30                        # on the colour LEDs' 1..100 scale
+    RISE_MS = 2000
+    QUIET = 1.2                       # s of silence: when LevelEngine starts to breathe
+
+    def __init__(self, delay=0.0):
+        self.delay = float(delay)
+        self.on = self.entered = self.left = False
+
+    def feed(self, moved_at, now, quiet=True):
+        """-> True while the pause light should show. `moved_at` is when the
+        picture last moved (CapturePacer.moved_at)."""
+        was = self.on
+        self.on = bool(self.delay > 0 and quiet and moved_at is not None
+                       and now - moved_at >= self.delay)
+        self.entered = self.on and not was
+        self.left = was and not self.on
+        return self.on
+
+    def frame(self):
+        return white_frame(self.CT, self.LEVEL)
+
+    def ramp(self, frame, last, period):
+        """The bulb-side ramp for this tick: slow into the pause, quick out."""
+        if self.entered:
+            return self.RISE_MS
+        if self.left:
+            return max(ramp_ms(frame, last, period), SWITCH_MS)
+        return ramp_ms(frame, last, period)
 
 
 class ScreenColorEngine:
@@ -1093,6 +1436,10 @@ class ScreenColorThread(threading.Thread):
         with self._lock:
             return self._white, self._ct
 
+    def moved_at(self):
+        """When the picture last moved (CapturePacer.moved_at), or None."""
+        return self._pacer.moved_at
+
     def poke(self):
         """A setting changed: read the screen at the full rate again."""
         self._pacer.reset()
@@ -1281,6 +1628,10 @@ def send_frame(bulb, frame, sudden, duration):
     if isinstance(frame, White):
         ms = 50 if sudden else max(int(duration), 30)
         bulb.send_command("start_cf", [1, 1, f"{ms}, 2, {frame.ct}, {frame.bright}"])
+        return
+    if isinstance(frame, Flow):
+        bulb.send_command("start_cf", [frame.count, frame.action, ", ".join(
+            f"{ms}, {mode}, {value}, {bright}" for ms, mode, value, bright in frame.steps)])
         return
     h, s, v = frame
     bulb.set_hsv(h, s, v, effect="sudden" if sudden else "smooth",
@@ -2017,7 +2368,9 @@ def run(args):
     dt = analyser.dt
     min_gap = 1.0 / args.fps
     lvl = LevelEngine(calm=args.calm)
-    sync = BeatSync()
+    sync = BeatSync(timed=args.bulb_clock)
+    fx = DropFx()
+    hold_until = 0.0
     last_sent = 0.0
     last_hsv = None
 
@@ -2029,13 +2382,16 @@ def run(args):
                     last_hsv = None
                 f = analyser.feed(rec.record(numframes=BLOCK))
                 fired = sync.feed(f, lvl, dt, args.lead / 1000.0, color)
+                fx.feed(f)
 
                 color.maybe_switch(f["t"], f["bands"])
                 hue, sat = color.tick(dt, f["treble"], f["t"])
 
                 now = time.monotonic()
-                # a predicted beat goes out on its block, not the next free one
-                if now - last_sent < (LED_GAP if fired else min_gap):
+                # a predicted beat goes out on its block, not the next free
+                # one; a bulb-timed one's wait shows nothing, so its gap
+                # counts to the flash
+                if now - last_sent < (LED_GAP - sync.hold if fired else min_gap):
                     continue
 
                 # perceptual gamma: a linear duty cycle looks washed out
@@ -2043,14 +2399,29 @@ def run(args):
                     4 + 96 * (lvl.brightness ** args.gamma), 1, 100)))
                 hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
+                effect = fx.take(now, hsv, args.drops)
+                if effect is not None:
+                    sender.put(effect, True, 0)
+                    last_sent, last_hsv = now, None
+                    continue
+                if fx.holding(now) or now < hold_until:
+                    continue
+                if fired and sync.hold:
+                    peak = (hsv[0], hsv[1], int(round(np.clip(
+                        4 + 96 * sync.flash ** args.gamma, 1, 100))))
+                    sender.put(beat_flow(sync.hold, last_hsv or hsv, peak), True, 0)
+                    hold_until = now + sync.hold + 0.05
+                    last_sent, last_hsv = now, peak
+                    continue
+
                 if not fired and same_light(hsv, last_hsv, hue_tol=2):
                     continue
 
                 # a sweep in progress must never be cut into by a hard set,
                 # or the fade turns back into the jump it exists to replace
                 fading = color.fade_t is not None
-                sender.put(hsv, sudden=lvl.hit > 0.35 and not fading,
-                           duration=int(np.clip(min_gap * 1000, 30, 150)))
+                sender.put(hsv, sudden=lvl.hit > 0.35 and not fading and not fx.handback,
+                           duration=fx.ramp(np.clip(min_gap * 1000, 30, 150)))
                 last_sent, last_hsv = now, hsv
     finally:
         link.close(restore=args.restore)
@@ -2075,6 +2446,7 @@ def run_screen(args):
                               gamma=args.screen_gamma, calm=args.calm)
 
     pacer = CapturePacer()
+    pause = PauseLight(args.pause)
     last = time.monotonic()
     last_hsv = None
 
@@ -2093,12 +2465,14 @@ def run_screen(args):
 
             v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
             light = screen_frame(color, hue, sat, v)
+            if pause.feed(pacer.moved_at, now):
+                light = pause.frame()
 
             # skip sends the LEDs could not resolve anyway
-            if cut or not same_light(light, last_hsv):
+            if cut or pause.entered or pause.left or not same_light(light, last_hsv):
                 # ramp for one frame gap so consecutive colours join up
-                sender.put(light, sudden=cut,
-                           duration=ramp_ms(light, last_hsv, period))
+                sender.put(light, sudden=cut and not pause.on,
+                           duration=pause.ramp(light, last_hsv, period))
                 last_hsv = light
 
             grab.pace(now, 1.0 / args.screen_fps, period)
@@ -2130,7 +2504,10 @@ def run_fusion(args):
 
     analyser = Analyser()
     lvl = LevelEngine(calm=args.calm)
-    sync = BeatSync()
+    sync = BeatSync(timed=args.bulb_clock)
+    fx = DropFx()
+    hold_until = 0.0
+    pause = PauseLight(args.pause)
     screen.start()
 
     dt = analyser.dt
@@ -2146,26 +2523,49 @@ def run_fusion(args):
                     last_hsv = None
                 # the audio loop sets the pace; accents move brightness only,
                 # because here the display owns the colour
-                fired = sync.feed(analyser.feed(rec.record(numframes=BLOCK)),
-                                  lvl, dt, args.lead / 1000.0)
+                f = analyser.feed(rec.record(numframes=BLOCK))
+                fired = sync.feed(f, lvl, dt, args.lead / 1000.0)
+                fx.feed(f)
 
                 if screen.error:
                     raise RuntimeError(f"screen capture stopped: {screen.error}")
 
                 now = time.monotonic()
-                if now - last_sent < (LED_GAP if fired else min_gap):
+                if now - last_sent < (LED_GAP - sync.hold if fired else min_gap):
                     continue
 
                 hue, sat, _val, cut = screen.read()
                 val = int(round(np.clip(
                     4 + 96 * (lvl.brightness ** args.gamma), 1, 100)))
                 light = screen_frame(screen, hue, sat, val)
+                quiet = (lvl.silent_since is not None
+                         and f["t"] - lvl.silent_since > PauseLight.QUIET)
+                if pause.feed(screen.moved_at(), now, quiet):
+                    light = pause.frame()
 
-                if not (cut or fired) and same_light(light, last_hsv):
+                if not pause.on:
+                    effect = fx.take(now, light, args.drops)
+                    if effect is not None:
+                        sender.put(effect, True, 0)
+                        last_sent, last_hsv = now, None
+                        continue
+                if fx.holding(now) or now < hold_until:
+                    continue
+                if fired and sync.hold and not pause.on:
+                    peak = screen_frame(screen, hue, sat, int(round(np.clip(
+                        4 + 96 * sync.flash ** args.gamma, 1, 100))))
+                    sender.put(beat_flow(sync.hold, last_hsv or light, peak), True, 0)
+                    hold_until = now + sync.hold + 0.05
+                    last_sent, last_hsv = now, peak
                     continue
 
-                sender.put(light, sudden=cut or lvl.hit > 0.35,
-                           duration=ramp_ms(light, last_hsv, min_gap))
+                if not (cut or fired or pause.entered or pause.left) \
+                        and same_light(light, last_hsv):
+                    continue
+
+                sender.put(light, sudden=(cut or lvl.hit > 0.35) and not pause.on
+                           and not fx.handback,
+                           duration=fx.ramp(pause.ramp(light, last_hsv, min_gap)))
                 last_sent, last_hsv = now, light
     finally:
         screen.close()
@@ -2211,6 +2611,14 @@ def main():
                    help="beat sync: once the tempo holds, send each flash this "
                         "many ms early so it lands on the beat over Wi-Fi "
                         "(0 = flash when the beat is heard; default 80)")
+    p.add_argument("--bulb-clock", action="store_true",
+                   help="beat sync: send each predicted flash ~60 ms early as a "
+                        "flow the bulb times itself, instead of on the block "
+                        "nearest the beat (music and fusion)")
+    p.add_argument("--drops", action="store_true",
+                   help="answer a build-up with a swell and a drop with a "
+                        f"strobe of at most {MAX_STROBE:g} flashes a second "
+                        "(music and fusion)")
     p.add_argument("--fade", type=float, default=0.0, metavar="SECONDS",
                    help="smooth colour mode: sweep between palette anchors "
                         "over this many seconds instead of snapping "
@@ -2244,6 +2652,10 @@ def main():
                    help="saturation floor for colour scenes (default: 55)")
     g.add_argument("--sat-boost", type=float, default=1.35,
                    help="multiplier on measured saturation (default: 1.35)")
+    g.add_argument("--pause", type=int, default=0, metavar="SECONDS",
+                   help="pause light: after this many seconds of a still "
+                        "picture (and, in fusion, silence) show a soft warm "
+                        "white until it moves (0 = off, the default)")
 
     args = p.parse_args()
 
@@ -2271,6 +2683,9 @@ def main():
     if not 1 <= args.screen_fps <= 30:
         p.error("--screen-fps must be between 1 and 30; the LEDs cannot "
                 "resolve faster")
+
+    if not 0 <= args.pause <= 120:
+        p.error("--pause must be between 0 and 120 seconds")
 
     if args.enable_lan:
         if not (args.ip and args.token):

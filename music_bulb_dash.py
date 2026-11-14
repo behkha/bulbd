@@ -43,7 +43,8 @@ from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
                         CapturePacer, crop_letterbox, screen_permission,
                         Link, BulbUnreachable, White, screen_frame, same_light,
                         ramp_ms, BeatSync, LED_GAP, AutoPicker, MotionMeter,
-                        AUTO_CAPTURE, CAPTURE_BACKENDS)
+                        AUTO_CAPTURE, CAPTURE_BACKENDS, PauseLight,
+                        DropFx, beat_flow)
 
 import palettes as pal_rules
 from palettes import PaletteError, clean_anchors
@@ -85,17 +86,18 @@ NUMERIC = {                         # key: (low, high, type) - the faders' range
     "lead": (0, 250, int),          # beat sync, ms early; 0 = flash when heard
     "screen_fps": (4, 30, int), "screen_gamma": (0.4, 1.6, float),
     "min_sat": (0.0, 90.0, float), "sat_boost": (0.8, 2.0, float),
+    "pause": (0, 120, int),         # pause light, s of a still picture; 0 = off
 }
 MODES = ("music", "screen", "fusion")
 # What a preset holds: how the light looks. Never the address, input, display
 # or area (they describe the room, not the look), and never Beat sync, which
 # is set once for the network and speakers.
 LOOK_KEYS = ("mode", "auto", "palette", "calm", "sensitivity", "gamma", "punch",
-             "fps", "fade", "screen_fps", "screen_gamma", "min_sat", "sat_boost")
+             "fps", "fade", "screen_fps", "screen_gamma", "min_sat", "sat_boost", "pause")
 LOOK_DEFAULTS = {"mode": "music", "auto": False, "palette": "auto", "calm": False,
                  "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
                  "fade": 0.0, "screen_fps": 10, "screen_gamma": 0.75,
-                 "min_sat": 55.0, "sat_boost": 1.35}
+                 "min_sat": 55.0, "sat_boost": 1.35, "pause": 0}
 # Built-in looks. Each sets every look key, so applying one always gives the
 # same light whatever came before; keys its mode does not use stay at the
 # defaults above.
@@ -121,6 +123,7 @@ MIN_REGION = 32                     # points; smaller than this is a mis-click
 # what survives a restart. Never `running` (the lamp must not start on its
 # own) and nothing from the cloud login (no secret touches disk).
 SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
+              "bulb_clock", "drops",
               "monitor", "region", "presets", "palettes")
 
 
@@ -376,7 +379,7 @@ def clean_patch(patch, snap):
         if _number(v):
             v = min(max(v, lo), hi)
             out[key] = int(round(v)) if kind is int else float(v)
-    for key in ("running", "calm", "auto"):
+    for key in ("running", "calm", "auto", "bulb_clock", "drops"):
         if isinstance(patch.get(key), bool):
             out[key] = patch[key]
     if patch.get("palette") == "auto" or (isinstance(patch.get("palette"), str)
@@ -546,12 +549,15 @@ class State:
             "palette": "auto", "calm": False,
             "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
             "fade": 0.0, "lead": 80,
+            # bulb-timed beats (off = today's block-paced flashes); drop effects
+            "bulb_clock": False, "drops": False,
             "presets": [],                  # the user's own; BUILTIN_PRESETS are fixed
             "palettes": [],                 # the user's own [{name, anchors}]; PALETTES are fixed
             # screen mode
             "monitor": mons[0]["i"] if mons else 1,
             "screen_fps": 10, "screen_gamma": 0.75,
             "min_sat": 55.0, "sat_boost": 1.35, "screen_width": 192,
+            "pause": 0, "paused": False,
             "region": None,
             "monitors": mons,
             "screen_ok": screen_ok,
@@ -883,6 +889,7 @@ class Engine(threading.Thread):
                       f"{grab.box['width']}x{grab.box['height']}")
 
         pacer = CapturePacer()
+        pause = PauseLight(cfg["pause"])
         last = time.monotonic()
         last_hsv = None
         cut_env = 0.0
@@ -905,6 +912,7 @@ class Engine(threading.Thread):
                 color.min_sat = float(cfg["min_sat"])
                 color.sat_boost = float(cfg["sat_boost"])
                 color.gamma = float(cfg["screen_gamma"])
+                pause.delay = float(cfg["pause"])
 
                 now = time.monotonic()
                 dt, last = now - last, now
@@ -918,20 +926,25 @@ class Engine(threading.Thread):
 
                 v = int(round(float(np.clip(3 + 97 * val, 1, 100))))
                 light = screen_frame(color, hue, sat, v)
+                # a picture held still for `pause` s: soft warm white instead
+                if pause.feed(pacer.moved_at, now):
+                    light, v = pause.frame(), PauseLight.LEVEL
 
                 # hue histogram, folded to 12 bars for the UI
                 cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                 hist = color.hist.reshape(12, 3).sum(axis=1)
                 peak = float(hist.max())
                 st.set(**light_telemetry(light, hue, v), capture=grab.backend,
+                       paused=pause.on,
                        level=round(float(val), 3), hit=round(cut_env, 3),
                        bands=[round(float(b) / peak, 3) for b in hist]
                              if peak > 0 else [0.0] * 12)
 
-                if cut or not same_light(light, last_hsv):
-                    # ramp for one frame gap so consecutive colours join up
-                    sender.put(light, sudden=cut,
-                               duration=ramp_ms(light, last_hsv, period))
+                if cut or pause.entered or pause.left or not same_light(light, last_hsv):
+                    # ramp for one frame gap so consecutive colours join up;
+                    # into a pause slowly, out of it quickly
+                    sender.put(light, sudden=cut and not pause.on,
+                               duration=pause.ramp(light, last_hsv, period))
                     last_hsv = light
 
                 # still picture: wait out the longer gap, but a moved control
@@ -942,7 +955,7 @@ class Engine(threading.Thread):
                     pacer.reset()
         finally:
             grab.close()
-            st.set(capture=None)
+            st.set(capture=None, paused=False)
             if ears is not None:
                 ears.close()
 
@@ -954,7 +967,9 @@ class Engine(threading.Thread):
         color = ColorEngine(None, calm=cfg["calm"], fade=cfg["fade"],
                             palettes=all_palettes(cfg))
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
-        sync = BeatSync()
+        sync = BeatSync(timed=cfg["bulb_clock"])
+        fx = DropFx()
+        hold_until = 0.0                    # a bulb-timed beat's flow is running
         mic = cfg["mic"]
         recorder = open_recorder(mic)
         st.set(device=str(getattr(recorder, "name", recorder))[:48])
@@ -993,7 +1008,9 @@ class Engine(threading.Thread):
                         apply_palette(color, cfg["palette"])
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
+                    sync.timed = cfg["bulb_clock"]
                     fired = sync.feed(f, lvl, dt, cfg["lead"] / 1000.0, color)
+                    fx.feed(f)
 
                     color.maybe_switch(f["t"], f["bands"])
                     hue, sat = color.tick(dt, f["treble"], f["t"])
@@ -1002,8 +1019,11 @@ class Engine(threading.Thread):
                     watch.feed(f["rms"], now)
                     if picker is not None:
                         picker.feed_sound(f["rms"], now)
-                    # a predicted beat goes out on its block, not the next free one
-                    if now - last_sent < (LED_GAP if fired else 1.0 / max(cfg["fps"], 5)):
+                    # a predicted beat goes out on its block, not the next free
+                    # one; a bulb-timed one's wait changes nothing on the LEDs,
+                    # so its gap counts to the flash
+                    if now - last_sent < (LED_GAP - sync.hold if fired
+                                          else 1.0 / max(cfg["fps"], 5)):
                         continue
 
                     val = int(round(np.clip(
@@ -1019,13 +1039,28 @@ class Engine(threading.Thread):
                            input_db=input_db, signal=signal,
                            active_palette=color.pal)
 
+                    # a build-up or a drop: one flow, then the loop again
+                    effect = fx.take(now, hsv, cfg["drops"])
+                    if effect is not None:
+                        sender.put(effect, True, 0)
+                        last_sent, last_hsv = now, None
+                        continue
+                    if fx.holding(now) or now < hold_until:
+                        continue
+                    if fired and sync.hold:
+                        peak = (hsv[0], hsv[1], int(round(np.clip(
+                            4 + 96 * sync.flash ** cfg["gamma"], 1, 100))))
+                        sender.put(beat_flow(sync.hold, last_hsv or hsv, peak), True, 0)
+                        hold_until = now + sync.hold + 0.05
+                        last_sent, last_hsv = now, peak
+                        continue
+
                     if not fired and same_light(hsv, last_hsv, hue_tol=2):
                         continue
 
                     fading = color.fade_t is not None
-                    sender.put(hsv, sudden=lvl.hit > 0.35 and not fading,
-                               duration=int(np.clip(
-                                   1000.0 / max(cfg["fps"], 5), 30, 150)))
+                    sender.put(hsv, sudden=lvl.hit > 0.35 and not fading and not fx.handback,
+                               duration=fx.ramp(np.clip(1000.0 / max(cfg["fps"], 5), 30, 150)))
                     last_sent, last_hsv = now, hsv
         finally:
             if eyes is not None:
@@ -1042,7 +1077,9 @@ class Engine(threading.Thread):
         monitor, region, mic = cfg["monitor"], cfg["region"], cfg["mic"]
         analyser = Analyser()
         lvl = LevelEngine(calm=cfg["calm"], punch=cfg["punch"])
-        sync = BeatSync()
+        sync = BeatSync(timed=cfg["bulb_clock"])
+        fx = DropFx()
+        hold_until = 0.0
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
                                   sat_boost=cfg["sat_boost"],
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
@@ -1057,6 +1094,7 @@ class Engine(threading.Thread):
                                    lambda frame, now: picker.feed_motion(
                                        meter.feed(frame, now), now))
         watch = SignalWatch()
+        pause = PauseLight(cfg["pause"])
         dt = analyser.dt
         last_sent = 0.0
         last_hsv = None
@@ -1085,29 +1123,38 @@ class Engine(threading.Thread):
                     color.min_sat = float(cfg["min_sat"])
                     color.sat_boost = float(cfg["sat_boost"])
                     screen.fps = cfg["screen_fps"]
+                    pause.delay = float(cfg["pause"])
                     if st.changed.is_set():     # a control moved: full rate
                         st.changed.clear()
                         screen.poke()
 
                     f = analyser.feed(rec.record(numframes=BLOCK))
                     # accents move brightness only
+                    sync.timed = cfg["bulb_clock"]
                     fired = sync.feed(f, lvl, dt, cfg["lead"] / 1000.0)
+                    fx.feed(f)
 
                     now = time.monotonic()
                     watch.feed(f["rms"], now)
                     if picker is not None:
                         picker.feed_sound(f["rms"], now)
-                    if now - last_sent < (LED_GAP if fired else 1.0 / max(cfg["fps"], 5)):
+                    if now - last_sent < (LED_GAP - sync.hold if fired
+                                          else 1.0 / max(cfg["fps"], 5)):
                         continue
 
                     hue, sat, _val, cut = screen.read()
                     val = int(round(np.clip(
                         4 + 96 * (lvl.brightness ** cfg["gamma"]), 1, 100)))
                     light = screen_frame(screen, hue, sat, val)
+                    # still picture and no sound: a paused film, not an album cover
+                    quiet = (lvl.silent_since is not None
+                             and f["t"] - lvl.silent_since > PauseLight.QUIET)
+                    if pause.feed(screen.moved_at(), now, quiet):
+                        light, val = pause.frame(), PauseLight.LEVEL
 
                     cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                     input_db, signal = watch.read(now)
-                    st.set(**light_telemetry(light, hue, val),
+                    st.set(**light_telemetry(light, hue, val), paused=pause.on,
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            capture=grab.backend,
                            level=round(lvl.brightness, 3),
@@ -1115,16 +1162,34 @@ class Engine(threading.Thread):
                            bands=[round(float(b), 3) for b in f["bands"]],
                            input_db=input_db, signal=signal)
 
-                    if not (cut or fired) and same_light(light, last_hsv):
+                    if not pause.on:
+                        effect = fx.take(now, light, cfg["drops"])
+                        if effect is not None:
+                            sender.put(effect, True, 0)
+                            last_sent, last_hsv = now, None
+                            continue
+                    if fx.holding(now) or now < hold_until:
+                        continue
+                    if fired and sync.hold and not pause.on:
+                        peak = screen_frame(screen, hue, sat, int(round(np.clip(
+                            4 + 96 * sync.flash ** cfg["gamma"], 1, 100))))
+                        sender.put(beat_flow(sync.hold, last_hsv or light, peak), True, 0)
+                        hold_until = now + sync.hold + 0.05
+                        last_sent, last_hsv = now, peak
                         continue
 
-                    sender.put(light, sudden=cut or lvl.hit > 0.35,
-                               duration=ramp_ms(light, last_hsv,
-                                                1.0 / max(cfg["fps"], 5)))
+                    if not (cut or fired or pause.entered or pause.left) \
+                            and same_light(light, last_hsv):
+                        continue
+
+                    sender.put(light, sudden=(cut or lvl.hit > 0.35) and not pause.on
+                               and not fx.handback,
+                               duration=fx.ramp(pause.ramp(light, last_hsv,
+                                                           1.0 / max(cfg["fps"], 5))))
                     last_sent, last_hsv = now, light
         finally:
             screen.close()
-            st.set(bands=[0.0] * 10, input_db=None, signal=True, capture=None)
+            st.set(bands=[0.0] * 10, input_db=None, signal=True, capture=None, paused=False)
 
 
 # ---------------------------------------------------------------------------
