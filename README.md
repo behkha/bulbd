@@ -224,8 +224,12 @@ Under the faders, on every mode:
       python music_bulb.py --alert green --pulses 3 --speed fast [--ip <bulb-ip>]
 
   The CLI goes through a running desk (`--desk URL`, default
-  `http://127.0.0.1:8765`) and straight to `--ip` when no desk answers. One
-  pulse at a time: a second while one runs is refused.
+  `http://127.0.0.1:8765`) and straight to `--ip` when no desk answers or
+  the desk has no bulb address yet. One pulse at a time and at most six a
+  minute; more is refused. A pulse during a sunrise or a Focus block
+  carries on with the ramp or the white afterwards. A session run by the
+  CLI in another process cannot hold its frames for a pulse, so its next
+  frame paints over it: pulse through the desk instead.
 - **Focus** is a pomodoro: cool white (5000 K) for the work block, warm
   (2700 K) for the break, a red pulse into work and a green one into a break.
   Start, Pause/Resume, Reset; Reset puts the lamp back. It runs on a stopped
@@ -235,8 +239,11 @@ Under the faders, on every mode:
   6500 K over 30 minutes, one flow the bulb runs by itself. The bulb has no
   clock, so the desk has to be running and the Mac awake to start it; an
   armed alarm shows its time beside the desk's status, and while it ramps
-  the top bar says *sunrise* with a **Stop**. A Mac that wakes up to 20 min
-  late still starts it; a session running at that time skips it.
+  the top bar says *sunrise* with a **Stop**. Until 20 min after the time
+  it keeps trying every 15 s: a Mac that wakes late, Wi-Fi that is not back
+  yet and a desk restarted in that window still get it. A session (or Focus)
+  running at that time wins; if it stops inside the window the sunrise
+  starts then. A time the clock skips in spring (02:30) fires at 03:00.
 
 Binds to localhost. `--host 0.0.0.0` reaches it from your phone — there is no
 authentication, so only on a network you trust.

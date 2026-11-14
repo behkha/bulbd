@@ -1219,95 +1219,105 @@ class Sender(threading.Thread):
     set, and whoever owns the bulb (Link) decides whether to reconnect. It
     used to retry forever on the same Bulb, whose socket yeelight had already
     thrown away, and each retry opened another connection to a bulb that was
-    struggling."""
+    struggling.
+
+    One slot holds the newest frame not yet sent (latest wins) and another
+    a flow (an alert); the thread sleeps on a condition between them, so a
+    stopped desk does not wake. While a flow runs the frame slot is kept,
+    not sent: the flow ends with the bulb back on the last frame sent, then
+    the newest frame put meanwhile goes out - or, if none was, the last one
+    again, which also finishes a smooth ramp the flow cut short - and the
+    frame after that waits LED_GAP."""
+
+    HOLD_MARGIN = 0.08          # s: the flow starts ~half an RTT after it is sent
 
     def __init__(self, bulb):
         super().__init__(daemon=True)
         self.bulb = bulb
-        self.box = queue.Queue(maxsize=1)          # latest value wins
         self.alive = True
         self.lost = threading.Event()
         self.error = None
-        # a flow the bulb runs itself (an alert), and until when the loop's
-        # frames are held so they do not paint over it
-        self._flow = None
-        self._flow_lock = threading.Lock()
-        self.hold_until = 0.0
-
-    HOLD_MARGIN = 0.08          # s: the flow starts ~half an RTT after it is sent
-
-    def flow(self, params, ms):
-        """Run a `start_cf` flow (params = [count, action, expression]) that
-        lasts `ms`, and hold every frame put meanwhile; the newest of them goes
-        out when the flow has ended. With end action 0 the bulb itself returns
-        to the last frame first, so the loop carries on where it was."""
-        with self._flow_lock:
-            self._flow = (params, ms)
-        self.put(_WAKE, False)                     # a frame put after it wakes us too
+        self._cv = threading.Condition()
+        self._frame = None                         # newest unsent (frame, sudden, duration)
+        self._flow = None                          # (params, ms)
+        self._last = None                          # the last frame on the wire
+        self.hold_until = 0.0                      # frames wait until then
+        self._gap_until = 0.0                      # spacing after a released frame
 
     def put(self, hsv, sudden, duration=40):
         """Queue one frame. `duration` is the bulb-side ramp for smooth sends;
         set it to the gap between frames so consecutive colours join up."""
-        try:
-            self.box.get_nowait()                  # drop the stale frame
-        except queue.Empty:
-            pass
-        try:
-            self.box.put_nowait((hsv, sudden, duration))
-        except queue.Full:
-            pass
+        with self._cv:
+            self._frame = (hsv, sudden, duration)  # drop the stale frame
+            self._cv.notify()
+
+    def flow(self, params, ms):
+        """Run a `start_cf` flow (params = [count, action, expression]) that
+        lasts `ms`, and hold the loop's frames until it has ended. With end
+        action 0 the bulb itself returns to the last frame first, so the loop
+        carries on where it was."""
+        with self._cv:
+            self._flow = (params, ms)
+            self._cv.notify()
 
     def stop(self, timeout=2.0):
-        """End the thread. It blocks on the queue rather than polling it, so
-        it needs a sentinel to notice."""
-        self.alive = False
-        try:
-            self.box.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.box.put_nowait(None)
-        except queue.Full:
-            pass
+        """End the thread, waking it if it sleeps."""
+        with self._cv:
+            self.alive = False
+            self._cv.notify()
         # wait out a send already in flight: a set_hsv landing after
         # release_bulb() would paint over the colour it just restored
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout)
 
-    def run(self):
-        held = None
+    def _next(self):
+        """Wait for something to do. -> ("flow", (params, ms)), ("frame",
+        item), or None to end. Called with the condition held."""
         while self.alive:
-            left = self.hold_until - time.monotonic()
-            try:
-                # no wake-ups between frames; a timer only while a flow holds them
-                item = self.box.get(timeout=left) if left > 0 else self.box.get()
-            except queue.Empty:
-                item, held = held, None            # the flow is over: newest frame out
-                if item is None:
-                    continue
-            if item is None:
-                break
-            with self._flow_lock:
+            if self._flow is not None:
                 flow, self._flow = self._flow, None
+                return "flow", flow
+            now = time.monotonic()
+            if now < self.hold_until:
+                self._cv.wait(self.hold_until - now)
+                continue
+            if self.hold_until:                    # the flow is over: release
+                self.hold_until = 0.0
+                item = self._frame or self._last
+                self._frame = None
+                if item is not None:
+                    self._gap_until = now + LED_GAP
+                    return "frame", item
+                continue
+            if self._frame is not None:
+                if now < self._gap_until:
+                    self._cv.wait(self._gap_until - now)
+                    continue
+                item, self._frame = self._frame, None
+                return "frame", item
+            self._cv.wait()                        # no wake-ups between frames
+        return None
+
+    def run(self):
+        while True:
+            with self._cv:
+                job = self._next()
+            if job is None:
+                break
+            kind, what = job
             try:
-                if flow is not None:
-                    params, ms = flow
+                if kind == "flow":
+                    params, ms = what
                     self.bulb.send_command("start_cf", params)
-                    self.hold_until = time.monotonic() + ms / 1000.0 + self.HOLD_MARGIN
-                frame, sudden, duration = item
-                if frame is _WAKE:
-                    continue
-                if time.monotonic() < self.hold_until:
-                    held = item
-                    continue
-                send_frame(self.bulb, frame, sudden, duration)
+                    with self._cv:
+                        self.hold_until = time.monotonic() + ms / 1000.0 + self.HOLD_MARGIN
+                else:
+                    send_frame(self.bulb, *what)
+                    self._last = what
             except Exception as exc:
                 self.error = exc
                 self.lost.set()
                 break
-
-
-_WAKE = object()                # put() by Sender.flow only to wake the thread
 
 
 def send_frame(bulb, frame, sudden, duration):
@@ -2245,7 +2255,9 @@ def run_alert(args):
                 reason = json.loads(exc.read()).get("error")
             except Exception:
                 reason = exc.reason
-            sys.exit(f"the desk refused the alert: {reason}")
+            # a desk that has no bulb yet cannot pulse one; --ip can
+            if not (args.ip and exc.code == 409 and reason == "no bulb address"):
+                sys.exit(f"the desk refused the alert: {reason}")
         except (urllib.error.URLError, OSError):
             pass                                  # no desk: go to the lamp
     if not args.ip:

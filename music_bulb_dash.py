@@ -2870,9 +2870,11 @@ class Handler(BaseHTTPRequestHandler):
             clean["running"] = False
             clean["status"] = f"bulb address is now {clean['ip']} - press Start"
         if clean.get("running") and not snap["running"] and self.signals is not None:
-            # Focus puts the lamp back before the session reads it
-            self.signals.session_started()
-        self.state.control(**clean)
+            # Focus puts the lamp back before the session reads it, and no
+            # plain exchange with the lamp can slip in before `running`
+            self.signals.claim_lamp(lambda: self.state.control(**clean))
+        else:
+            self.state.control(**clean)
         if self.signals is not None and ("sunrise_on" in clean or "sunrise_at" in clean):
             self.signals.changed()
         self._send(200, json.dumps({"ok": True}), "application/json")
@@ -3026,7 +3028,8 @@ def main():
     store.attach(state)
     engine = Engine(state, restore=args.restore, capture=args.capture)
     engine.start()
-    signals = Signals(state, link=lambda: engine.link)
+    signals = Signals(state, link=lambda: engine.link,
+                      parked=lambda timeout=0.0: engine.idle.wait(timeout))
     signals.start()
     Handler.signals = signals
     Handler.state = state

@@ -208,6 +208,8 @@ def test_the_alarm_fires_once_at_its_time_across_midnight():
         fire, wait = plan.step(now, True, at)
         if fire:
             fired.append(now)
+            plan.done(now)
+            continue
         assert 0 < wait <= ls.CHECK_S
         now += dt.timedelta(seconds=wait)
     assert len(fired) == 1 and D(2026, 11, 15, 0, 5) <= fired[0] < D(2026, 11, 15, 0, 5, 1)
@@ -220,7 +222,7 @@ def test_a_mac_that_wakes_late_still_gets_its_sunrise_but_not_hours_late():
     assert plan.step(D(2026, 11, 15, 7, 12), True, 7 * 60)[0] is True     # slept past it
     plan = ls.AlarmPlan()
     plan.step(D(2026, 11, 14, 23, 0), True, 7 * 60)
-    assert plan.step(D(2026, 11, 15, 9, 0), True, 7 * 60)[0] is False
+    assert plan.step(D(2026, 11, 15, 9, 0), True, 7 * 60)[0] is False   # past the window
     assert plan.target == D(2026, 11, 16, 7, 0)
 
 
@@ -278,7 +280,7 @@ def make(link=None, **saved):
     clock = [100.0]
     sig = ls.Signals(state, link=lambda: link,
                      lamp=lambda ip, cmds: lamp.append((ip, cmds)),
-                     pulse=lambda ip, flow: pulses.append((ip, flow)),
+                     pulse=lambda ip, flow, tail=None: pulses.append((ip, flow, tail)),
                      read=lambda ip: {"power": "off", "bright": 30, "color_mode": 2,
                                       "ct": 2700, "rgb": None, "hue": None, "sat": None},
                      clock=lambda: clock[0])
@@ -297,7 +299,8 @@ def test_with_a_session_the_alert_goes_through_its_sender():
 def test_without_a_session_the_alert_is_one_plain_connection():
     sig, state, lamp, pulses, _ = make(None)
     code, body = sig.alert(0xFF0000, 1, "normal")
-    assert code == 200 and body["via"] == "lamp" and pulses == [("10.0.0.9", ls.alert_flow(0xFF0000, 1))]
+    assert code == 200 and body["via"] == "lamp"
+    assert pulses == [("10.0.0.9", ls.alert_flow(0xFF0000, 1), None)]
 
 
 def test_one_alert_at_a_time():
@@ -317,7 +320,7 @@ def test_an_alert_waits_for_a_session_that_is_still_connecting():
 
 def test_an_unreachable_bulb_is_a_502():
     sig, state, *_ = make(None)
-    sig.pulse = lambda ip, flow: (_ for _ in ()).throw(OSError("refused"))
+    sig.pulse = lambda ip, flow, tail=None: (_ for _ in ()).throw(OSError("refused"))
     code, body = sig.alert(0xFF0000)
     assert code == 502 and "refused" in body["error"]
 
@@ -340,7 +343,7 @@ def test_focus_runs_on_a_stopped_desk_only_and_a_session_ends_it_first():
     assert sig.focus_op("start")[0] == 409 and not lamp
     state.set(running=False)
     sig.focus_op("start")
-    sig.session_started()
+    sig.claim_lamp()
     assert not sig.focus.active and lamp[-1][1][0][0] == "set_ct_abx"
 
 
@@ -427,3 +430,226 @@ def test_start_ends_focus_before_the_session_and_alarm_changes_wake_the_alarm():
     sig._alarm_wake.clear()
     post(state, sig, "/api/control", {"sunrise_on": True, "sunrise_at": 390})
     assert sig._alarm_wake.is_set() and state.snapshot()["sunrise_at"] == 390
+
+
+# ------------------------------------------------- review fixes (second pass)
+# 1. a pulse cannot end a sunrise or leave Focus on the wrong white
+@pytest.mark.parametrize("at", [0, 1000, 300_000, 900_000, 1_500_000, 1_799_000])
+def test_a_pulse_mid_sunrise_carries_on_with_the_rest_of_the_ramp(at):
+    tail = ls.sunrise_rest(at)
+    assert len(tail) <= 1 + len(ls.SUNRISE_STEPS)
+    assert ls.with_tail(ls.alert_flow(0xFF0000, ls.MAX_PULSES, "slow"), tail)[0] <= ls.MAX_STEPS
+    assert tail[-1][2:] == (6500, 100)
+    # it still ends when the ramp would have
+    assert abs(at + sum(t[0] for t in tail) - (ls.SUNRISE_MS + 50)) <= ls.BRIDGE_MS + 50
+    # the first step goes to where the ramp is by then, warm and dim early on
+    if at < 300_000:
+        assert tail[0][2] < 2700 and tail[0][3] < 22
+
+
+def test_alert_during_the_sunrise_keeps_it_running():
+    sig, state, lamp, pulses, clock = make(None)
+    sig.epoch = lambda: 1000.0
+    sig.fire_sunrise()
+    sig.epoch = lambda: 1000.0 + 600                         # 10 min in
+    assert sig.alert(0x2F7DE1, 2)[0] == 200
+    tail = pulses[-1][2]
+    assert tail == ls.sunrise_rest(600_000 + ls.alert_flow(0x2F7DE1, 2)[2])
+    assert sig.view()["sunrise_ramping"] is True
+
+
+def test_alert_during_focus_lands_back_on_the_phase_white():
+    sig, state, lamp, pulses, clock = make(None)
+    sig.focus_op("start")
+    sig.alert(0xFF0000, 1)
+    assert pulses[-1][2] == [(600, 2, *ls.WORK_WHITE)]
+
+
+def test_alert_lamp_with_a_tail_pulses_then_carries_on():
+    sock, connect = scripted("on")
+    flow, tail = ls.alert_flow(0xFF0000, 1), [(600, 2, 2700, 45)]
+    ls.alert_lamp("10.0.0.9", flow, tail, connect=connect)
+    assert sock.sent[-1] == ("start_cf", [3, 1, flow[1] + ",600,2,2700,45"])
+    sock, connect = scripted("off")                          # switched off: pulse, back off
+    ls.alert_lamp("10.0.0.9", flow, tail, connect=connect)
+    assert sock.sent[-1] == ("set_scene", ["cf", 2, 0, flow[1]])
+
+
+# 2. a frame queued while the sender was busy is not lost to the wake-up
+class GatedBulb(MusicBulb):
+    def __init__(self):
+        super().__init__()
+        self.gate, self.entered = threading.Event(), threading.Event()
+
+    def set_hsv(self, *a, **k):
+        if not self.entered.is_set():
+            self.entered.set()
+            self.gate.wait(2)
+        super().set_hsv(*a, **k)
+
+
+def test_a_frame_put_before_the_flow_goes_out_when_the_pulse_ends():
+    bulb = GatedBulb()
+    s = Sender(bulb)
+    s.start()
+    try:
+        s.put((1, 1, 1), False)                  # A: the sender is stuck sending it
+        assert bulb.entered.wait(2)
+        s.put((2, 2, 2), False)                  # B: queued meanwhile
+        s.flow([2, 0, "50,1,255,100,50,1,255,1"], 100)
+        bulb.gate.set()
+        assert wait_for(lambda: len(bulb.log) == 3)
+        assert [x for x, _ in bulb.log] == [(1, 1, 1), "start_cf", (2, 2, 2)]
+    finally:
+        s.stop()
+
+
+def test_with_nothing_new_the_last_frame_goes_out_again_after_the_pulse(running):
+    # a smooth (or White) frame cut short by the flow is finished this way
+    bulb, s = running()
+    s.put((5, 5, 5), False, 200)
+    assert wait_for(lambda: len(bulb.log) == 1)
+    s.flow([2, 0, "50,1,255,100,50,1,255,1"], 100)
+    assert wait_for(lambda: len(bulb.log) == 3)
+    assert [x for x, _ in bulb.log] == [(5, 5, 5), "start_cf", (5, 5, 5)]
+
+
+# 3. the released frame and the next one are LED_GAP apart
+def test_the_frame_after_the_release_waits_led_gap(running):
+    from music_bulb import LED_GAP
+    bulb, s = running()
+    s.flow([2, 0, "50,1,255,100,50,1,255,1"], 60)
+    s.put((1, 1, 1), False)
+    assert wait_for(lambda: len(bulb.log) == 2)
+    s.put((2, 2, 2), False)
+    assert wait_for(lambda: len(bulb.log) == 3)
+    assert bulb.log[2][1] - bulb.log[1][1] >= LED_GAP - 0.003
+
+
+# 4. no strobe on demand
+def test_alerts_are_capped_per_minute():
+    sig, state, lamp, pulses, clock = make(None)
+    for _ in range(ls.ALERTS_PER_MIN):
+        assert sig.alert(0xFF0000, 1, "fast")[0] == 200
+        clock[0] += 1.0
+    code, body = sig.alert(0xFF0000, 1, "fast")
+    assert code == 429 and "minute" in body["error"]
+    clock[0] += 60.0
+    assert sig.alert(0xFF0000, 1, "fast")[0] == 200
+
+
+# 5. a missed fire is retried inside the window
+def test_a_failed_sunrise_is_tried_again_until_it_goes_out():
+    plan, at = ls.AlarmPlan(), 7 * 60
+    plan.step(D(2026, 11, 15, 6, 59), True, at)
+    assert plan.step(D(2026, 11, 15, 7, 0), True, at) == (True, ls.RETRY_S)    # send failed
+    assert plan.step(D(2026, 11, 15, 7, 0, 15), True, at)[0] is True          # tried again
+    plan.done(D(2026, 11, 15, 7, 0, 15))
+    assert plan.step(D(2026, 11, 15, 7, 0, 30), True, at)[0] is False
+    assert plan.target == D(2026, 11, 16, 7, 0)
+
+
+def test_a_desk_restarted_inside_the_window_still_starts_it():
+    plan = ls.AlarmPlan()                                     # a fresh process
+    assert plan.step(D(2026, 11, 15, 7, 10), True, 7 * 60)[0] is True
+
+
+def test_a_time_set_just_after_it_passed_is_tomorrows():
+    plan = ls.AlarmPlan()
+    plan.step(D(2026, 11, 15, 6, 0), True, 6 * 60 + 30)       # armed at start
+    assert plan.step(D(2026, 11, 15, 7, 5), True, 7 * 60) == (False, ls.CHECK_S)
+    assert plan.target == D(2026, 11, 16, 7, 0)
+    plan = ls.AlarmPlan()
+    plan.step(D(2026, 11, 15, 7, 5), False, 7 * 60)           # off at start, then on
+    assert plan.step(D(2026, 11, 15, 7, 5), True, 7 * 60)[0] is False
+
+
+def test_a_session_wins_and_the_sunrise_starts_if_it_stops_in_the_window():
+    sig, state, lamp, _, _ = make(None)
+    state.set(running=True)
+    assert sig.fire_sunrise() is False
+    state.set(running=False)
+    assert sig.fire_sunrise() is True
+
+
+@pytest.fixture
+def new_york(monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_a_time_the_clock_skips_fires_when_the_clock_comes_back(new_york):
+    # 2027-03-14: 02:00 -> 03:00 in New York
+    assert ls.next_fire(D(2027, 3, 14, 1, 0), 2 * 60 + 30) == D(2027, 3, 14, 3, 0)
+    assert ls.next_fire(D(2027, 3, 13, 12, 0), 2 * 60 + 30) == D(2027, 3, 14, 3, 0)
+    assert ls.next_fire(D(2027, 3, 14, 4, 0), 2 * 60 + 30) == D(2027, 3, 15, 2, 30)
+
+
+# 6. the page's poll never waits for the bulb
+def test_view_answers_while_a_pulse_is_on_the_wire():
+    sig, state, lamp, pulses, clock = make(None)
+    inside, release = threading.Event(), threading.Event()
+
+    def slow(ip, flow, tail=None):
+        inside.set()
+        release.wait(3)
+    sig.pulse = slow
+    t = threading.Thread(target=sig.alert, args=(0xFF0000,))
+    t.start()
+    assert inside.wait(2)
+    t0 = time.monotonic()
+    sig.view()
+    assert time.monotonic() - t0 < 0.1
+    release.set()
+    t.join(2)
+
+
+# 7. nothing plain goes out while a session starts, runs or restores
+def test_no_plain_exchange_until_the_session_is_parked():
+    sig, state, lamp, pulses, _ = make(None)
+    sig.parked = lambda timeout=0.0: False                    # restore in flight
+    assert sig.alert(0xFF0000)[0] == 409 and not pulses
+    assert sig.focus_op("start")[0] == 409
+    assert sig.fire_sunrise() is False and not lamp
+
+
+def test_nothing_slips_in_between_start_and_running():
+    sig, state, lamp, pulses, _ = make(None)
+    got = []
+
+    def start():
+        t = threading.Thread(target=lambda: got.append(sig.focus_op("start")[0]))
+        t.start()
+        time.sleep(0.1)                                       # it must be waiting
+        assert not got
+        state.set(running=True)
+        start.t = t
+    sig.claim_lamp(start)
+    start.t.join(2)
+    assert got == [409] and not sig.focus.active
+
+
+# 8. CLI: a desk without a bulb address does not stop --ip
+def test_cli_falls_through_to_ip_when_the_desk_has_no_bulb(monkeypatch, capsys):
+    import argparse
+    import urllib.error
+    import urllib.request
+
+    import music_bulb
+
+    def refuse(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 409, "Conflict", {},
+                                     io.BytesIO(b'{"ok": false, "error": "no bulb address"}'))
+    sent = []
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(ls, "alert_lamp", lambda ip, flow: sent.append((ip, flow)))
+    args = argparse.Namespace(alert="green", pulses=1, speed="fast", desk="http://127.0.0.1:1",
+                              ip="10.0.0.9")
+    music_bulb.run_alert(args)
+    assert sent == [("10.0.0.9", ls.alert_flow(0x2FB457, 1, "fast"))]
+    args.ip = None
+    with pytest.raises(SystemExit):
+        music_bulb.run_alert(args)
