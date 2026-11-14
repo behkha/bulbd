@@ -12,9 +12,18 @@ It answers the miio hello on UDP 54321 (127.0.0.1 only), the LAN API on TCP
 55443 (get_prop and the set_* commands the restore uses) and music mode
 (set_music: it connects back and reads the start_cf frames). Each frame it
 receives is printed, so white frames and early flashes can be seen.
+
+What the lamp does on its own follows the color5 as measured: cron_add /
+cron_get / cron_del and get_prop delayoff (the timer really switches it off;
+--minute S shortens a minute for trying it), start_cf flows (a finite one
+runs its end action when its steps are done, stop_cf runs it at once, a
+one-step flow or set_scene replaces a flow without it), and set_default
+(kept, printed). With the lamp off start_cf does nothing and cron_add is
+refused with -5006, like the real one.
 """
 import argparse
 import json
+import math
 import socket
 import threading
 import time
@@ -26,6 +35,8 @@ ap.add_argument("--drop-after", type=float, default=0.0, metavar="S",
 ap.add_argument("--gone", type=float, default=6.0, metavar="S",
                 help="how long it stays away after --drop-after (default 6)")
 ap.add_argument("--did", type=lambda s: int(s, 16), default=0x12AB34CD)
+ap.add_argument("--minute", type=float, default=60.0, metavar="S",
+                help="seconds in a cron minute (default 60)")
 ap.add_argument("--quiet", action="store_true", help="do not print every frame")
 args = ap.parse_args()
 
@@ -34,6 +45,132 @@ state = {"power": "off", "bright": "30", "color_mode": "2", "rgb": "16711680",
 PROPS = ("power", "bright", "color_mode", "rgb", "ct", "hue", "sat")
 away = threading.Event()
 conns = []
+# what runs on the bulb with nothing connected
+alone = {"cron": None, "cron_min": 0, "flow": None, "flow_params": "", "default": None}
+alone_lock = threading.Lock()
+
+
+def later(secs, fn, *a):
+    t = threading.Timer(secs, fn, a)
+    t.daemon = True
+    t.start()
+
+
+class Refused(Exception):
+    pass
+
+
+def _flow_end(params, gen):
+    """A finite flow is done: run its end action unless it was replaced."""
+    with alone_lock:
+        if alone["flow"] != gen:
+            return
+        alone["flow"] = None
+    end_action(params)
+
+
+def end_action(params):
+    action = params[1]
+    if action == 2:
+        state["power"] = "off"
+        print("alone: flow ended, lamp off")
+    elif action == 1:
+        last = [int(x) for x in str(params[2]).split(",")][-4:]
+        apply_step(last)
+        print("alone: flow ended, stays", last)
+    else:
+        print("alone: flow ended, back to before")
+
+
+def apply_step(step):
+    _, mode, value, bright = step
+    if mode == 1:
+        state.update(rgb=str(value), color_mode="1")
+    elif mode == 2:
+        state.update(ct=str(value), color_mode="2")
+    if mode in (1, 2):
+        state["bright"] = str(bright)
+
+
+def stop_flow(run_end):
+    with alone_lock:
+        gen, alone["flow"] = alone["flow"], None
+        params = alone.get("flow_live")
+    if gen is not None and run_end and params:
+        end_action(params)
+
+
+def cron_fire(gen):
+    with alone_lock:
+        if alone["cron"] != gen:
+            return
+        alone["cron"] = None
+    stop_flow(run_end=False)
+    state["power"] = "off"
+    print("alone: cron fired, lamp off")
+
+
+def alone_call(method, params):
+    """-> result list, or None when the method is not one of these."""
+    on = state["power"] == "on"
+    if method == "cron_add":
+        if not on:
+            raise Refused
+        gen = object()
+        with alone_lock:
+            alone.update(cron=gen, cron_min=int(params[1]), cron_at=time.monotonic()
+                         + int(params[1]) * args.minute)
+        later(int(params[1]) * args.minute, cron_fire, gen)
+        return ["ok"]
+    if method == "cron_get":
+        with alone_lock:
+            if alone["cron"] is None:
+                return []
+            left = max(0, math.ceil((alone["cron_at"] - time.monotonic()) / args.minute))
+        return [{"type": 0, "delay": left, "mix": 0}]
+    if method == "cron_del":
+        with alone_lock:
+            alone["cron"] = None
+        return ["ok"]
+    if method == "start_cf":
+        if not on:
+            return ["ok"]                      # the real one says ok and does nothing
+        count, action, expr = params
+        steps = [int(x) for x in str(expr).split(",")]
+        steps = [steps[i:i + 4] for i in range(0, len(steps), 4)]
+        stop_flow(run_end=False)
+        gen = object()
+        with alone_lock:
+            alone.update(flow=gen, flow_live=params, flow_params=f"{count},{action},{expr}")
+        apply_step(steps[0])
+        if count:
+            total = sum(steps[i % len(steps)][0] for i in range(count)) / 1000
+            later(total, _flow_end, params, gen)
+        return ["ok"]
+    if method == "stop_cf":
+        stop_flow(run_end=True)
+        return ["ok"]
+    if method == "set_scene":
+        stop_flow(run_end=False)
+        return ["ok"]
+    if method == "set_default":
+        alone["default"] = {k: state[k] for k in PROPS if k != "power"}
+        print("alone: power-on look saved", alone["default"])
+        return ["ok"]
+    return None
+
+
+def prop(name):
+    if name == "delayoff":
+        r = alone_call("cron_get", [0])
+        return str(r[0]["delay"]) if r else "0"
+    if name == "flowing":
+        return "1" if alone["flow"] is not None else "0"
+    if name == "flow_params":
+        return alone["flow_params"]
+    if name == "music_on":
+        return "1" if any(t.name == "music" for t in threading.enumerate()) else "0"
+    return state.get(name, "")
 
 
 def hello():
@@ -103,10 +240,21 @@ def control(c):
                 msg = json.loads(line)
                 method, params = msg["method"], msg.get("params", [])
                 result = ["ok"]
-                if method == "get_prop":
-                    result = [state.get(p, "") for p in params]
+                try:
+                    alone_result = alone_call(method, params)
+                except Refused:
+                    print("control:", method, params, "-> illegal request")
+                    c.sendall((json.dumps({"id": msg["id"], "error": {
+                        "code": -5006, "message": "illegal request"}}) + "\r\n").encode())
+                    continue
+                if alone_result is not None:
+                    result = alone_result
+                elif method == "get_prop":
+                    result = [prop(p) for p in params]
                 elif method == "set_power":
                     state["power"] = params[0]
+                    if params[0] == "off":
+                        stop_flow(run_end=False)
                 elif method == "set_bright":
                     state["bright"] = str(params[0])
                 elif method == "set_ct_abx":
@@ -115,7 +263,8 @@ def control(c):
                     state.update(rgb=str(params[0]), color_mode="1")
                 elif method == "set_music" and params and params[0] == 1:
                     state["power"] = "on"
-                    threading.Thread(target=music, args=(params[1], params[2]), daemon=True).start()
+                    threading.Thread(target=music, args=(params[1], params[2]), daemon=True,
+                                     name="music").start()
                 print("control:", method, params)
                 c.sendall((json.dumps({"id": msg["id"], "result": result}) + "\r\n").encode())
     except OSError:

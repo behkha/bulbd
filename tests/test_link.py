@@ -352,7 +352,7 @@ def test_closing_a_lost_link_sends_nothing(links, monkeypatch):
 
 def test_closing_a_healthy_link_restores_what_start_saw(links, monkeypatch):
     seen = []
-    monkeypatch.setattr(music_bulb, "release_bulb", lambda bulb, restore: seen.append(restore) or True)
+    monkeypatch.setattr(music_bulb, "release_bulb", lambda bulb, restore, then=(): seen.append(restore) or True)
     link = links({"192.168.1.2": BULB}, ip="192.168.1.2")
     link.open()
     assert link.close(restore=True) is True

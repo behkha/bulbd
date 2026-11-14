@@ -1481,7 +1481,7 @@ def open_bulb(ip, attempts=3, on_attempt=None, remember=True, memo=None):
     raise last
 
 
-def release_bulb(bulb, restore=False):
+def release_bulb(bulb, restore=False, then=()):
     """Hand the bulb's LAN connection back, and optionally its old look.
 
     yeelight.Bulb holds one persistent socket and never closes it on error;
@@ -1494,6 +1494,9 @@ def release_bulb(bulb, restore=False):
     works too). It goes out on the connection stop_music() has just opened,
     before that is closed, so stopping costs the bulb no extra slot. A
     failure is reported, never raised: stopping always finishes.
+
+    `then` is more commands sent after the restore on the same connection:
+    an idle look or a sleep fade (bulb_alone.py) the lamp keeps running.
     """
     saved = getattr(bulb, "bulbd_saved", None) if restore is True else restore
     try:
@@ -1503,15 +1506,16 @@ def release_bulb(bulb, restore=False):
     sock = getattr(bulb, "_Bulb__socket", None)
 
     restored = False
-    if saved:
+    cmds = (restore_commands(saved) if saved else []) + list(then)
+    if cmds:
         try:
             if sock is not None:
-                lamp_call(bulb._ip, restore_commands(saved), sock=sock)
+                lamp_call(bulb._ip, cmds, sock=sock)
             else:
                 # stop_music() never reached the bulb: one bounded try on a
                 # fresh connection, which also has to end music mode
-                lamp_call(bulb._ip, [("set_music", [0])] + restore_commands(saved))
-            restored = True
+                lamp_call(bulb._ip, [("set_music", [0])] + cmds)
+            restored = bool(saved)
         except Exception as exc:
             print(f"could not restore the lamp: {exc}", file=sys.stderr)
 
@@ -1882,9 +1886,9 @@ class Link:
         if bulb is not None:
             abandon_bulb(bulb)
 
-    def close(self, restore=False):
-        """End the session: put the lamp back if asked and it can be reached.
-        -> True if it was restored."""
+    def close(self, restore=False, then=()):
+        """End the session: put the lamp back if asked and it can be reached,
+        then send `then` (see release_bulb). -> True if it was restored."""
         lost = self.lost
         if self.sender is not None:
             self.sender.stop()
@@ -1895,7 +1899,8 @@ class Link:
         if lost:
             abandon_bulb(bulb)
             return False
-        return release_bulb(bulb, restore=(self.saved or False) if restore else False)
+        return release_bulb(bulb, restore=(self.saved or False) if restore else False,
+                            then=then)
 
 
 # ---------------------------------------------------------------------------
@@ -2053,7 +2058,7 @@ def run(args):
                            duration=int(np.clip(min_gap * 1000, 30, 150)))
                 last_sent, last_hsv = now, hsv
     finally:
-        link.close(restore=args.restore)
+        link.close(restore=args.restore and not args.leave, then=leave_commands(args))
 
 
 def run_screen(args):
@@ -2103,7 +2108,7 @@ def run_screen(args):
 
             grab.pace(now, 1.0 / args.screen_fps, period)
     finally:
-        link.close(restore=args.restore)
+        link.close(restore=args.restore and not args.leave, then=leave_commands(args))
         grab.close()
 
 
@@ -2169,7 +2174,7 @@ def run_fusion(args):
                 last_sent, last_hsv = now, light
     finally:
         screen.close()
-        link.close(restore=args.restore)
+        link.close(restore=args.restore and not args.leave, then=leave_commands(args))
 
 
 def capture_label(grab):
@@ -2187,6 +2192,34 @@ def parse_region(text):
     if w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError("width and height must be positive")
     return x, y, w, h
+
+
+def leave_commands(args):
+    """--leave: the idle look the CLI leaves running at exit."""
+    if not getattr(args, "leave", None):
+        return []
+    from bulb_alone import idle_commands
+    return idle_commands(args.leave, PALETTES.get(args.palette or "ember"))
+
+
+def sleep_now(args):
+    """--sleep: set (or with 0 clear) the bulb's own off timer and exit. One
+    short connection; a still look also gets the fade."""
+    from bulb_alone import SLEEP_MAX, cancel_commands, look_step, sleep_commands
+    if args.sleep == 0:
+        lamp_call(args.ip, cancel_commands())
+        print("sleep timer cleared")
+        return
+    if not 1 <= args.sleep <= SLEEP_MAX:
+        raise SystemExit(f"--sleep must be 0..{SLEEP_MAX} minutes")
+    saved = read_lamp(args.ip)
+    if not saved or saved["power"] != "on":
+        raise SystemExit("the lamp is off: nothing to switch off")
+    (flowing,) = lamp_call(args.ip, [("get_prop", ["flowing"])])
+    step = None if (flowing or ["0"])[0] == "1" else look_step(saved)
+    lamp_call(args.ip, sleep_commands(args.sleep, step))
+    print(f"the lamp switches off in {args.sleep} min"
+          + (", fading over the last 10" if step else ""))
 
 
 def main():
@@ -2207,6 +2240,12 @@ def main():
     p.add_argument("--no-restore", dest="restore", action="store_false",
                    help="leave the lamp on the last colour sent when this "
                         "exits, instead of putting back what it showed before")
+    p.add_argument("--leave", choices=("candle", "drift", "breathe"),
+                   help="leave this look running on the lamp at exit instead "
+                        "of restoring (drift walks --palette, default ember)")
+    p.add_argument("--sleep", type=int, metavar="MINUTES",
+                   help="set the bulb's own off timer and exit (0 clears it); "
+                        "it runs with nothing connected")
     p.add_argument("--lead", type=int, default=80, metavar="MS",
                    help="beat sync: once the tempo holds, send each flash this "
                         "many ms early so it lands on the beat over Wi-Fi "
@@ -2280,6 +2319,13 @@ def main():
 
     if not args.ip:
         p.error("--ip is required")
+
+    if args.sleep is not None:
+        try:
+            sleep_now(args)
+        except (OSError, RuntimeError) as exc:
+            sys.exit(f"could not set the timer: {exc}")
+        return
 
     try:
         if args.fusion:

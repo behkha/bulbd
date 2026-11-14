@@ -90,8 +90,8 @@ class FakeLink:
     def put(self, *a, **k):
         pass
 
-    def close(self, restore=False):
-        self.closed = restore
+    def close(self, restore=False, then=()):
+        self.closed, self.then = restore, list(then)
 
 
 @pytest.fixture

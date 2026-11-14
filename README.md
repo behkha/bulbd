@@ -203,8 +203,25 @@ brightness.
   connection. **Stop** puts the lamp back the way it was before Start —
   power, brightness, and colour or white temperature — and so does Ctrl-C;
   `--no-restore` leaves it on the last colour sent. The CLI does the same.
+- **On stop** picks what Stop leaves on the lamp instead: **Candle** (a warm
+  flicker), **Drift** (a slow walk through the selected palette, yours
+  included) or **Breathe** (white, in and out). The bulb runs them on its own,
+  so they keep going when the desk quits or the Mac sleeps. The CLI takes
+  `--leave candle|drift|breathe`.
+- **Sleep** switches the lamp off after 15 to 120 minutes, dimming it over
+  the last ten. The bulb counts, so the timer survives the desk quitting or
+  the Mac sleeping; the chosen step shows the time left, **Off** cancels it.
+  It needs the lamp on. During a session the desk does the dimming and, at
+  zero, stops without restoring; after Stop, a restored look fades on the
+  bulb and an On stop look keeps running until the lamp switches off.
+  `python music_bulb.py --ip <bulb-ip> --sleep 30` sets it from a shell
+  (`--sleep 0` clears it).
+- **Use as power-on look** (Setup) makes what the lamp shows now the look it
+  comes on with from the wall switch. The old one cannot be read back, so it
+  asks first; `tools/check_default.py` does the same from a shell.
 - Settings — address, the bulb's device id, input, mode, Auto, palette,
-  Calm, every fader, display, area, your presets and your palettes — are saved to `~/Library/Application Support/bulbd/settings.json`
+  Calm, every fader, display, area, your presets and your palettes, On stop
+  and a running Sleep timer — are saved to `~/Library/Application Support/bulbd/settings.json`
   a second after the last change and loaded at start (`--settings PATH` to
   move it, `--settings ''` to keep nothing). Start/Stop is not saved: the lamp
   never turns on by itself. `--ip` and `--mic` win over the file, and a
@@ -403,12 +420,14 @@ music_bulb.py        DSP, screen capture, CLI, bulb lifecycle
 music_bulb_dash.py   the web desk; CloudSession drives the login
 sck_capture.py       the ScreenCaptureKit stream backend (optional pyobjc)
 palettes.py          what a valid palette is; a palette from album art
+bulb_alone.py        what the lamp runs on its own: On stop flows, Sleep, fades
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
 tests/               pytest suite (synthetic signals in tests/signals.py)
 tools/check_bulb.py  manual check against a real bulb; not part of the suite
 tools/check_link.py  hello, find, diagnose and a power-cycle reconnect, real bulb
 tools/check_white.py white-LED brightness match and temperature sweep, real bulb
 tools/check_sync.py  Beat sync against a click track on your speakers, real bulb
+tools/check_default.py  set the real bulb's power-on look (asks first)
 tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
 tools/bench_capture.py  mss vs the stream: CPU per process and colour agreement
 ```

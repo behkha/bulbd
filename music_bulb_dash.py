@@ -29,6 +29,7 @@ import math
 import os
 import re
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -45,7 +46,9 @@ from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
                         ramp_ms, BeatSync, LED_GAP, AutoPicker, MotionMeter,
                         AUTO_CAPTURE, CAPTURE_BACKENDS)
 
+import music_bulb
 import palettes as pal_rules
+import bulb_alone as alone
 from palettes import PaletteError, clean_anchors
 
 # The cloud half is optional: it pulls in requests/PIL/pycryptodome, and a
@@ -121,7 +124,7 @@ MIN_REGION = 32                     # points; smaller than this is a mis-click
 # what survives a restart. Never `running` (the lamp must not start on its
 # own) and nothing from the cloud login (no secret touches disk).
 SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
-              "monitor", "region", "presets", "palettes")
+              "monitor", "region", "presets", "palettes", "idle", "sleep")
 
 
 def _number(v):
@@ -412,6 +415,10 @@ def clean_patch(patch, snap):
             pass
     if "presets" in patch:              # from the settings file; the page uses /api/presets
         out["presets"] = clean_presets(patch["presets"], snap)
+    if patch.get("idle") in alone.IDLE_LOOKS:   # what Stop leaves on the lamp
+        out["idle"] = patch["idle"]
+    if "sleep" in patch:                # from the settings file; the page uses /api/sleep
+        out["sleep"] = alone.clean_sleep(patch["sleep"])
     return out
 
 
@@ -547,6 +554,9 @@ class State:
             "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
             "fade": 0.0, "lead": 80,
             "presets": [],                  # the user's own; BUILTIN_PRESETS are fixed
+            # what Stop leaves on the lamp (bulb_alone.IDLE_LOOKS), and the
+            # bulb's own off timer: None or {at: epoch s, step: the faded look}
+            "idle": "restore", "sleep": None,
             "palettes": [],                 # the user's own [{name, anchors}]; PALETTES are fixed
             # screen mode
             "monitor": mons[0]["i"] if mons else 1,
@@ -751,6 +761,139 @@ def apply_palette(color, name, palettes=None):
         color.retarget(*color.palettes[name][0])
 
 
+def lamp_error(exc):
+    """A lamp_call failure in the page's words."""
+    if "-5006" in str(exc) or "illegal" in str(exc):
+        return "The lamp is off."
+    return "The bulb did not answer."
+
+
+class SleepTimer:
+    """The bulb's own off timer, as the desk sees it.
+
+    The bulb counts (cron_add), so the lamp switches off on time whether the
+    desk runs, quits or the Mac sleeps. The desk keeps `sleep` = {at, step}
+    in its settings and arms one threading.Timer for `at`: no polling, a
+    stopped desk sleeps until then. When the timer runs out during a
+    session, `fired` makes the session end without the restore, which would
+    switch the lamp back on.
+
+    Set while stopped on a still look, the bulb also fades it (a flow ending
+    in off) and `step` keeps the look for Cancel. During a session the
+    session dims its own frames (bulb_alone.Dimmed); on Stop, _leave() hands
+    the fade to the bulb for the time left.
+    """
+
+    def __init__(self, state, call=None):
+        self.state = state
+        self.call = call or self._call
+        self.fired = threading.Event()
+        self._timer = None
+        self._lock = threading.Lock()
+        cur = state.snapshot()["sleep"]
+        if cur:
+            self._arm(cur["at"])
+
+    @staticmethod
+    def _call(ip, batches):
+        """Each batch on one short connection, in turn. -> their results."""
+        sock = socket.create_connection((ip, music_bulb.LAMP_PORT), 2)
+        try:
+            out = []
+            for cmds in batches:
+                cmds = cmds(out) if callable(cmds) else cmds
+                out.append(music_bulb.lamp_call(ip, cmds, sock=sock) if cmds else [])
+            return out
+        finally:
+            sock.close()
+
+    def left(self):
+        cur = self.state.snapshot()["sleep"]
+        return None if not cur else max(0.0, cur["at"] - time.time())
+
+    def _arm(self, at):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+            self._timer = threading.Timer(max(0.0, at - time.time()), self._fire)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _disarm(self):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+
+    def _fire(self):
+        snap = self.state.snapshot()
+        if snap["running"]:
+            self.fired.set()
+            self.state.control(sleep=None, running=False, status="sleeping", notice=None)
+        else:
+            self.state.control(sleep=None)
+
+    def start(self, minutes):
+        """-> error sentence or ''."""
+        snap = self.state.snapshot()
+        if not snap["ip"]:
+            return "Set up the bulb first."
+        step = None
+        try:
+            if snap["running"]:
+                # frames would replace a fade: the bulb only counts, the
+                # session dims itself
+                self.call(snap["ip"], [alone.sleep_commands(minutes)])
+            else:
+                props = list(music_bulb.LAMP_PROPS) + ["flowing"]
+
+                def then(out):
+                    nonlocal step
+                    values = out[0][0] or []
+                    raw = dict(zip(props, values))
+                    saved = {"power": raw.get("power")}
+                    for k in music_bulb.LAMP_PROPS[1:]:
+                        with contextlib.suppress(TypeError, ValueError):
+                            saved[k] = int(raw.get(k))
+                    if raw.get("flowing") != "1":     # an idle look keeps running
+                        step = alone.look_step(saved)
+                    return alone.sleep_commands(minutes, step)
+
+                self.call(snap["ip"], [[("get_prop", props)], then])
+        except Exception as exc:
+            return lamp_error(exc)
+        at = time.time() + minutes * 60
+        self.fired.clear()
+        self.state.control(sleep={"at": at, "step": step})
+        self._arm(at)
+        return ""
+
+    def cancel(self):
+        snap = self.state.snapshot()
+        cur = snap["sleep"]
+        self._disarm()
+        self.state.control(sleep=None)
+        if not snap["ip"]:
+            return ""
+        step = None if snap["running"] or not cur else cur.get("step")
+        try:
+            self.call(snap["ip"], [alone.cancel_commands(step)])
+        except Exception as exc:
+            return lamp_error(exc)
+        return ""
+
+    def handed_over(self, step):
+        """Stop gave the fade to the bulb: Cancel now puts `step` back."""
+        cur = self.state.snapshot()["sleep"]
+        if cur:
+            self.state.control(sleep=dict(cur, step=step))
+
+    def dropped(self):
+        """The lamp ended off, so there is nothing left to switch off."""
+        self._disarm()
+        self.state.control(sleep=None)
+
+
 class Engine(threading.Thread):
     daemon = True
 
@@ -762,6 +905,7 @@ class Engine(threading.Thread):
         self.idle = threading.Event()           # set while parked, for a clean exit
         self.idle.set()
         self.picker = None                      # an AutoPicker while Auto is on
+        self.sleep = SleepTimer(state)
 
     def _mode(self, cfg):
         """The mode to run: the picker's choice under Auto, else the desk's.
@@ -844,6 +988,8 @@ class Engine(threading.Thread):
             return
         loops = {"music": self._audio_loop, "screen": self._screen_loop,
                  "fusion": self._fusion_loop}
+        # a sleep timer dims the last minutes of a session
+        dimmed = alone.Dimmed(link, lambda: alone.dim_factor(self.sleep.left()))
         try:
             while True:
                 cfg = st.snapshot()
@@ -855,14 +1001,46 @@ class Engine(threading.Thread):
                     continue
                 # Auto turned on mid-session starts from the mode running now
                 self._watch(cfg, start=cfg["mode"])
-                loops.get(self._mode(cfg), self._audio_loop)(st, link)
+                loops.get(self._mode(cfg), self._audio_loop)(st, dimmed)
         finally:
             self.picker = None
-            if self.restore and link.saved and not link.lost:
+            restore, then = self._leave(st.snapshot(), link)
+            if restore and link.saved and not link.lost:
                 st.set(status="restoring the lamp")
-            link.close(restore=self.restore)
+            link.close(restore=restore, then=then)
             st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10,
                    input_db=None, signal=True)
+
+    def _leave(self, cfg, link):
+        """What Stop sends: -> (restore, then) for Link.close.
+
+        The sleep timer ran out: no restore (it would switch the lamp back
+        on), just off. An idle look: that flow instead of the restore; a
+        pending timer still switches it off. The restore with a timer
+        pending: the restored look, then the bulb fades it for the time
+        left. A lamp restored to off has no timer left to run."""
+        if self.sleep.fired.is_set():
+            self.sleep.fired.clear()
+            return False, [("set_power", ["off", "smooth", 500])]
+        anchors = None
+        if cfg["idle"] == "drift":
+            pals = all_palettes(cfg)
+            name = cfg["palette"] if cfg["palette"] in pals else cfg["active_palette"]
+            anchors = pals.get(name) or PALETTES["ember"]
+        then = alone.idle_commands(cfg["idle"], anchors)
+        if then:
+            return False, then
+        cur, saved = cfg["sleep"], link.saved
+        if not cur or not self.restore or link.lost:
+            return self.restore, []
+        if saved and saved.get("power") == "off":
+            self.sleep.dropped()
+            return True, [("cron_del", [0])]
+        step, left = alone.look_step(saved), cur["at"] - time.time()
+        if not step or left < 1:
+            return True, []
+        self.sleep.handed_over(step)
+        return True, [alone.fade_flow(step, left)]
 
     # -- screen mode --------------------------------------------------------
     def _screen_loop(self, st, sender):
@@ -1499,6 +1677,15 @@ input.tx::placeholder{color:var(--dim)}
 #errnote span{flex:1 1 260px}
 .warn{color:var(--warn)} .err{color:var(--err)} .ok{color:var(--ok)}
 .line{display:flex;gap:8px}
+/* what the lamp does on its own: On stop looks, Sleep, the power-on look */
+.pchip>s{display:block;width:30px;height:12px;border-radius:3px;margin-right:6px}
+.chips>.lead{color:var(--dim);font-size:13.5px;align-self:center;margin-right:2px}
+.lbl{display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center}
+.lbl>span:first-child{color:var(--dim);font-size:13.5px}
+#sleep{justify-self:start;flex-wrap:wrap}
+#sleep button[aria-pressed="true"]{min-width:58px}
+.confirm{background:var(--sf);border-radius:10px;box-shadow:inset 0 0 0 1px var(--line);padding:12px;display:grid;gap:10px}
+.confirm p{margin:0}
 .line>input{flex:1;min-width:0}
 .btn{border:0;padding:8px 16px;border-radius:8px;background:var(--sf2);font-weight:550;white-space:nowrap;cursor:pointer}
 .btn.pri{background:var(--ink);color:var(--bg)}
@@ -1595,6 +1782,10 @@ td .mini+.mini{margin-left:6px}
     </div>
 
     <div class="chips deck-runtime" id="presets"></div>
+    <div class="chips deck-runtime" id="idle"></div>
+    <div class="lbl deck-runtime"><span id="sleeplabel">Sleep</span>
+      <span class="seg" id="sleep" role="group" aria-labelledby="sleeplabel"></span></div>
+    <p class="note err deck-runtime" id="sleeperr"></p>
 
     <div class="pal deck-runtime only-music no-fusion">
       <div class="chips" id="chips"></div>
@@ -1692,6 +1883,15 @@ td .mini+.mini{margin-left:6px}
             <input class="tx" id="ip" autocomplete="off" spellcheck="false">
             <button class="btn" id="ipset" type="button">Set</button>
           </div>
+        </div>
+        <div class="line"><span class="sp"></span><span class="st on" id="defok" hidden><i></i>Saved</span>
+          <button class="btn" id="defbtn" type="button">Use as power-on look</button></div>
+        <div class="confirm" id="defask" hidden>
+          <p>The lamp will come on like this from the wall switch. The current power-on look cannot be brought back.</p>
+          <p class="note err" id="deferr"></p>
+          <div class="line"><span class="sp"></span>
+            <button class="btn" id="defno" type="button">Cancel</button>
+            <button class="btn pri" id="defyes" type="button">Save</button></div>
         </div>
         <span class="seg" id="cmethods" style="justify-self:start;margin-top:6px">
           <button type="button" data-method="password" aria-pressed="true">Password</button>
@@ -2013,6 +2213,66 @@ function renderPalettes(s){
   }
   if(mine.length && !ped && $('cpick').hidden) mini('Edit',()=>{ pEditMode=true; closePick(); palKey=''; renderPalettes(live); });
 }
+// -- the lamp on its own: On stop, Sleep ---------------------------------------
+const IDLE = [['restore','Restore',null],
+  ['candle','Candle','linear-gradient(90deg,#ff8a2a,#ffc56b,#ff9a3c)'],
+  ['drift','Drift',''],
+  ['breathe','Breathe','linear-gradient(90deg,#fff1dc,#6d685f,#fff1dc)']];
+const SLEEP_STEPS = __SLEEP_STEPS__;
+let idleKey='', sleepKey='';
+function driftAnchors(s){
+  return P[s.palette] || (own(s).find(p=>p.name===s.palette)||{}).anchors
+    || P[s.active_palette] || (own(s).find(p=>p.name===s.active_palette)||{}).anchors || P.ember;
+}
+function renderIdle(s){
+  const row=$('idle'), anchors=driftAnchors(s);
+  const key=JSON.stringify([s.idle, anchors]);
+  if(key===idleKey) return;
+  idleKey=key; row.innerHTML='';
+  const lead=document.createElement('span'); lead.className='lead'; lead.textContent='On stop'; row.append(lead);
+  IDLE.forEach(([id,label,bg])=>{
+    const b=document.createElement('button'); b.type='button'; b.className='pchip';
+    b.setAttribute('aria-pressed', s.idle===id);
+    if(bg!==null){ const sw=document.createElement('s'); sw.style.background = bg || strip(anchors); b.append(sw); }
+    b.append(document.createTextNode(label));
+    b.onclick=()=>{ [...row.querySelectorAll('.pchip')].forEach(c=>c.setAttribute('aria-pressed', c===b));
+                    send({idle:id}); };
+    row.append(b);
+  });
+}
+function clock(sec){
+  sec=Math.max(0, Math.ceil(sec));
+  const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), x=String(sec%60).padStart(2,'0');
+  return h ? h+':'+String(m).padStart(2,'0')+':'+x : m+':'+x;
+}
+function renderSleep(s){
+  // the bulb counts; the page only shows what is left of `at`
+  const left = s.sleep ? s.sleep.at - Date.now()/1000 : 0;
+  const on = left > 0 ? (SLEEP_STEPS.find(m=>m*60 >= left-1) || SLEEP_STEPS[SLEEP_STEPS.length-1]) : 0;
+  const key=JSON.stringify([on, on ? clock(left) : '']);
+  if(key===sleepKey) return;
+  sleepKey=key;
+  const row=$('sleep');
+  if(!row.children.length){
+    [0].concat(SLEEP_STEPS).forEach(m=>{
+      const b=document.createElement('button'); b.type='button'; b.dataset.min=m;
+      b.onclick=async ()=>{
+        $('sleeperr').textContent='';
+        const r=await post('/api/sleep', {minutes:m});
+        if(!r.ok) $('sleeperr').textContent=r.error||'The bulb did not answer.';
+        sleepKey=''; poll();
+      };
+      row.append(b);
+    });
+  }
+  [...row.children].forEach(b=>{
+    const m=+b.dataset.min;
+    b.setAttribute('aria-pressed', m===on);
+    b.textContent = m===0 ? 'Off' : (m===on ? clock(left) : String(m));
+    b.setAttribute('aria-label', m===0 ? 'Sleep off' : (m===on ? clock(left)+' left' : m+' minutes'));
+  });
+}
+
 async function palOp(body){
   const r = await post('/api/palettes', body);
   palKey=''; poll();
@@ -2411,6 +2671,7 @@ async function poll(){
       if(!drag && !draft) paintRegion(s.region, true);
       buildMics();
       renderPresets(s);
+      renderIdle(s);
       // faders follow the desk too, or a reload leaves them showing whatever
       // the browser restored rather than what is running
       Object.keys(KEYS).forEach(id=>{
@@ -2420,6 +2681,7 @@ async function poll(){
         paint(id);
       });
     }
+    renderSleep(s);
   }catch(e){ live=null; setStatus('server unreachable', null); }
   busy=false;
   pollTimer = setTimeout(poll, pollDelay());
@@ -2428,6 +2690,14 @@ poll();
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ shotStale=true; poll(); cloudPoll(); } });
 
 /* ------------------------------ setup deck ------------------------------ */
+$('defbtn').addEventListener('click', ()=>{ $('defask').hidden=false; $('defok').hidden=true; $('deferr').textContent=''; });
+$('defno').addEventListener('click', ()=>{ $('defask').hidden=true; });
+$('defyes').addEventListener('click', async ()=>{
+  $('deferr').textContent='';
+  const r=await post('/api/default', {});
+  if(!r.ok){ $('deferr').textContent=r.error||'The bulb did not answer.'; return; }
+  $('defask').hidden=true; $('defok').hidden=false;
+});
 let method='password', serversBuilt=false, logLen=-1, devKey='';
 [...$('cmethods').children].forEach(b=>{
   b.onclick=()=>{
@@ -2651,7 +2921,8 @@ class Handler(BaseHTTPRequestHandler):
                             "name": pal_rules.NAME_MAX, "min": pal_rules.MIN_ANCHORS,
                             "max": pal_rules.MAX_ANCHORS, "sat": pal_rules.SAT_RANGE,
                             "side": ART_SIDE}))
-                        .replace("__PRESETS__", json.dumps(BUILTIN_PRESETS)))
+                        .replace("__PRESETS__", json.dumps(BUILTIN_PRESETS))
+                        .replace("__SLEEP_STEPS__", json.dumps(list(alone.SLEEP_STEPS))))
             self._send(200, page, "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
@@ -2675,6 +2946,32 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/palettes"):
             self._do_palettes()
             return
+        if self.path.startswith("/api/sleep"):
+            # {"minutes": n} sets the bulb's off timer, 0 or null cancels it
+            body = self._body()
+            mins = body.get("minutes") if isinstance(body, dict) else None
+            timer = Handler.engine.sleep
+            if mins in (0, None):
+                error = timer.cancel()
+            else:
+                mins = alone.clean_minutes(mins)
+                error = timer.start(mins) if mins else "bad minutes"
+            self._json(400 if error else 200, {"ok": not error, "error": error,
+                                               "sleep": self.state.snapshot()["sleep"]})
+            return
+        if self.path.startswith("/api/default"):
+            # the lamp's power-on look (set_default). Its old one cannot be
+            # read back, so the page confirms first.
+            self._body()
+            ip = self.state.snapshot()["ip"]
+            error = "" if ip else "Set up the bulb first."
+            if ip:
+                try:
+                    music_bulb.lamp_call(ip, [("set_default", [])])
+                except Exception as exc:
+                    error = lamp_error(exc)
+            self._json(400 if error else 200, {"ok": not error, "error": error})
+            return
         if not self.path.startswith("/api/control"):
             self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
@@ -2689,6 +2986,7 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(patch, dict):
             patch.pop("presets", None)
             patch.pop("palettes", None)
+            patch.pop("sleep", None)            # only /api/sleep talks to the bulb
         if isinstance(patch, dict) and "preset" in patch:
             found = find_preset(patch.pop("preset"), snap)
             if found:
@@ -2847,6 +3145,7 @@ def main():
     engine = Engine(state, restore=args.restore, capture=args.capture)
     engine.start()
     Handler.state = state
+    Handler.engine = engine
     Handler.cloud = CloudSession()
     Handler.local = loopback
     Handler.cloud_enabled = loopback or args.allow_remote_login
