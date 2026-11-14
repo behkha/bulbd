@@ -229,6 +229,41 @@ brightness.
   never turns on by itself. `--ip` and `--mic` win over the file, and a
   broken file costs only the values it breaks.
 
+### Signals
+
+Under the faders, on every mode:
+
+- **Alert** pulses the lamp in a colour, 1-5 times, slow, normal or fast,
+  and then it shows what it showed before - a colour, a white, or off again
+  for a lamp that was off. With a session running the pulse goes out on the
+  session's own connection and its frames wait until the pulse is over. The
+  same pulse from a script or a timer:
+
+      curl -X POST localhost:8765/api/alert -d '{"color":"#2fb457","pulses":3,"speed":"fast"}'
+      python music_bulb.py --alert green --pulses 3 --speed fast [--ip <bulb-ip>]
+
+  The CLI goes through a running desk (`--desk URL`, default
+  `http://127.0.0.1:8765`) and straight to `--ip` when no desk answers or
+  the desk has no bulb address yet. One pulse at a time and at most six a
+  minute; more is refused. A pulse during a sunrise or a Focus block
+  carries on with the ramp or the white afterwards. A session run by the
+  CLI in another process cannot hold its frames for a pulse, so its next
+  frame paints over it: pulse through the desk instead.
+- **Focus** is a pomodoro: cool white (5000 K) for the work block, warm
+  (2700 K) for the break, a red pulse into work and a green one into a break.
+  Start, Pause/Resume, Reset; Reset puts the lamp back. It runs on a stopped
+  desk only, and Start (a session) ends it first. The lengths are saved; a
+  running block is not.
+- **Sunrise** at a set time ramps the lamp from 1% at 1700 K to 100% at
+  6500 K over 30 minutes, one flow the bulb runs by itself. The bulb has no
+  clock, so the desk has to be running and the Mac awake to start it; an
+  armed alarm shows its time beside the desk's status, and while it ramps
+  the top bar says *sunrise* with a **Stop**. Until 20 min after the time
+  it keeps trying every 15 s: a Mac that wakes late, Wi-Fi that is not back
+  yet and a desk restarted in that window still get it. A session (or Focus)
+  running at that time wins; if it stops inside the window the sunrise
+  starts then. A time the clock skips in spring (02:30) fires at 03:00.
+
 Binds to localhost. `--host 0.0.0.0` reaches it from your phone — there is no
 authentication, so only on a network you trust.
 
@@ -451,6 +486,7 @@ music_bulb_dash.py   the web desk; CloudSession drives the login
 sck_capture.py       the ScreenCaptureKit stream backend (optional pyobjc)
 palettes.py          what a valid palette is; a palette from album art
 bulb_alone.py        what the lamp runs on its own: On stop flows, Sleep, fades
+lamp_signals.py      alert pulses, the Focus timer and the sunrise alarm
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
 tests/               pytest suite (synthetic signals in tests/signals.py)
 tools/check_bulb.py  manual check against a real bulb; not part of the suite
@@ -459,6 +495,7 @@ tools/check_white.py white-LED brightness match and temperature sweep, real bulb
 tools/check_sync.py  Beat sync against a click track on your speakers, real bulb
 tools/check_default.py  set the real bulb's power-on look (asks first)
 tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
+                     (flows as the color5 runs them; --port beside another fake)
 tools/bench_capture.py  mss vs the stream: CPU per process and colour agreement
 ```
 

@@ -492,7 +492,7 @@ def test_the_engine_holds_the_lamp_lock_while_it_opens_and_closes(monkeypatch):
             held.append(("open", eng.lamp_lock.locked()))
             return True
 
-        def close(self, restore=False):
+        def close(self, restore=False, then=()):
             held.append(("close", eng.lamp_lock.locked()))
 
     monkeypatch.setattr(dash, "Link", Link)

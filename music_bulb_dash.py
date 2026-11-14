@@ -50,6 +50,7 @@ import music_bulb
 import palettes as pal_rules
 import bulb_alone as alone
 from palettes import PaletteError, clean_anchors
+from lamp_signals import Signals, clean_alert
 
 # The cloud half is optional: it pulls in requests/PIL/pycryptodome, and a
 # desk that only drives an already-provisioned bulb should still start
@@ -135,6 +136,14 @@ LAMP_SAVED = tuple(LAMP_DEFAULTS)
 SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
               "monitor", "region", "presets", "palettes", "idle", "sleep",
               *LAMP_SAVED)
+# Signals (lamp_signals.py): Focus lengths in minutes and the sunrise time in
+# minutes past midnight are clamped like the faders (but are not part of a
+# preset's look); the sunrise switch is a bool. Whether Focus is running is never saved.
+SIGNAL_NUMERIC = {"focus_work": (5, 90, int), "focus_break": (1, 30, int),
+                  "sunrise_at": (0, 1439, int)}
+SIGNAL_DEFAULTS = {"focus_work": 25, "focus_break": 5, "sunrise_at": 7 * 60,
+                   "sunrise_on": False}
+SAVED_KEYS += (*SIGNAL_NUMERIC, "sunrise_on")
 
 
 def _number(v):
@@ -384,7 +393,7 @@ def clean_patch(patch, snap):
     if "palettes" in patch:             # from the settings file; the page uses /api/palettes
         out["palettes"] = clean_palettes(patch["palettes"])
         snap = dict(snap, palettes=out["palettes"])
-    for key, (lo, hi, kind) in NUMERIC.items():
+    for key, (lo, hi, kind) in (*NUMERIC.items(), *SIGNAL_NUMERIC.items()):
         v = patch.get(key)
         if _number(v):
             v = min(max(v, lo), hi)
@@ -430,6 +439,8 @@ def clean_patch(patch, snap):
     if "sleep" in patch:                # from the settings file; the page uses /api/sleep
         out["sleep"] = alone.clean_sleep(patch["sleep"])
     out.update(clean_lamp(patch, snap))
+    if isinstance(patch.get("sunrise_on"), bool):
+        out["sunrise_on"] = patch["sunrise_on"]
     return out
 
 
@@ -584,6 +595,7 @@ class State:
         }
         # lamp mode: Follow the day, and the lamp as last read (never saved)
         self._d.update(LAMP_DEFAULTS, lamp=None, lamp_error=None)
+        self._d.update(SIGNAL_DEFAULTS)
         if saved:
             self._d.update(clean_patch(saved, self._d))
 
@@ -1293,6 +1305,7 @@ class Engine(threading.Thread):
         # a session has let go of the bulb
         self.lamp_lock = threading.Lock()
         self.on_session_end = None
+        self.link = None                        # the session's Link, for alerts
 
     def _mode(self, cfg):
         """The mode to run: the picker's choice under Auto, else the desk's.
@@ -1384,6 +1397,7 @@ class Engine(threading.Thread):
         done = threading.Event()
         fader = threading.Thread(target=self._fade, args=(dimmed, done), daemon=True)
         fader.start()
+        self.link = link
         try:
             while True:
                 cfg = st.snapshot()
@@ -1398,6 +1412,7 @@ class Engine(threading.Thread):
                 loops.get(self._mode(cfg), self._audio_loop)(st, dimmed)
         finally:
             self.picker = None
+            self.link = None
             done.set()
             self.sleep.kick.set()
             fader.join(2)
@@ -2190,13 +2205,39 @@ td.acts{text-align:right}
 td .mini+.mini{margin-left:6px}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-left:8px;vertical-align:1px}
 .empty{color:var(--dim);padding:12px 0;margin:0}
+
+/* ---------- signals: alert, Focus, sunrise ---------- */
+.sig{display:grid;gap:10px;padding-top:16px;border-top:1px solid var(--line)}
+.sig .sh{display:flex;align-items:center;gap:10px;font-weight:620}
+.sig .ln{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.sig .sw button{width:28px;height:28px;border-radius:7px}
+.sig .sw button[aria-pressed="true"]{box-shadow:0 0 0 2px var(--bg),0 0 0 3.5px var(--ink)}
+.sig .sw button.pale{box-shadow:inset 0 0 0 1px var(--line)}
+.sig .sw button.pale[aria-pressed="true"]{box-shadow:inset 0 0 0 1px var(--line),0 0 0 2px var(--bg),0 0 0 3.5px var(--ink)}
+.sig .seg button{padding:5px 12px}
+.clock{font-size:26px;font-weight:620;letter-spacing:-.01em}
+.phase{color:var(--dim);font-weight:400;font-size:13.5px}
+input.tm{width:auto;min-width:110px}
+.tog{position:relative;flex:none;width:36px;height:21px;border-radius:11px;border:0;padding:0;background:var(--line);cursor:pointer}
+.tog::after{content:"";position:absolute;left:2.5px;top:2.5px;width:16px;height:16px;border-radius:50%;background:var(--sf);transition:left .15s}
+.tog[aria-checked="true"]{background:var(--ink)}
+.tog[aria-checked="true"]::after{left:17.5px}
+@media (prefers-reduced-motion:reduce){.tog::after{transition:none}}
+.ramp{flex:1;min-width:60px;height:8px;border-radius:4px;background:linear-gradient(90deg,#3a1d08,#ff8a2a 30%,#ffd9a8 65%,#f2f6ff)}
+.alm{flex:none;display:inline-flex;align-items:center;gap:6px;font-size:13.5px;font-weight:600;border:0;border-radius:7px;
+  padding:5px 10px;background:transparent;box-shadow:inset 0 0 0 1.5px var(--ink);cursor:pointer}
+.alm svg{width:15px;height:15px}
+body[data-deck="cloud"] #alm{display:none}
 </style></head><body data-mode="music" data-deck="runtime">
 
 <div class="app">
   <div class="top">
     <span class="name">bulbd</span>
     <span class="st" id="status"><i></i><span id="stxt">idle</span></span>
+    <button class="alm" id="alm" type="button" hidden aria-label="Sunrise alarm"><svg viewBox="0 0 16 16" fill="none"
+      stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 12.5h12M4.5 12.5a3.5 3.5 0 0 1 7 0M8 3.5v2M3.3 6.6l1.3 1.2M12.7 6.6l-1.3 1.2"/></svg><span id="almt"></span></button>
     <span class="sp"></span>
+    <button class="btn" id="sstop" type="button" hidden>Stop</button>
     <button class="addr" id="addr" type="button">Set up bulb</button>
     <button class="btn" id="done" type="button">Done</button>
   </div>
@@ -2343,6 +2384,38 @@ td .mini+.mini{margin-left:6px}
         <input type="range" id="sfps" min="4" max="30" step="1" value="10"><output id="v-sfps"></output></div>
     </div>
 
+    <!-- ============================= SIGNALS ============================= -->
+    <div class="sig deck-runtime" id="alert">
+      <div class="sh">Alert<span class="sp"></span><button class="btn" id="apulse" type="button">Pulse</button></div>
+      <div class="sw" id="aswatch" role="group" aria-label="Alert colour"></div>
+      <div class="ln">
+        <span class="seg" id="apulses" role="group" aria-label="Pulses"></span>
+        <span class="sp"></span>
+        <span class="seg" id="aspeed" role="group" aria-label="Speed"></span>
+      </div>
+      <p class="note err" id="aerr"></p>
+    </div>
+
+    <div class="sig deck-runtime" id="focus">
+      <div class="sh">Focus<span class="sp"></span><span class="phase" id="fphase"></span></div>
+      <div class="ln"><span class="clock" id="fclock">25:00</span><span class="sp"></span>
+        <button class="btn" id="fgo" type="button">Start</button>
+        <button class="btn" id="freset" type="button" disabled>Reset</button></div>
+      <div class="rows">
+        <div class="r"><label for="fwork">Work</label>
+          <input type="range" id="fwork" min="5" max="90" step="5" value="25"><output id="v-fwork"></output></div>
+        <div class="r"><label for="fbreak">Break</label>
+          <input type="range" id="fbreak" min="1" max="30" step="1" value="5"><output id="v-fbreak"></output></div>
+      </div>
+      <p class="note err" id="ferr"></p>
+    </div>
+
+    <div class="sig deck-runtime" id="sunrise">
+      <div class="sh">Sunrise<span class="sp"></span>
+        <button class="tog" id="son" type="button" role="switch" aria-checked="false" aria-label="Sunrise"></button></div>
+      <div class="ln"><input class="tx tm" type="time" id="sat" value="07:00" aria-label="Sunrise time"><span class="ramp"></span></div>
+    </div>
+
     <!-- ============================== SETUP ============================== -->
     <div class="setup deck-cloud">
       <div class="login">
@@ -2476,13 +2549,14 @@ async function post(path, body){
 const KEYS = {sens:'sensitivity', gamma:'gamma', punch:'punch', fps:'fps',
               lead:'lead', fade:'fade',
               sgamma:'screen_gamma', minsat:'min_sat', sboost:'sat_boost',
-              sfps:'screen_fps'};
+              sfps:'screen_fps', fwork:'focus_work', fbreak:'focus_break'};
 function fmt(id, v){
   v=+v;
   if(id==='fps' || id==='sfps') return v+'/s';
   if(id==='fade') return v ? v.toFixed(1)+' s' : 'Off';
   if(id==='lead') return v ? v+' ms' : 'Off';
   if(id==='minsat') return String(v);
+  if(id==='fwork' || id==='fbreak') return v+' min';
   return v.toFixed(2);
 }
 function paint(id){
@@ -2508,7 +2582,7 @@ function setStatus(text, notice){
   $('errnote').className = 'note deck-runtime ' + (n ? n.kind : '');
   $('errtxt').textContent = n ? n.text : '';
   $('errfix').hidden = !(n && n.action==='setup');
-  st.className = 'st' + (text==='running' || text==='connected' ? ' on'
+  st.className = 'st' + (text==='running' || text==='connected' || text==='sunrise' ? ' on'
     : text==='no signal' ? ' quiet'
     : /^(connecting|starting|stopping|restoring|reconnecting|searching)/.test(text) ? ' busy'
     : /^(error|no bulb|server|unreachable)/.test(text) ? ' bad' : '');
@@ -3097,9 +3171,11 @@ async function poll(){
       ? {kind:'warn', text:'No Screen Recording permission, so Auto stays on Music.'} : null;
     const lampErr = !s.running && !s.notice && s.lamp_error ? {kind:'err', text:s.lamp_error} : null;
     setStatus(s.running && s.status==='running' && !s.signal && mode!=='screen' ? 'no signal'
+              : !s.running && s.sunrise_ramping ? 'sunrise'
               : lampErr ? 'unreachable' : s.status,
               s.notice || autoNote || lampErr);
     paintLamp(s, r, g, b);
+    paintSignals(s);
     paintMeter(s);
     maybeShot(s);
     const addr=$('addr');
@@ -3158,6 +3234,74 @@ async function poll(){
   busy=false;
   pollTimer = setTimeout(poll, pollDelay());
 }
+/* -------------------------------- signals ------------------------------- */
+const SWATCH = ['#e5352b','#f29a1d','#2fb457','#2f7de1','#a24be0','#ffffff'];
+const sig = {color:SWATCH[0], pulses:2, speed:'normal'};
+function segOf(id, items, key){
+  const box=$(id);
+  items.forEach(([v,label])=>{
+    const b=document.createElement('button'); b.type='button'; b.textContent=label;
+    b.onclick=()=>{ sig[key]=v; [...box.children].forEach(c=>c.setAttribute('aria-pressed', c===b)); };
+    b.setAttribute('aria-pressed', sig[key]===v);
+    box.append(b);
+  });
+}
+SWATCH.forEach(c=>{
+  const b=document.createElement('button'); b.type='button'; b.style.background=c;
+  b.setAttribute('aria-label', c); b.setAttribute('aria-pressed', c===sig.color);
+  if(c==='#ffffff') b.className='pale';
+  b.onclick=()=>{ sig.color=c; [...$('aswatch').children].forEach(x=>x.setAttribute('aria-pressed', x===b)); };
+  $('aswatch').append(b);
+});
+segOf('apulses', [[1,'1'],[2,'2'],[3,'3'],[5,'5']], 'pulses');
+segOf('aspeed', [['slow','Slow'],['normal','Normal'],['fast','Fast']], 'speed');
+$('apulse').addEventListener('click', async ()=>{
+  $('aerr').textContent='';
+  const r = await post('/api/alert', sig);
+  if(!r.ok) $('aerr').textContent = r.error;
+});
+async function focusOp(op){
+  $('ferr').textContent='';
+  const r = await post('/api/focus', {op});
+  if(!r.ok) $('ferr').textContent = r.error;
+  poll();
+}
+$('fgo').addEventListener('click', ()=>{
+  const f = live && live.focus;
+  focusOp(f && f.phase!=='idle' && !f.paused ? 'pause' : 'start');
+});
+$('freset').addEventListener('click', ()=>focusOp('reset'));
+$('son').addEventListener('click', ()=>{
+  const on = $('son').getAttribute('aria-checked')!=='true';
+  $('son').setAttribute('aria-checked', on);
+  send({sunrise_on:on});
+});
+$('sat').addEventListener('change', ()=>{
+  const [h,m] = $('sat').value.split(':').map(Number);
+  if(Number.isFinite(h) && Number.isFinite(m)) send({sunrise_at:h*60+m});
+});
+$('alm').addEventListener('click', ()=>$('sunrise').scrollIntoView({behavior:'smooth', block:'center'}));
+$('sstop').addEventListener('click', async ()=>{ await post('/api/sunrise', {op:'stop'}); poll(); });
+const clock = n => String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+function paintSignals(s){
+  const f = s.focus || {phase:'idle'};
+  const active = f.phase!=='idle';
+  // Focus whites would fight a session's frames: it is a stopped-desk tool
+  $('focus').hidden = s.running;
+  $('fclock').textContent = clock(active ? f.left : s.focus_work*60);
+  $('fphase').textContent = active ? (f.phase==='work' ? 'Work' : 'Break')+' · '+f.round : '';
+  $('fgo').textContent = !active ? 'Start' : f.paused ? 'Resume' : 'Pause';
+  $('freset').disabled = !active;
+  const at = clock(s.sunrise_at);
+  $('alm').hidden = !s.sunrise_on;
+  $('almt').textContent = at;
+  $('sstop').hidden = !(s.sunrise_ramping && !s.running);
+  if(Date.now() > holdUntil){
+    $('son').setAttribute('aria-checked', s.sunrise_on);
+    if(document.activeElement !== $('sat')) $('sat').value = at;
+  }
+}
+
 poll();
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ shotStale=true; lampStale=true; poll(); cloudPoll(); } });
 addEventListener('focus', ()=>{ lampStale=true; poll(); });
@@ -3456,6 +3600,7 @@ cloudPoll();
 class Handler(BaseHTTPRequestHandler):
     state = None
     cloud = None
+    signals = None                  # lamp_signals.Signals: alerts, Focus, sunrise
     # Cloud login means a Xiaomi password crosses this socket. The desk has
     # no authentication, so on anything but loopback the endpoints stay shut
     # unless the operator asked for them with --allow-remote-login.
@@ -3525,6 +3670,8 @@ class Handler(BaseHTTPRequestHandler):
                 # the page paints what the lamp shows: dimmed by a sleep fade
                 snap["val"] = alone.dim_level(snap["val"],
                                               alone.dim_factor(engine.sleep.left()))
+            if self.signals is not None:
+                snap.update(self.signals.view())
             self._send(200, json.dumps(snap), "application/json")
         elif self.path.startswith("/api/cloud/state"):
             snap = self.cloud.snapshot()
@@ -3616,6 +3763,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._do_lamp(body)
             return
+        if self.path.split("?")[0] in ("/api/alert", "/api/focus", "/api/sunrise"):
+            self._do_signals()
+            return
         if not self.path.startswith("/api/control"):
             self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
@@ -3665,9 +3815,16 @@ class Handler(BaseHTTPRequestHandler):
             # live run has to end before the new bulb can be opened
             clean["running"] = False
             clean["status"] = f"bulb address is now {clean['ip']} - press Start"
-        self.state.control(**clean)
+        if clean.get("running") and not snap["running"] and self.signals is not None:
+            # Focus puts the lamp back before the session reads it, and no
+            # plain exchange with the lamp can slip in before `running`
+            self.signals.claim_lamp(lambda: self.state.control(**clean))
+        else:
+            self.state.control(**clean)
         if self.lamp:
             self.lamp.changed(clean)
+        if self.signals is not None and ("sunrise_on" in clean or "sunrise_at" in clean):
+            self.signals.changed()
         self._send(200, json.dumps({"ok": True}), "application/json")
 
     def _do_lamp(self, body):
@@ -3697,6 +3854,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(502, {"ok": False, "error": self.state.snapshot()["lamp_error"]})
             return
         self._json(200, {"ok": True, "lamp": lamp})
+
+    def _do_signals(self):
+        body = self._body()
+        if body is None or not isinstance(body, dict):
+            self._send(400, "bad json", "text/plain")
+            return
+        if self.signals is None:
+            self._json(503, {"ok": False, "error": "signals are off"})
+            return
+        path = self.path.split("?")[0]
+        if path == "/api/alert":
+            picked, error = clean_alert(body)
+            if error:
+                self._json(400, {"ok": False, "error": error})
+                return
+            code, payload = self.signals.alert(*picked)
+        elif path == "/api/focus":
+            code, payload = self.signals.focus_op(body.get("op"))
+        else:
+            if body.get("op") != "stop":
+                self._json(400, {"ok": False, "error": "op must be stop"})
+                return
+            code, payload = self.signals.sunrise_stop()
+        self._json(code, payload)
 
     def _do_presets(self):
         body = self._body()
@@ -3827,6 +4008,10 @@ def main():
     engine.on_session_end = lamp.session_ended
     lamp.start()
     Handler.lamp = lamp
+    signals = Signals(state, link=lambda: engine.link,
+                      parked=lambda timeout=0.0: engine.idle.wait(timeout))
+    signals.start()
+    Handler.signals = signals
     Handler.state = state
     Handler.engine = engine
     Handler.cloud = CloudSession()

@@ -8,19 +8,27 @@
 Point a desk at it with its own settings file:
     python music_bulb_dash.py --port 8768 --ip 127.0.0.1 --settings /tmp/x.json
 
-It answers the miio hello on UDP 54321 (on --host only), the LAN API on TCP
-55443 (get_prop, the set_* commands the restore uses, and lamp mode's
-toggle and adjust_bright, with the real bulb's habits while it is off) and music mode
+It answers the miio hello on UDP 54321, the LAN API on TCP 55443 (get_prop
+and the set_* commands the restore and lamp mode use) and music mode
 (set_music: it connects back and reads the start_cf frames). Each frame it
 receives is printed, so white frames and early flashes can be seen.
 
-What the lamp does on its own follows the color5 as measured: cron_add /
-cron_get / cron_del and get_prop delayoff (the timer really switches it off;
---minute S shortens a minute for trying it), start_cf flows (a finite one
-runs its end action when its steps are done, stop_cf runs it at once, a
-one-step flow or set_scene replaces a flow without it), and set_default
-(kept, printed). With the lamp off start_cf does nothing and cron_add is
-refused with -5006, like the real one.
+What the lamp does on its own follows the color5 as measured:
+- Flows. start_cf is ignored by a lamp that is off, set_scene cf lights it.
+  A finite flow runs its end action when its steps are done: 0 puts back
+  the state from before the flow, 1 stays on the last step, 2 turns off.
+  Count 0 runs until something replaces it. stop_cf runs the end action at
+  once; a new flow, set_scene or a plain set replaces a flow without it.
+  More than 16 steps is refused with -5001. get_prop reports the pre-flow
+  state, `flowing` 1 and `flow_params` while one runs.
+- The off timer. cron_add / cron_get / cron_del and get_prop delayoff; the
+  timer really switches the lamp off (--minute S shortens a minute for
+  trying it) and is refused with -5006 while the lamp is off.
+- set_default is kept and printed. toggle and adjust_bright work as on the
+  lamp; an off lamp answers "ok" to set_bright / set_ct_abx / set_rgb /
+  set_hsv / set_adjust and changes nothing.
+
+--host ::1 or --port N runs a second fake beside one on 127.0.0.1:55443.
 """
 import argparse
 import json
@@ -42,147 +50,167 @@ ap.add_argument("--quiet", action="store_true", help="do not print every frame")
 ap.add_argument("--host", default="127.0.0.1",
                 help="address to listen on; ::1 runs a second fake beside one on "
                      "127.0.0.1 (point the desk at --ip localhost)")
+ap.add_argument("--port", type=int, default=55443,
+                help="LAN API port (default 55443); another port lets a second "
+                     "fake run beside one already on 55443, for a desk whose "
+                     "bulb port is patched to match")
 args = ap.parse_args()
 FAMILY = socket.AF_INET6 if ":" in args.host else socket.AF_INET
 
 state = {"power": "off", "bright": "30", "color_mode": "2", "rgb": "16711680",
-         "ct": "2700", "hue": "0", "sat": "100"}
-PROPS = ("power", "bright", "color_mode", "rgb", "ct", "hue", "sat")
+         "ct": "2700", "hue": "0", "sat": "100", "flowing": "0", "music_on": "0",
+         "flow_params": ""}
+LOOK = ("bright", "color_mode", "rgb", "ct", "hue", "sat")
 # a color5 that is off answers "ok" to these and changes nothing
 IGNORED_OFF = ("set_bright", "set_adjust", "set_ct_abx", "set_rgb", "set_hsv")
+MAX_STEPS = 16
 away = threading.Event()
 conns = []
-# what runs on the bulb with nothing connected
-alone = {"cron": None, "cron_min": 0, "flow": None, "flow_params": "", "default": None}
-alone_lock = threading.Lock()
+lock = threading.RLock()
+flow = {"timer": None, "action": 0, "before": None, "steps": None, "at": 0.0}
+cron = {"timer": None, "at": 0.0}
+default = {}
 
 
-def later(secs, fn, *a):
-    t = threading.Timer(secs, fn, a)
-    t.daemon = True
-    t.start()
+# -- flows --------------------------------------------------------------------
+def parse_flow(count, expr):
+    """-> [(ms, mode, value, bright)] or None if the firmware would refuse it."""
+    try:
+        nums = [int(x) for x in str(expr).split(",")]
+        count = int(count)
+    except (TypeError, ValueError):
+        return None
+    if len(nums) % 4 or not 1 <= len(nums) // 4 <= MAX_STEPS or count < 0:
+        return None
+    return [tuple(nums[i:i + 4]) for i in range(0, len(nums), 4)]
 
 
-class Refused(Exception):
-    pass
-
-
-def _flow_end(params, gen):
-    """A finite flow is done: run its end action unless it was replaced."""
-    with alone_lock:
-        if alone["flow"] != gen:
-            return
-        alone["flow"] = None
-    end_action(params)
-
-
-def end_action(params):
-    action = params[1]
-    if action == 2:
-        state["power"] = "off"
-        print("alone: flow ended, lamp off")
-    elif action == 1:
-        last = [int(x) for x in str(params[2]).split(",")][-4:]
-        apply_step(last)
-        print("alone: flow ended, stays", last)
-    else:
-        print("alone: flow ended, back to before")
-
-
-def apply_step(step):
+def step_state(step):
     _, mode, value, bright = step
+    out = {"bright": str(max(1, min(bright, 100)))} if bright > 0 else {}
     if mode == 1:
-        state.update(rgb=str(value), color_mode="1")
+        out.update(rgb=str(value), color_mode="1")
     elif mode == 2:
-        state.update(ct=str(value), color_mode="2")
-    if mode in (1, 2):
-        state["bright"] = str(bright)
+        out.update(ct=str(value), color_mode="2")
+    return out
 
 
-def stop_flow(run_end):
-    with alone_lock:
-        gen, alone["flow"] = alone["flow"], None
-        params = alone.get("flow_live")
-    if gen is not None and run_end and params:
-        end_action(params)
+def drop_flow():
+    """Forget a running flow without its end action (something replaced it)."""
+    with lock:
+        if flow["timer"]:
+            flow["timer"].cancel()
+        flow.update(timer=None, steps=None, before=None)
+        state.update(flowing="0", flow_params="")
 
 
-def cron_fire(gen):
-    with alone_lock:
-        if alone["cron"] != gen:
+def end_flow(now_step=None):
+    """The flow's end action. `now_step` is where a stop_cf caught it."""
+    with lock:
+        if flow["steps"] is None:
             return
-        alone["cron"] = None
-    stop_flow(run_end=False)
-    state["power"] = "off"
-    print("alone: cron fired, lamp off")
+        action, before, steps = flow["action"], flow["before"], flow["steps"]
+        drop_flow()
+        if action == 0:
+            state.update(before)
+        else:
+            state.update(step_state(now_step or steps[-1]))
+            if action == 2:
+                state["power"] = "off"
+    print(f"flow over (action {action}):", {k: state[k] for k in ("power",) + LOOK[:4]})
 
 
-def alone_call(method, params):
-    """-> result list, or None when the method is not one of these."""
-    on = state["power"] == "on"
-    if method == "cron_add":
-        if not on:
-            raise Refused
-        gen = object()
-        with alone_lock:
-            alone.update(cron=gen, cron_min=int(params[1]), cron_at=time.monotonic()
-                         + int(params[1]) * args.minute)
-        later(int(params[1]) * args.minute, cron_fire, gen)
-        return ["ok"]
-    if method == "cron_get":
-        with alone_lock:
-            if alone["cron"] is None:
-                return []
-            left = max(0, math.ceil((alone["cron_at"] - time.monotonic()) / args.minute))
-        return [{"type": 0, "delay": left, "mix": 0}]
-    if method == "cron_del":
-        with alone_lock:
-            alone["cron"] = None
-        return ["ok"]
-    if method == "start_cf":
-        if not on:
-            return ["ok"]                      # the real one says ok and does nothing
-        count, action, expr = params
-        steps = [int(x) for x in str(expr).split(",")]
-        steps = [steps[i:i + 4] for i in range(0, len(steps), 4)]
-        stop_flow(run_end=False)
-        gen = object()
-        with alone_lock:
-            alone.update(flow=gen, flow_live=params, flow_params=f"{count},{action},{expr}")
-        apply_step(steps[0])
+def run_flow(count, action, steps, light_it):
+    """Start a flow. A lamp that is off takes one only from set_scene."""
+    with lock:
+        if state["power"] != "on" and not light_it:
+            return                               # "ok", and nothing happens
+        before = {k: state[k] for k in ("power",) + LOOK}
+        drop_flow()
+        count = int(count)
+        run = [steps[i % len(steps)] for i in range(count)] if count else list(steps)
+        total = sum(s[0] for s in run) / 1000.0
+        flow.update(action=int(action), before=before, steps=run, at=time.monotonic())
+        state.update(power="on", flowing="1",
+                     flow_params=f"{count},{action}," + ",".join(
+                         str(x) for s in steps for x in s))
         if count:
-            total = sum(steps[i % len(steps)][0] for i in range(count)) / 1000
-            later(total, _flow_end, params, gen)
-        return ["ok"]
-    if method == "stop_cf":
-        stop_flow(run_end=True)
-        return ["ok"]
-    if method == "set_scene":
-        stop_flow(run_end=False)
-        return ["ok"]
-    if method == "set_default":
-        alone["default"] = {k: state[k] for k in PROPS if k != "power"}
-        print("alone: power-on look saved", alone["default"])
-        return ["ok"]
-    return None
+            flow["timer"] = threading.Timer(total, end_flow)
+            flow["timer"].daemon = True
+            flow["timer"].start()
+    print(f"flow: {len(run)} steps, " + (f"{total:.1f} s" if count else "forever")
+          + f", action {action}")
+
+
+def stop_flow():
+    """stop_cf: the end action now, from the step the flow has reached."""
+    with lock:
+        steps = flow["steps"]
+        if steps is None:
+            return
+        gone, here = (time.monotonic() - flow["at"]) * 1000.0, steps[-1]
+        if flow["timer"] is None:                # endless: where in the loop
+            gone %= max(1, sum(s[0] for s in steps))
+        for s in steps:
+            if gone < s[0]:
+                here = s
+                break
+            gone -= s[0]
+        end_flow(here)
+
+
+# -- the off timer ------------------------------------------------------------
+class Refused(Exception):
+    code = -5006
+
+
+def cron_fire():
+    with lock:
+        cron["timer"] = None
+        drop_flow()
+        state["power"] = "off"
+    print("cron fired, lamp off")
+
+
+def cron_left():
+    with lock:
+        if cron["timer"] is None:
+            return 0
+        return max(0, math.ceil((cron["at"] - time.monotonic()) / args.minute))
+
+
+def cron_del():
+    with lock:
+        if cron["timer"]:
+            cron["timer"].cancel()
+        cron["timer"] = None
+
+
+def cron_add(minutes):
+    with lock:
+        if state["power"] != "on":
+            raise Refused
+        cron_del()
+        cron["at"] = time.monotonic() + minutes * args.minute
+        cron["timer"] = threading.Timer(minutes * args.minute, cron_fire)
+        cron["timer"].daemon = True
+        cron["timer"].start()
 
 
 def prop(name):
     if name == "delayoff":
-        r = alone_call("cron_get", [0])
-        return str(r[0]["delay"]) if r else "0"
-    if name == "flowing":
-        return "1" if alone["flow"] is not None else "0"
-    if name == "flow_params":
-        return alone["flow_params"]
-    if name == "music_on":
-        return "1" if any(t.name == "music" for t in threading.enumerate()) else "0"
+        return str(cron_left())
     return state.get(name, "")
 
 
+# -- the wire -----------------------------------------------------------------
 def hello():
     s = socket.socket(FAMILY, socket.SOCK_DGRAM)
-    s.bind((args.host, 54321))
+    try:
+        s.bind((args.host, 54321))
+    except OSError:
+        print("UDP 54321 is taken (another fake?): not answering the hello")
+        return
     while True:
         data, addr = s.recvfrom(64)
         if data[:4] == bytes.fromhex("21310020") and not away.is_set():
@@ -222,11 +250,92 @@ def music(host, port):
             while b"\r\n" in buf:
                 line, buf = buf.split(b"\r\n", 1)
                 line = line.strip()
-                if line and not args.quiet:
-                    msg = json.loads(line)
+                if not line:
+                    continue
+                msg = json.loads(line)
+                if not args.quiet:
                     print(f"{time.monotonic():.3f}", msg["method"], msg["params"])
+                p = msg.get("params", [])
+                # a long flow in music mode is an alert (frames are one-step flows)
+                if msg["method"] == "start_cf" and len(p) == 3 and int(p[0]) > 1:
+                    steps = parse_flow(p[0], p[2])
+                    if steps:
+                        run_flow(p[0], p[1], steps, light_it=False)
     except OSError:
         return
+    finally:
+        state["music_on"] = "0"
+
+
+def handle(method, params):
+    """One LAN API command. -> result list. Raises Refused or ValueError."""
+    on = state["power"] == "on"
+    if method == "get_prop":
+        return [prop(p) for p in params]
+    if method in ("start_cf", "set_scene"):
+        kind = "cf" if method == "start_cf" else (params[0] if params else None)
+        cf = params if method == "start_cf" else params[1:]
+        if kind == "cf":
+            steps = parse_flow(cf[0], cf[2]) if len(cf) == 3 else None
+            if steps is None:
+                raise ValueError
+            run_flow(cf[0], cf[1], steps, light_it=method == "set_scene")
+        elif kind == "ct":
+            drop_flow()
+            state.update(power="on", ct=str(cf[0]), bright=str(cf[1]), color_mode="2")
+        elif kind == "color":
+            drop_flow()
+            state.update(power="on", rgb=str(cf[0]), bright=str(cf[1]), color_mode="1")
+        else:
+            raise ValueError
+    elif method == "stop_cf":
+        stop_flow()
+    elif method == "cron_add":
+        cron_add(int(params[1]))
+    elif method == "cron_get":
+        left = cron_left()
+        return [{"type": 0, "delay": left, "mix": 0}] if left else []
+    elif method == "cron_del":
+        cron_del()
+    elif method == "set_default":
+        default.update({k: state[k] for k in LOOK})
+        print("power-on look saved", default)
+    elif method == "set_power":
+        if params[0] == "off":
+            drop_flow()
+        state["power"] = params[0]
+    elif method == "toggle":
+        if on:
+            drop_flow()
+        state["power"] = "off" if on else "on"
+    elif method == "adjust_bright":
+        # as measured on the color5: an off lamp comes on at the step, and
+        # going under 1 switches it off
+        if not on:
+            if params[0] > 0:
+                state.update(power="on", bright=str(min(100, params[0])))
+        elif int(state["bright"]) + params[0] < 1:
+            drop_flow()
+            state["power"] = "off"
+        else:
+            state["bright"] = str(min(100, int(state["bright"]) + params[0]))
+    elif method in IGNORED_OFF and not on:
+        pass                                    # answered "ok", changes nothing
+    elif method == "set_bright":
+        state["bright"] = str(params[0])
+    elif method == "set_ct_abx":
+        drop_flow()
+        state.update(ct=str(params[0]), color_mode="2")
+    elif method == "set_rgb":
+        drop_flow()
+        state.update(rgb=str(params[0]), color_mode="1")
+    elif method == "set_music" and params and params[0] == 0:
+        state["music_on"] = "0"
+    elif method == "set_music" and params and params[0] == 1:
+        state.update(power="on", music_on="1")
+        threading.Thread(target=music, args=(params[1], params[2]), daemon=True,
+                         name="music").start()
+    return ["ok"]
 
 
 def control(c):
@@ -246,61 +355,33 @@ def control(c):
                     continue
                 msg = json.loads(line)
                 method, params = msg["method"], msg.get("params", [])
-                result = ["ok"]
                 try:
-                    alone_result = alone_call(method, params)
+                    with lock:
+                        reply = {"id": msg["id"], "result": handle(method, params)}
+                    note = ""
                 except Refused:
-                    print("control:", method, params, "-> illegal request")
-                    c.sendall((json.dumps({"id": msg["id"], "error": {
-                        "code": -5006, "message": "illegal request"}}) + "\r\n").encode())
-                    continue
-                if alone_result is not None:
-                    result = alone_result
-                elif method == "get_prop":
-                    result = [prop(p) for p in params]
-                elif method == "set_power":
-                    state["power"] = params[0]
-                    if params[0] == "off":
-                        stop_flow(run_end=False)
-                elif method == "toggle":
-                    state["power"] = "off" if state["power"] == "on" else "on"
-                elif method == "adjust_bright":
-                    # as measured on the color5: an off lamp comes on at the
-                    # step, and going under 1 switches it off
-                    if state["power"] != "on":
-                        if params[0] > 0:
-                            state.update(power="on", bright=str(min(100, params[0])))
-                    elif int(state["bright"]) + params[0] < 1:
-                        state["power"] = "off"
-                    else:
-                        state["bright"] = str(min(100, int(state["bright"]) + params[0]))
-                elif method in IGNORED_OFF and state["power"] != "on":
-                    pass                        # answered "ok", changes nothing
-                elif method == "set_bright":
-                    state["bright"] = str(params[0])
-                elif method == "set_ct_abx":
-                    state.update(ct=str(params[0]), color_mode="2")
-                elif method == "set_rgb":
-                    state.update(rgb=str(params[0]), color_mode="1")
-                elif method == "set_music" and params and params[0] == 1:
-                    state["power"] = "on"
-                    threading.Thread(target=music, args=(params[1], params[2]), daemon=True,
-                                     name="music").start()
-                print("control:", method, params)
-                c.sendall((json.dumps({"id": msg["id"], "result": result}) + "\r\n").encode())
+                    reply = {"id": msg["id"], "error": {"code": -5006,
+                                                        "message": "illegal request"}}
+                    note = "-> illegal request"
+                except (ValueError, IndexError, TypeError):
+                    reply = {"id": msg["id"], "error": {"code": -5001,
+                                                        "message": "invalid params"}}
+                    note = "-> invalid params"
+                print("control:", method, params, note)
+                c.sendall((json.dumps(reply) + "\r\n").encode())
     except OSError:
         return
 
 
 threading.Thread(target=hello, daemon=True).start()
-print(f"fake bulb {args.did:08x} on {args.host} ({args.mode})")
+print(f"fake bulb {args.did:08x} on {args.host}:{args.port} ({args.mode})")
 while True:
     if args.mode == "refuse":
         time.sleep(3600)
         continue
     srv = socket.socket(FAMILY, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.host, 55443))
+    srv.bind((args.host, args.port))
     srv.listen(8)
     srv.settimeout(0.5)
     while not away.is_set():

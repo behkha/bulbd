@@ -1220,53 +1220,101 @@ class Sender(threading.Thread):
     set, and whoever owns the bulb (Link) decides whether to reconnect. It
     used to retry forever on the same Bulb, whose socket yeelight had already
     thrown away, and each retry opened another connection to a bulb that was
-    struggling."""
+    struggling.
+
+    One slot holds the newest frame not yet sent (latest wins) and another
+    a flow (an alert); the thread sleeps on a condition between them, so a
+    stopped desk does not wake. While a flow runs the frame slot is kept,
+    not sent: the flow ends with the bulb back on the last frame sent, then
+    the newest frame put meanwhile goes out - or, if none was, the last one
+    again, which also finishes a smooth ramp the flow cut short - and the
+    frame after that waits LED_GAP."""
+
+    HOLD_MARGIN = 0.08          # s: the flow starts ~half an RTT after it is sent
 
     def __init__(self, bulb):
         super().__init__(daemon=True)
         self.bulb = bulb
-        self.box = queue.Queue(maxsize=1)          # latest value wins
         self.alive = True
         self.lost = threading.Event()
         self.error = None
+        self._cv = threading.Condition()
+        self._frame = None                         # newest unsent (frame, sudden, duration)
+        self._flow = None                          # (params, ms)
+        self._last = None                          # the last frame on the wire
+        self.hold_until = 0.0                      # frames wait until then
+        self._gap_until = 0.0                      # spacing after a released frame
 
     def put(self, hsv, sudden, duration=40):
         """Queue one frame. `duration` is the bulb-side ramp for smooth sends;
         set it to the gap between frames so consecutive colours join up."""
-        try:
-            self.box.get_nowait()                  # drop the stale frame
-        except queue.Empty:
-            pass
-        try:
-            self.box.put_nowait((hsv, sudden, duration))
-        except queue.Full:
-            pass
+        with self._cv:
+            self._frame = (hsv, sudden, duration)  # drop the stale frame
+            self._cv.notify()
+
+    def flow(self, params, ms):
+        """Run a `start_cf` flow (params = [count, action, expression]) that
+        lasts `ms`, and hold the loop's frames until it has ended. With end
+        action 0 the bulb itself returns to the last frame first, so the loop
+        carries on where it was."""
+        with self._cv:
+            self._flow = (params, ms)
+            self._cv.notify()
 
     def stop(self, timeout=2.0):
-        """End the thread. It blocks on the queue rather than polling it, so
-        it needs a sentinel to notice."""
-        self.alive = False
-        try:
-            self.box.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.box.put_nowait(None)
-        except queue.Full:
-            pass
+        """End the thread, waking it if it sleeps."""
+        with self._cv:
+            self.alive = False
+            self._cv.notify()
         # wait out a send already in flight: a set_hsv landing after
         # release_bulb() would paint over the colour it just restored
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout)
 
-    def run(self):
+    def _next(self):
+        """Wait for something to do. -> ("flow", (params, ms)), ("frame",
+        item), or None to end. Called with the condition held."""
         while self.alive:
-            item = self.box.get()                  # no wake-ups between frames
-            if item is None:
+            if self._flow is not None:
+                flow, self._flow = self._flow, None
+                return "flow", flow
+            now = time.monotonic()
+            if now < self.hold_until:
+                self._cv.wait(self.hold_until - now)
+                continue
+            if self.hold_until:                    # the flow is over: release
+                self.hold_until = 0.0
+                item = self._frame or self._last
+                self._frame = None
+                if item is not None:
+                    self._gap_until = now + LED_GAP
+                    return "frame", item
+                continue
+            if self._frame is not None:
+                if now < self._gap_until:
+                    self._cv.wait(self._gap_until - now)
+                    continue
+                item, self._frame = self._frame, None
+                return "frame", item
+            self._cv.wait()                        # no wake-ups between frames
+        return None
+
+    def run(self):
+        while True:
+            with self._cv:
+                job = self._next()
+            if job is None:
                 break
-            frame, sudden, duration = item
+            kind, what = job
             try:
-                send_frame(self.bulb, frame, sudden, duration)
+                if kind == "flow":
+                    params, ms = what
+                    self.bulb.send_command("start_cf", params)
+                    with self._cv:
+                        self.hold_until = time.monotonic() + ms / 1000.0 + self.HOLD_MARGIN
+                else:
+                    send_frame(self.bulb, *what)
+                    self._last = what
             except Exception as exc:
                 self.error = exc
                 self.lost.set()
@@ -1942,6 +1990,14 @@ class Link:
         if self.sender is not None:
             self.sender.put(*a, **kw)
 
+    def flow(self, params, ms):
+        """An alert on the session's own connection. -> False with no sender."""
+        sender = self.sender
+        if sender is None or sender.lost.is_set():
+            return False
+        sender.flow(params, ms)
+        return True
+
     def _try(self):
         """One hello, maybe a search, one open. -> bulb or BulbUnreachable."""
         self.moved_note = None
@@ -2334,6 +2390,47 @@ def run_fusion(args):
         link.close(restore=args.restore and not args.leave, then=leave_commands(args))
 
 
+def run_alert(args):
+    """--alert: one pulse. A running desk is asked first (POST /api/alert),
+    because only the desk can hold a session's frames while the pulse runs;
+    with no desk answering, one short plain connection to --ip."""
+    import urllib.error
+    import urllib.request
+
+    from lamp_signals import alert_flow, alert_lamp, clean_alert
+
+    body = {"color": args.alert, "pulses": args.pulses, "speed": args.speed}
+    picked, error = clean_alert(body)
+    if error:
+        sys.exit(f"--alert: {error}")
+    if args.desk:
+        req = urllib.request.Request(args.desk.rstrip("/") + "/api/alert",
+                                     data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=4) as r:
+                reply = json.loads(r.read() or b"{}")
+            print(f"pulsed through the desk ({reply.get('via')})")
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                reason = json.loads(exc.read()).get("error")
+            except Exception:
+                reason = exc.reason
+            # a desk that has no bulb yet cannot pulse one; --ip can
+            if not (args.ip and exc.code == 409 and reason == "no bulb address"):
+                sys.exit(f"the desk refused the alert: {reason}")
+        except (urllib.error.URLError, OSError):
+            pass                                  # no desk: go to the lamp
+    if not args.ip:
+        sys.exit("no desk answered at --desk; pass --ip to reach the bulb directly")
+    try:
+        alert_lamp(args.ip, alert_flow(*picked))
+    except Exception as exc:
+        sys.exit(f"the bulb did not take the alert: {exc}")
+    print(f"pulsed {args.ip}")
+
+
 def capture_label(grab):
     """"ScreenCaptureKit" / "mss", and why not the stream if it was wanted."""
     if grab.backend == "sck":
@@ -2428,6 +2525,16 @@ def main():
                         "over this many seconds instead of snapping "
                         "(0 = snap, the default; try 1.5)")
 
+    a = p.add_argument_group("alert")
+    a.add_argument("--alert", metavar="COLOR",
+                   help="pulse the lamp in this colour (#rrggbb or red, orange, "
+                        "green, blue, purple, white), then put back what it showed")
+    a.add_argument("--pulses", type=int, default=2, help="1-5 (default 2)")
+    a.add_argument("--speed", choices=("slow", "normal", "fast"), default="normal")
+    a.add_argument("--desk", default="http://127.0.0.1:8765", metavar="URL",
+                   help="a running desk to send the alert through (default "
+                        "%(default)s; '' to always go to --ip)")
+
     g = p.add_argument_group("screen mode")
     g.add_argument("--screen", action="store_true",
                    help="follow the dominant screen colour instead of audio")
@@ -2488,6 +2595,10 @@ def main():
         if not (args.ip and args.token):
             p.error("--enable-lan needs --ip and --token")
         enable_lan(args.ip, args.token)
+        return
+
+    if args.alert:
+        run_alert(args)
         return
 
     if not args.ip:
