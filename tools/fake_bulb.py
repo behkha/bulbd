@@ -12,6 +12,12 @@ It answers the miio hello on UDP 54321 (127.0.0.1 only), the LAN API on TCP
 55443 (get_prop and the set_* commands the restore uses) and music mode
 (set_music: it connects back and reads the start_cf frames). Each frame it
 receives is printed, so white frames and early flashes can be seen.
+
+Flows run the way tools/check_flow.py measured the color5: start_cf runs
+its count of steps on this process's clock, `flowing` reads 1 meanwhile and
+the lamp stays on the last step (action 1); a later start_cf, a set_* or
+stop_cf replaces it. A flow of more than one step is printed as `flow`, with
+its length, so bulb-timed beats and drop effects show apart from frames.
 """
 import argparse
 import json
@@ -34,6 +40,58 @@ state = {"power": "off", "bright": "30", "color_mode": "2", "rgb": "16711680",
 PROPS = ("power", "bright", "color_mode", "rgb", "ct", "hue", "sat")
 away = threading.Event()
 conns = []
+flow_lock = threading.Lock()
+flow_gen = [0]                       # bumped by anything that replaces a flow
+state["flowing"] = "0"
+
+
+def end_flow():
+    with flow_lock:
+        flow_gen[0] += 1
+        state["flowing"] = "0"
+
+
+def start_flow(params):
+    """start_cf [count, action, "ms, mode, value, bright, ..."]: run it."""
+    count, action, expr = int(params[0]), int(params[1]), str(params[2])
+    nums = [int(x) for x in expr.replace(" ", "").split(",") if x]
+    steps = [tuple(nums[i:i + 4]) for i in range(0, len(nums) - 3, 4)]
+    with flow_lock:
+        flow_gen[0] += 1
+        gen = flow_gen[0]
+        state["flowing"] = "1"
+
+    def run():
+        n = 0
+        while count == 0 or n < count:
+            ms, mode, value, bright = steps[n % len(steps)]
+            time.sleep(ms / 1000.0)
+            with flow_lock:
+                if flow_gen[0] != gen:
+                    return
+                if mode == 1:
+                    state.update(rgb=str(value), color_mode="1")
+                elif mode == 2:
+                    state.update(ct=str(value), color_mode="2")
+                if mode in (1, 2) and bright > 0:
+                    state["bright"] = str(bright)
+            n += 1
+        with flow_lock:
+            if flow_gen[0] == gen:
+                state["flowing"] = "0"
+                if action == 2:
+                    state["power"] = "off"
+    threading.Thread(target=run, daemon=True).start()
+    return sum(steps[i % len(steps)][0] for i in range(count)) if count else 0
+
+
+def act(method, params):
+    """What any connection's command does to the lamp's state."""
+    if method == "start_cf" and len(params) >= 3:
+        return start_flow(params)
+    if method == "stop_cf" or method.startswith("set_"):
+        end_flow()
+    return None
 
 
 def hello():
@@ -78,8 +136,15 @@ def music(host, port):
             while b"\r\n" in buf:
                 line, buf = buf.split(b"\r\n", 1)
                 line = line.strip()
-                if line and not args.quiet:
-                    msg = json.loads(line)
+                if not line:
+                    continue
+                msg = json.loads(line)
+                ms = act(msg["method"], msg.get("params", []))
+                if args.quiet:
+                    continue
+                if msg["method"] == "start_cf" and msg["params"][0] != 1:
+                    print(f"{time.monotonic():.3f} flow {ms} ms", msg["params"])
+                else:
                     print(f"{time.monotonic():.3f}", msg["method"], msg["params"])
     except OSError:
         return
@@ -103,6 +168,7 @@ def control(c):
                 msg = json.loads(line)
                 method, params = msg["method"], msg.get("params", [])
                 result = ["ok"]
+                act(method, params)
                 if method == "get_prop":
                     result = [state.get(p, "") for p in params]
                 elif method == "set_power":

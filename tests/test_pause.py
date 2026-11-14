@@ -114,9 +114,8 @@ def test_pause_is_a_saved_setting_and_paused_is_not():
     assert dash.clean_patch({"pause": -3}, snap) == {"pause": 0}
     assert dash.clean_patch({"pause": "8"}, snap) == {}
     assert "pause" in dash.SAVED_KEYS and "paused" not in dash.SAVED_KEYS
-    # a fader like the others: a preset carries it, and every built-in leaves it off
-    assert "pause" in dash.LOOK_KEYS
-    assert all(p["look"]["pause"] == 0 for p in dash.BUILTIN_PRESETS)
+    # the viewer's habit, like Beat sync: applying Cinema must not switch it off
+    assert "pause" not in dash.LOOK_KEYS
 
 
 class StillCapture:

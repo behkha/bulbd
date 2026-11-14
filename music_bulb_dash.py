@@ -90,14 +90,15 @@ NUMERIC = {                         # key: (low, high, type) - the faders' range
 }
 MODES = ("music", "screen", "fusion")
 # What a preset holds: how the light looks. Never the address, input, display
-# or area (they describe the room, not the look), and never Beat sync, which
-# is set once for the network and speakers.
+# or area (they describe the room, not the look), never Beat sync, which
+# is set once for the network and speakers, and never the pause light, a
+# habit of the viewer's that picking Cinema must not switch off.
 LOOK_KEYS = ("mode", "auto", "palette", "calm", "sensitivity", "gamma", "punch",
-             "fps", "fade", "screen_fps", "screen_gamma", "min_sat", "sat_boost", "pause")
+             "fps", "fade", "screen_fps", "screen_gamma", "min_sat", "sat_boost")
 LOOK_DEFAULTS = {"mode": "music", "auto": False, "palette": "auto", "calm": False,
                  "sensitivity": 1.4, "gamma": 1.9, "punch": 0.78, "fps": 25,
                  "fade": 0.0, "screen_fps": 10, "screen_gamma": 0.75,
-                 "min_sat": 55.0, "sat_boost": 1.35, "pause": 0}
+                 "min_sat": 55.0, "sat_boost": 1.35}
 # Built-in looks. Each sets every look key, so applying one always gives the
 # same light whatever came before; keys its mode does not use stay at the
 # defaults above.
@@ -1544,6 +1545,7 @@ input[type=range].hue::-webkit-slider-thumb,input[type=range].sat::-webkit-slide
 .rows{display:grid;gap:4px}
 .r{display:grid;grid-template-columns:150px 1fr 54px;gap:16px;align-items:center;min-height:34px}
 .r output{text-align:right;color:var(--dim);font-size:13.5px}
+.r input[type=checkbox]{width:16px;height:16px;margin:0;justify-self:start;accent-color:var(--ink);cursor:pointer}
 @media (max-width:520px){.r{grid-template-columns:110px 1fr 46px;gap:10px}}
 input[type=range]{--p:50%;-webkit-appearance:none;appearance:none;width:100%;height:20px;margin:0;background:transparent;cursor:pointer}
 input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;
@@ -1738,6 +1740,10 @@ td .mini+.mini{margin-left:6px}
         <input type="range" id="fade" min="0" max="6" step="0.1" value="0"><output id="v-fade"></output></div>
       <div class="r only-music"><label for="lead">Beat sync</label>
         <input type="range" id="lead" min="0" max="250" step="5" value="80"><output id="v-lead"></output></div>
+      <div class="r only-music"><label for="bclock">Bulb clock</label>
+        <input type="checkbox" id="bclock"><output></output></div>
+      <div class="r only-music"><label for="drops">Drops</label>
+        <input type="checkbox" id="drops"><output></output></div>
       <div class="r only-screen no-fusion"><label for="sgamma">Dark lift</label>
         <input type="range" id="sgamma" min="0.4" max="1.6" step="0.05" value="0.75"><output id="v-sgamma"></output></div>
       <div class="r only-screen"><label for="minsat">Colour floor</label>
@@ -1746,6 +1752,8 @@ td .mini+.mini{margin-left:6px}
         <input type="range" id="sboost" min="0.8" max="2" step="0.05" value="1.35"><output id="v-sboost"></output></div>
       <div class="r only-screen"><label for="sfps">Capture rate</label>
         <input type="range" id="sfps" min="4" max="30" step="1" value="10"><output id="v-sfps"></output></div>
+      <div class="r only-screen"><label for="pause">Pause light</label>
+        <input type="range" id="pause" min="0" max="120" step="1" value="0"><output id="v-pause"></output></div>
     </div>
 
     <!-- ============================== SETUP ============================== -->
@@ -1872,12 +1880,13 @@ async function post(path, body){
 const KEYS = {sens:'sensitivity', gamma:'gamma', punch:'punch', fps:'fps',
               lead:'lead', fade:'fade',
               sgamma:'screen_gamma', minsat:'min_sat', sboost:'sat_boost',
-              sfps:'screen_fps'};
+              sfps:'screen_fps', pause:'pause'};
 function fmt(id, v){
   v=+v;
   if(id==='fps' || id==='sfps') return v+'/s';
   if(id==='fade') return v ? v.toFixed(1)+' s' : 'Off';
   if(id==='lead') return v ? v+' ms' : 'Off';
+  if(id==='pause') return v ? v+' s' : 'Off';
   if(id==='minsat') return String(v);
   return v.toFixed(2);
 }
@@ -1938,6 +1947,8 @@ addEventListener('hashchange', ()=>showDeck(location.hash.slice(1)));
 $('monitor').addEventListener('change',e=>send({monitor:+e.target.value}));
 $('mic').addEventListener('change',e=>send({mic:e.target.value || null}));
 $('calm').addEventListener('change',e=>send({calm:e.target.checked}));
+$('bclock').addEventListener('change',e=>send({bulb_clock:e.target.checked}));
+$('drops').addEventListener('change',e=>send({drops:e.target.checked}));
 $('auto').addEventListener('change',e=>send({auto:e.target.checked}));
 $('go').addEventListener('click',()=>{
   const on = $('go').dataset.on === 'true';
@@ -2466,6 +2477,8 @@ async function poll(){
     if(Date.now() > holdUntil){
       $('calm').checked = s.calm;
       $('auto').checked = s.auto;
+      $('bclock').checked = s.bulb_clock;
+      $('drops').checked = s.drops;
       renderPalettes(s);
       [...$('modes').children].forEach(c=>{
         c.setAttribute('aria-pressed', c.dataset.mode===mode);

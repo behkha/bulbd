@@ -25,9 +25,9 @@ def test_a_preset_holds_the_look_and_nothing_about_the_room():
     look = set(dash.LOOK_KEYS)
     assert look == set(dash.LOOK_DEFAULTS)
     assert look <= set(dash.SAVED_KEYS)
-    assert not look & {"ip", "did", "mic", "monitor", "region", "presets", "lead"}
-    # every fader but Beat sync, and the switches added with Auto
-    assert set(dash.NUMERIC) - {"lead"} <= look and {"auto", "mode"} <= look
+    assert not look & {"ip", "did", "mic", "monitor", "region", "presets", "lead", "pause"}
+    # every fader but Beat sync and the pause light, and the switches added with Auto
+    assert set(dash.NUMERIC) - {"lead", "pause"} <= look and {"auto", "mode"} <= look
 
 
 @pytest.mark.parametrize("preset", dash.BUILTIN_PRESETS, ids=lambda p: p["name"])
