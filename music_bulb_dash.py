@@ -1004,6 +1004,7 @@ class SleepTimer:
 # lamp mode - the desk as a plain lamp while no session runs
 # ---------------------------------------------------------------------------
 DAY_TICK = 300                      # s between Follow the day's checks
+FLOW_RETRY = 5                      # s: one early look after meeting a flow
 DAY_STEP = 50                       # K: the curve moves in steps this big
 DAY_UP = 60                         # min: night to day, from the morning time
 DAY_DOWN = 120                      # min: day to night, from the evening time
@@ -1133,6 +1134,7 @@ class LampMode(threading.Thread):
         self.fading_until = 0.0                 # clock() until that send has landed
         self.found_off = False
         self.searched = False                   # one search per unreachable spell
+        self.flow_seen = False                  # the last tick met a flow
         # True while something else has the lamp on purpose (Focus, the
         # sunrise): the curve waits and is not mistaken for a hand change
         self.yield_to = lambda: False
@@ -1256,10 +1258,15 @@ class LampMode(threading.Thread):
                 self.wake.clear()
                 continue
             try:
-                self.tick()
+                what = self.tick()
             except Exception:
-                pass                            # the lamp may be away; next tick
-            self.wake.wait(DAY_TICK)
+                what = None                     # the lamp may be away; next tick
+            # a pulse or a cancelled fade is over in seconds, so the first
+            # flow seen gets one early look; an On stop look runs on, and is
+            # then only met on the usual tick
+            soon = what == "flow" and not self.flow_seen
+            self.flow_seen = what == "flow"
+            self.wake.wait(FLOW_RETRY if soon else DAY_TICK)
             self.wake.clear()
 
     def tick(self):
@@ -3390,17 +3397,17 @@ $('sat').addEventListener('change', ()=>{
 });
 $('alm').addEventListener('click', ()=>$('sunrise').scrollIntoView({behavior:'smooth', block:'center'}));
 $('sstop').addEventListener('click', async ()=>{ await post('/api/sunrise', {op:'stop'}); poll(); });
-const clock = n => String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+const mmss = n => String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
 function paintSignals(s){
   const f = s.focus || {phase:'idle'};
   const active = f.phase!=='idle';
   // Focus whites would fight a session's frames: it is a stopped-desk tool
   $('focus').hidden = s.running;
-  $('fclock').textContent = clock(active ? f.left : s.focus_work*60);
+  $('fclock').textContent = mmss(active ? f.left : s.focus_work*60);
   $('fphase').textContent = active ? (f.phase==='work' ? 'Work' : 'Break')+' · '+f.round : '';
   $('fgo').textContent = !active ? 'Start' : f.paused ? 'Resume' : 'Pause';
   $('freset').disabled = !active;
-  const at = clock(s.sunrise_at);
+  const at = mmss(s.sunrise_at);
   $('alm').hidden = !s.sunrise_on;
   $('almt').textContent = at;
   $('sstop').hidden = !(s.sunrise_ramping && !s.running);

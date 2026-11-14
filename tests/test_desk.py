@@ -167,3 +167,33 @@ def test_engine_run_turns_bulb_unreachable_into_a_notice(engine, monkeypatch):
     snap = st.snapshot()
     assert snap["running"] is False and snap["notice"]["kind"] == "err"
     assert "switch it off and on at the wall" in snap["notice"]["text"]
+
+
+# ------------------------------------------------------------ the page
+def page_script():
+    a = dash.PAGE.index("<script>") + len("<script>")
+    return dash.PAGE[a:dash.PAGE.index("</script>", a)]
+
+
+def test_the_page_script_declares_each_top_level_name_once():
+    """One <script>, many features: a second `const clock` is a SyntaxError
+    that stops the whole page, and nothing else in the suite runs the page."""
+    import re
+    from collections import Counter
+    names = re.findall(r"^(?:const|let|class|function\*?|async function)\s+([A-Za-z_$][\w$]*)",
+                       page_script(), re.M)
+    assert len(names) > 50
+    assert {k: n for k, n in Counter(names).items() if n > 1} == {}
+
+
+def test_the_page_script_parses():
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    js = page_script()
+    for key in ("__PRESETS__", "__LAMP__", "__SLEEP_STEPS__"):
+        js = js.replace(key, "{}")
+    done = subprocess.run([node, "--check", "-"], input=js, text=True, capture_output=True)
+    assert done.returncode == 0, done.stderr[:600]
