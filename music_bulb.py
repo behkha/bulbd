@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import queue
 import socket
 import sys
@@ -1359,6 +1360,11 @@ def read_lamp(ip, **kw):
     """The lamp's power, brightness and colour as ints (power as "on"/"off"),
     or None if the bulb did not say."""
     (values,) = lamp_call(ip, [("get_prop", list(LAMP_PROPS))], **kw)
+    return lamp_state(values)
+
+
+def lamp_state(values):
+    """A get_prop answer for LAMP_PROPS as read_lamp() returns it."""
     raw = dict(zip(LAMP_PROPS, values or []))
 
     def num(key):
@@ -1372,6 +1378,149 @@ def read_lamp(ip, **kw):
     saved = {"power": raw["power"]}
     saved.update({k: num(k) for k in LAMP_PROPS[1:]})
     return saved
+
+
+# ---------------------------------------------------------------------------
+# lamp mode - the bulb as a plain lamp while no session runs
+# ---------------------------------------------------------------------------
+# Each action is one short connection of its own: the commands, then a
+# get_prop on the same socket so the caller sees what the lamp did, then
+# close. Nothing is held between actions, so an idle desk keeps no slot.
+LAMP_FADE_MS = 400                    # power, temperature and brightness changes
+CT_LIMITS = (2700, 6500)              # the white range the desk offers
+LAMP_OPS = ("on", "off", "toggle", "up", "down")
+# Up and down are adjust_bright by this many percent. Measured on the color5:
+# it is exact (50 +10 -> 60, -20 -> 40), turns an off lamp on at 10%, and
+# turns it off when it would go under 1. set_adjust "increase"/"decrease"
+# jumps between coarse levels instead (60 -> 100 -> 40 -> 10), so not that.
+# While the lamp is off, set_bright / set_ct_abx / set_adjust are answered
+# "ok" and ignored.
+LAMP_STEP = 10
+
+
+@contextlib.contextmanager
+def lamp_link(ip, timeout=2.0, connect=socket.create_connection):
+    """One plain connection for a few lamp_call() exchanges, always closed:
+    `with lamp_link(ip) as call: call([(method, params), ...])`."""
+    sock = connect((ip, LAMP_PORT), timeout)
+    try:
+        yield lambda commands: lamp_call(ip, commands, timeout=timeout, sock=sock)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def lamp_send(ip, commands=(), **kw):
+    """Send `commands` on a connection of its own, read the lamp back on it
+    and close. -> the lamp's state as read_lamp() gives it (None if the bulb
+    answered nonsense). With no commands it is just a read."""
+    with lamp_link(ip, **kw) as call:
+        results = call(list(commands) + [("get_prop", list(LAMP_PROPS))])
+    return lamp_state(results[-1])
+
+
+def lamp_commands(op=None, ct=None, bright=None, ms=LAMP_FADE_MS):
+    """The LAN commands for a lamp action. `op` is one of LAMP_OPS: up and
+    down are adjust_bright and toggle is toggle, which need no current
+    value, so a hotkey costs one exchange. `ct` and `bright` are clamped."""
+    cmds = []
+    if op in ("on", "off"):
+        cmds.append(("set_power", [op, "smooth", ms]))
+    elif op == "toggle":
+        cmds.append(("toggle", []))
+    elif op in ("up", "down"):
+        cmds.append(("adjust_bright", [LAMP_STEP if op == "up" else -LAMP_STEP, ms]))
+    elif op is not None:
+        raise ValueError(f"unknown lamp action {op!r}")
+    if ct is not None:
+        cmds.append(("set_ct_abx", [int(max(CT_LIMITS[0], min(ct, CT_LIMITS[1]))), "smooth", ms]))
+    if bright is not None:
+        cmds.append(("set_bright", [int(max(1, min(bright, 100))), "smooth", ms]))
+    return cmds
+
+
+def describe_lamp(lamp):
+    """One line for the CLI: "on 3400 K 62%", "on colour 62%" or "off"."""
+    if not lamp:
+        return "no answer"
+    if lamp["power"] != "on":
+        return "off"
+    look = f"{lamp['ct']} K" if lamp.get("color_mode") == 2 else "colour"
+    return f"on {look} {lamp.get('bright')}%"
+
+
+def settings_path():
+    """Where the desk keeps its settings: the platform's per-user config dir."""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "bulbd", "settings.json")
+
+
+DESK_URL = "http://127.0.0.1:8765"
+
+
+def lamp_main(argv, urlopen=None, send=None):
+    """`bulbd lamp up|down|toggle|on|off`, for a hotkey. A running desk gets
+    it first (POST /api/lamp), so a session and Follow the day know about
+    it; with no desk it is one plain connection to the saved address."""
+    import urllib.error
+    import urllib.request
+
+    p = argparse.ArgumentParser(prog="bulbd lamp",
+                                description="the bulb as a plain lamp, for hotkeys")
+    p.add_argument("op", choices=LAMP_OPS)
+    p.add_argument("--ip", help="bulb address (default: the desk's saved one)")
+    p.add_argument("--desk", default=DESK_URL, metavar="URL",
+                   help="a running desk to go through (default: %(default)s; "
+                        "'' to talk to the bulb directly)")
+    p.add_argument("--settings", default=settings_path(), metavar="PATH",
+                   help="the desk's settings file, for the address")
+    args = p.parse_args(argv)
+    urlopen = urlopen or urllib.request.urlopen
+    send = send or lamp_send
+
+    if args.desk and not args.ip:
+        req = urllib.request.Request(
+            args.desk.rstrip("/") + "/api/lamp", method="POST",
+            data=json.dumps({"op": args.op}).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            # a toggle during a session waits for the session to stop
+            with urlopen(req, timeout=15) as r:
+                print(describe_lamp(json.loads(r.read()).get("lamp")))
+            return 0
+        except urllib.error.HTTPError as exc:
+            try:
+                reason = json.loads(exc.read()).get("error")
+            except Exception:
+                reason = None
+            print(reason or f"desk answered {exc.code}", file=sys.stderr)
+            return 1
+        except (urllib.error.URLError, OSError):
+            pass                                # no desk: straight to the bulb
+
+    ip = args.ip
+    if not ip and args.settings:
+        try:
+            with open(args.settings) as f:
+                ip = ((json.load(f) or {}).get("settings") or {}).get("ip")
+        except (OSError, ValueError, AttributeError):
+            ip = None
+    if not ip:
+        print("no bulb address - pass --ip or set one on the desk", file=sys.stderr)
+        return 1
+    try:
+        print(describe_lamp(send(ip, lamp_commands(args.op))))
+        return 0
+    except Exception as exc:
+        print(f"the bulb at {ip} did not take it: {exc}", file=sys.stderr)
+        return 1
 
 
 def restore_commands(saved, ms=300):
@@ -2190,6 +2339,8 @@ def parse_region(text):
 
 
 def main():
+    if sys.argv[1:2] == ["lamp"]:
+        sys.exit(lamp_main(sys.argv[2:]))
     p = argparse.ArgumentParser()
     p.add_argument("--ip")
     p.add_argument("--token", help="only for --enable-lan")

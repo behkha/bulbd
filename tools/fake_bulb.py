@@ -8,8 +8,9 @@
 Point a desk at it with its own settings file:
     python music_bulb_dash.py --port 8768 --ip 127.0.0.1 --settings /tmp/x.json
 
-It answers the miio hello on UDP 54321 (127.0.0.1 only), the LAN API on TCP
-55443 (get_prop and the set_* commands the restore uses) and music mode
+It answers the miio hello on UDP 54321 (on --host only), the LAN API on TCP
+55443 (get_prop, the set_* commands the restore uses, and lamp mode's
+toggle and adjust_bright, with the real bulb's habits while it is off) and music mode
 (set_music: it connects back and reads the start_cf frames). Each frame it
 receives is printed, so white frames and early flashes can be seen.
 """
@@ -27,18 +28,24 @@ ap.add_argument("--gone", type=float, default=6.0, metavar="S",
                 help="how long it stays away after --drop-after (default 6)")
 ap.add_argument("--did", type=lambda s: int(s, 16), default=0x12AB34CD)
 ap.add_argument("--quiet", action="store_true", help="do not print every frame")
+ap.add_argument("--host", default="127.0.0.1",
+                help="address to listen on; ::1 runs a second fake beside one on "
+                     "127.0.0.1 (point the desk at --ip localhost)")
 args = ap.parse_args()
+FAMILY = socket.AF_INET6 if ":" in args.host else socket.AF_INET
 
 state = {"power": "off", "bright": "30", "color_mode": "2", "rgb": "16711680",
          "ct": "2700", "hue": "0", "sat": "100"}
 PROPS = ("power", "bright", "color_mode", "rgb", "ct", "hue", "sat")
+# a color5 that is off answers "ok" to these and changes nothing
+IGNORED_OFF = ("set_bright", "set_adjust", "set_ct_abx", "set_rgb", "set_hsv")
 away = threading.Event()
 conns = []
 
 
 def hello():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 54321))
+    s = socket.socket(FAMILY, socket.SOCK_DGRAM)
+    s.bind((args.host, 54321))
     while True:
         data, addr = s.recvfrom(64)
         if data[:4] == bytes.fromhex("21310020") and not away.is_set():
@@ -103,10 +110,26 @@ def control(c):
                 msg = json.loads(line)
                 method, params = msg["method"], msg.get("params", [])
                 result = ["ok"]
+                reply = {"id": msg["id"], "result": result}
                 if method == "get_prop":
                     result = [state.get(p, "") for p in params]
+                    reply["result"] = result
                 elif method == "set_power":
                     state["power"] = params[0]
+                elif method == "toggle":
+                    state["power"] = "off" if state["power"] == "on" else "on"
+                elif method == "adjust_bright":
+                    # as measured on the color5: an off lamp comes on at the
+                    # step, and going under 1 switches it off
+                    if state["power"] != "on":
+                        if params[0] > 0:
+                            state.update(power="on", bright=str(min(100, params[0])))
+                    elif int(state["bright"]) + params[0] < 1:
+                        state["power"] = "off"
+                    else:
+                        state["bright"] = str(min(100, int(state["bright"]) + params[0]))
+                elif method in IGNORED_OFF and state["power"] != "on":
+                    pass                        # answered "ok", changes nothing
                 elif method == "set_bright":
                     state["bright"] = str(params[0])
                 elif method == "set_ct_abx":
@@ -116,21 +139,21 @@ def control(c):
                 elif method == "set_music" and params and params[0] == 1:
                     state["power"] = "on"
                     threading.Thread(target=music, args=(params[1], params[2]), daemon=True).start()
-                print("control:", method, params)
-                c.sendall((json.dumps({"id": msg["id"], "result": result}) + "\r\n").encode())
+                print("control:", method, params, "" if "result" in reply else "-> refused")
+                c.sendall((json.dumps(reply) + "\r\n").encode())
     except OSError:
         return
 
 
 threading.Thread(target=hello, daemon=True).start()
-print(f"fake bulb {args.did:08x} on 127.0.0.1 ({args.mode})")
+print(f"fake bulb {args.did:08x} on {args.host} ({args.mode})")
 while True:
     if args.mode == "refuse":
         time.sleep(3600)
         continue
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv = socket.socket(FAMILY, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 55443))
+    srv.bind((args.host, 55443))
     srv.listen(8)
     srv.settimeout(0.5)
     while not away.is_set():

@@ -213,6 +213,34 @@ brightness.
 Binds to localhost. `--host 0.0.0.0` reaches it from your phone — there is no
 authentication, so only on a network you trust.
 
+### Lamp mode
+
+While no session runs, the top of the desk is a plain lamp: the **Lamp**
+switch, **Temperature** (2700–6500 K) and **Brightness**. Each change is one
+short connection to the bulb, closed straight away. The section is hidden
+while a session runs, and Stop puts back whatever it left.
+
+**Follow the day** moves the white with the time: warm at night, up to cool
+over an hour from the morning handle, down to warm over two hours from the
+evening handle (drag them on the strip, or focus one and use the arrow keys).
+It checks every 5 minutes and sends only when its value moved. If the lamp's
+white is changed anywhere else, it leaves it alone until 04:00 and the box
+shows unticked; tick it again to resume at once.
+
+For hotkeys, bind these in Shortcuts (Run Shell Script, then Add Keyboard
+Shortcut), Raycast or similar:
+
+```
+bulbd lamp up        # +10%; from off, on at 10%
+bulbd lamp down      # -10%; below 1%, off
+bulbd lamp toggle
+bulbd lamp on | off
+```
+
+They go through a desk running on the default port (`--desk URL` for another;
+during a session, `toggle` stops it and turns the lamp off) and otherwise
+talk to the bulb at the address saved by the desk (`--ip` to give one).
+
 ## Getting the token
 
 The bulb's miio token is the one thing you can't read off the device. It
