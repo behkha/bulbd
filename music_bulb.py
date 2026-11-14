@@ -1467,15 +1467,17 @@ DESK_URL = "http://127.0.0.1:8765"
 
 def lamp_main(argv, urlopen=None, send=None):
     """`bulbd lamp up|down|toggle|on|off`, for a hotkey. A running desk gets
-    it first (POST /api/lamp), so a session and Follow the day know about
-    it; with no desk it is one plain connection to the saved address."""
+    it whenever one answers (POST /api/lamp), so a session and Follow the
+    day know about it; only when the desk's port refuses the connection is
+    it one plain connection to --ip or the saved address."""
     import urllib.error
     import urllib.request
 
     p = argparse.ArgumentParser(prog="bulbd lamp",
                                 description="the bulb as a plain lamp, for hotkeys")
     p.add_argument("op", choices=LAMP_OPS)
-    p.add_argument("--ip", help="bulb address (default: the desk's saved one)")
+    p.add_argument("--ip", help="bulb address when no desk is running "
+                                "(default: the desk's saved one)")
     p.add_argument("--desk", default=DESK_URL, metavar="URL",
                    help="a running desk to go through (default: %(default)s; "
                         "'' to talk to the bulb directly)")
@@ -1485,7 +1487,7 @@ def lamp_main(argv, urlopen=None, send=None):
     urlopen = urlopen or urllib.request.urlopen
     send = send or lamp_send
 
-    if args.desk and not args.ip:
+    if args.desk:
         req = urllib.request.Request(
             args.desk.rstrip("/") + "/api/lamp", method="POST",
             data=json.dumps({"op": args.op}).encode(),
@@ -1502,8 +1504,14 @@ def lamp_main(argv, urlopen=None, send=None):
                 reason = None
             print(reason or f"desk answered {exc.code}", file=sys.stderr)
             return 1
-        except (urllib.error.URLError, OSError):
-            pass                                # no desk: straight to the bulb
+        except (urllib.error.URLError, OSError) as exc:
+            # only a refused connection means no desk; anything else (a
+            # timeout above all) may come after the desk acted, and sending
+            # again could toggle twice
+            if not isinstance(getattr(exc, "reason", exc), ConnectionRefusedError):
+                print(f"the desk at {args.desk} did not answer: "
+                      f"{getattr(exc, 'reason', exc)}", file=sys.stderr)
+                return 1
 
     ip = args.ip
     if not ip and args.settings:

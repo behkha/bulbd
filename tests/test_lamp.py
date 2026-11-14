@@ -143,17 +143,23 @@ class FakeLamp:
         self.connections = 0
         self.sent = []
         self.fail = None
+        self.good_ips = set()                          # answer here even while failing
+        self.ips = []
+        self.raise_on = None                           # a method that fails mid-exchange
 
     @contextlib.contextmanager
     def link(self, ip):
-        if self.fail:
+        if self.fail and ip not in self.good_ips:
             raise self.fail
         self.connections += 1
+        self.ips.append(ip)
         yield self.call
 
     def call(self, cmds):
         out = []
         for method, params in cmds:
+            if method == self.raise_on:
+                raise TimeoutError(f"{method}: no answer")
             self.sent.append((method, params))
             st = self.st
             if method == "get_prop":
@@ -196,7 +202,8 @@ def lamp_mode(clock=None, fake=None, **saved):
     fake = fake or FakeLamp()
     idle = threading.Event()
     idle.set()
-    lm = dash.LampMode(st, idle=idle, link=fake.link, clock=clock or Clock(13))
+    lm = dash.LampMode(st, idle=idle, link=fake.link, clock=clock or Clock(13),
+                       find=lambda did, ip: None)
     return st, lm, fake
 
 
@@ -427,3 +434,268 @@ def test_bulbd_lamp_is_routed_before_the_session_flags(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         music_bulb.main()
     assert exc.value.code == 0 and got == [["down", "--ip", "10.0.0.9"]]
+
+
+# ------------------------------------------------- review round: races
+def in_thread(fn):
+    out = {}
+
+    def run():
+        try:
+            out["value"] = fn()
+        except Exception as exc:
+            out["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, out
+
+
+def test_nothing_goes_out_while_a_stopping_session_restores():
+    st, lm, fake = lamp_mode(follow_day=True)
+    lm.idle.clear()                                   # Stop pressed, restore under way
+    for n, fn in enumerate((lambda: lm.act("up"), lm.tick, lm.read)):
+        lm.sent = None                                # so the tick has something to send
+        t, out = in_thread(fn)
+        time.sleep(0.1)
+        assert t.is_alive() and fake.connections == n
+        lm.idle.set()
+        t.join(2)
+        assert "error" not in out and fake.connections == n + 1
+        lm.idle.clear()
+
+
+def test_a_command_waiting_on_the_lock_is_refused_if_a_session_started():
+    st, lm, fake = lamp_mode()
+    lm.lock.acquire()                                 # the engine opening the bulb
+    t, out = in_thread(lambda: lm.act("up"))
+    time.sleep(0.1)
+    st.set(running=True)
+    lm.lock.release()
+    t.join(2)
+    assert isinstance(out.get("error"), dash.LampBusy) and fake.connections == 0
+    t, out = in_thread(lm.tick)
+    t.join(2)
+    assert out["value"] == "idle"
+
+
+def test_the_engine_holds_the_lamp_lock_while_it_opens_and_closes(monkeypatch):
+    held = []
+
+    class Link:
+        ip, lost, saved = "10.0.0.9", False, {"power": "on"}
+
+        def __init__(self, *a, **k):
+            pass
+
+        def open(self):
+            held.append(("open", eng.lamp_lock.locked()))
+            return True
+
+        def close(self, restore=False):
+            held.append(("close", eng.lamp_lock.locked()))
+
+    monkeypatch.setattr(dash, "Link", Link)
+    st = dash.State({"ip": "10.0.0.9"}, store=None)
+    eng = dash.Engine(st)
+    ended = []
+    eng.on_session_end = lambda: ended.append(True)
+    eng._audio_loop = lambda st_, link: st_.set(running=False)
+    st.set(running=True)
+    eng._session()
+    assert held == [("open", True), ("close", True)] and ended == [True]
+    assert not eng.lamp_lock.locked()
+
+
+class SharedLampSock(ScriptedSock):
+    """A control socket over one shared lamp dict, applying what it is sent."""
+
+    def __init__(self, lamp):
+        super().__init__()
+        self.lamp = lamp
+
+    def sendall(self, data):
+        if not data.strip():
+            self.nudges += 1
+            return
+        msg = json.loads(data.decode())
+        method, params = msg["method"], msg["params"]
+        self.sent.append((method, params))
+        L = self.lamp
+        if method == "get_prop":
+            result = [str(L[p]) for p in params]
+        else:
+            result = ["ok"]
+            if method == "set_power":
+                L["power"] = params[0]
+            elif method == "set_ct_abx":
+                L.update(ct=params[0], color_mode=2)
+            elif method == "set_rgb":
+                L.update(rgb=params[0], color_mode=1)
+            elif method == "set_bright":
+                L["bright"] = params[0]
+        self.inbox += (json.dumps({"id": msg["id"], "result": result}) + "\r\n").encode()
+
+
+def test_a_session_after_lamp_use_saves_and_restores_what_the_controls_left(monkeypatch):
+    import socket
+    import yeelight
+
+    lamp = {"power": "off", "bright": 80, "color_mode": 1, "rgb": 255, "ct": 6500,
+            "hue": 0, "sat": 100}
+    # the lamp controls: on, 3100 K, 35%, each on a plain connection
+    plain = lambda addr, timeout: SharedLampSock(lamp)
+    lamp_send("10.0.0.9", lamp_commands("on"), connect=plain)
+    lamp_send("10.0.0.9", lamp_commands(ct=3100, bright=35), connect=plain)
+    left = dict(lamp)
+    assert (left["power"], left["ct"], left["bright"], left["color_mode"]) == ("on", 3100, 35, 2)
+
+    class Bulb:
+        def __init__(self, ip, **kw):
+            self._ip = ip
+            self._Bulb__socket = None
+
+        @property
+        def _socket(self):
+            if self._Bulb__socket is None:
+                self._Bulb__socket = SharedLampSock(lamp)
+            return self._Bulb__socket
+
+        def turn_on(self):
+            lamp["power"] = "on"
+
+        def start_music(self):
+            pass
+
+        def stop_music(self):
+            self._Bulb__socket = SharedLampSock(lamp)   # the fresh control connection
+
+    monkeypatch.setattr(yeelight, "Bulb", Bulb)
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("extra slot"))
+    bulb = music_bulb.open_bulb("10.0.0.9", remember=True)
+    assert bulb.bulbd_saved == left
+    lamp.update(color_mode=1, rgb=0xFF00FF, bright=100)  # the session's light
+    assert music_bulb.release_bulb(bulb, restore=True)
+    look = ("power", "color_mode", "ct", "bright")       # rgb is moot on a white lamp
+    assert {k: lamp[k] for k in look} == {k: left[k] for k in look}
+
+
+def test_a_reading_inside_its_own_fade_is_not_a_hand_change():
+    clock = Clock(21)
+    st, lm, fake = lamp_mode(clock, follow_day=True)
+    assert lm.tick() == "sent"
+    fake.st["ct"] = (fake.st["ct"] + 5000) // 2          # still gliding there
+    post(st, {"day_k": 6000}, lm)                         # a quick second edit
+    clock.advance(0.02)                                   # ~1 s later
+    assert lm.tick() == "sent" and st.snapshot()["day_held"] is None
+    fake.st["ct"] = 3000                                  # well after the fade: a hand
+    clock.t = Clock(21, 20)()
+    assert lm.tick() == "hand"
+
+
+def test_a_failed_send_is_not_remembered_as_sent():
+    st, lm, fake = lamp_mode(Clock(22, 30), follow_day=True, fake=FakeLamp(power="off", ct=5000))
+    fake.raise_on = "set_ct_abx"
+    with pytest.raises(TimeoutError):
+        lm.act("on")
+    assert lm.sent is None
+    fake.raise_on = None
+    with pytest.raises(TimeoutError):                     # the tick fails the same way
+        fake.raise_on = "set_ct_abx"
+        lm.tick()
+    assert lm.sent is None
+    fake.raise_on = None
+    assert lm.tick() == "sent" and fake.st["ct"] == 2700
+
+
+def test_after_a_session_the_curve_is_reasserted():
+    clock = Clock(22, 30)
+    st, lm, fake = lamp_mode(clock, follow_day=True)
+    assert lm.tick() == "sent"
+    fake.st.update(color_mode=1)                          # --no-restore left the session's colour
+    lm.session_ended()
+    assert lm.wake.is_set()
+    assert lm.tick() == "sent" and fake.st["color_mode"] == 2
+    assert st.snapshot()["day_held"] is None
+
+
+def test_a_temperature_sent_to_an_off_lamp_holds_nothing():
+    st, lm, fake = lamp_mode(follow_day=True, fake=FakeLamp(power="off"))
+    lm.act(ct=3000)
+    assert st.snapshot()["day_held"] is None
+
+
+def test_wake_and_dusk_never_cross():
+    snap = {"monitors": [], "wake": 420, "dusk": 1200}
+    assert dash.clean_patch({"dusk": 300}, snap) == {"wake": 420, "dusk": 540}
+    assert dash.clean_patch({"wake": 1300}, snap) == {"wake": 1080, "dusk": 1200}
+    assert dash.clean_patch({"wake": 1400, "dusk": 10}, snap) == {"wake": 1305, "dusk": 1425}
+    assert dash.clean_patch({"dusk": 30}, dict(snap, wake=0)) == {"wake": 0, "dusk": 120}
+    for patch in ({"dusk": 300}, {"wake": 1300}, {"wake": 1400, "dusk": 10}):
+        out = dict(snap, **dash.clean_patch(patch, snap))
+        assert out["dusk"] - out["wake"] >= dash.MIN_DAY
+        assert dash.day_kelvin((out["wake"] + out["dusk"]) // 2 + 30,
+                               wake=out["wake"], dusk=out["dusk"]) > 2700
+
+
+def test_a_moved_bulb_is_searched_for_once_and_followed():
+    st, lm, fake = lamp_mode(did=0x1E5A1F80)
+    searches = []
+    lm.find = lambda did, ip: searches.append((did, ip)) or "10.0.0.33"
+    fake.fail, fake.good_ips = TimeoutError("timed out"), {"10.0.0.33"}
+    lamp = lm.act("up")
+    assert searches == [(0x1E5A1F80, "10.0.0.9")] and fake.ips == ["10.0.0.33"]
+    assert st.snapshot()["ip"] == "10.0.0.33" and lamp["power"] == "on"
+    assert st.snapshot()["lamp"] == lamp
+
+
+def test_an_unreachable_bulb_is_searched_for_only_once():
+    st, lm, fake = lamp_mode(follow_day=True, did=0x1E5A1F80)
+    searches = []
+    lm.find = lambda did, ip: searches.append(ip)
+    fake.fail = TimeoutError("timed out")
+    for _ in range(3):
+        with pytest.raises(TimeoutError):
+            lm.tick()
+    assert searches == ["10.0.0.9"]
+    fake.fail = None
+    assert lm.tick() == "sent"
+    fake.fail = TimeoutError("timed out")                 # a new unreachable spell
+    with pytest.raises(TimeoutError):
+        lm.act("up")
+    assert searches == ["10.0.0.9", "10.0.0.9"]
+
+
+def test_no_search_without_a_known_id():
+    st, lm, fake = lamp_mode()
+    lm.find = lambda did, ip: pytest.fail("searched")
+    fake.fail = TimeoutError("timed out")
+    with pytest.raises(TimeoutError):
+        lm.act("up")
+
+
+def test_cli_with_an_address_still_goes_through_a_running_desk():
+    seen = []
+
+    def urlopen(req, timeout):
+        seen.append(req.full_url)
+        return Resp(b'{"ok": true, "lamp": {"power": "off"}}')
+
+    assert lamp_main(["toggle", "--ip", "10.0.0.9"], urlopen=urlopen,
+                     send=lambda *a: pytest.fail("sent beside the desk")) == 0
+    assert seen == ["http://127.0.0.1:8765/api/lamp"]
+
+
+def test_cli_never_sends_again_after_a_desk_timeout(capsys):
+    import socket
+
+    def slow(req, timeout):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    def hung(req, timeout):
+        raise TimeoutError("timed out")
+
+    for urlopen in (slow, hung):
+        assert lamp_main(["toggle", "--ip", "10.0.0.9"], urlopen=urlopen,
+                         send=lambda *a: pytest.fail("toggled twice")) == 1
+        assert "did not answer" in capsys.readouterr().err
