@@ -358,6 +358,10 @@ python music_bulb.py --ip "$BULB_IP" --mic "System audio"
 python music_bulb.py --list-devices
 ```
 
+It costs about what BlackHole does and less than the microphone: 5.8% of one
+core over an idle Mac against 5.6% and 8.4% (`tools/bench_audio.py`, every
+process counted), and nothing while no session runs.
+
 Without them the old order applies. `soundcard` has no CoreAudio loopback:
 `include_loopback=True` warns and is ignored. BlackHole is a virtual cable,
 not a system tap — it only carries what macOS *outputs* into it, so capturing
@@ -509,6 +513,7 @@ tools/check_default.py  set the real bulb's power-on look (asks first)
 tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
                      (flows as the color5 runs them; --port beside another fake)
 tools/bench_capture.py  mss vs the stream: CPU per process and colour agreement
+tools/bench_audio.py    what each audio input costs: CPU and wake-ups per process
 ```
 
 ## Credits

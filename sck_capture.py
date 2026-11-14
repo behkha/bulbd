@@ -507,27 +507,55 @@ class Resampler:
     """A stream of (frames, channels) blocks from `src` Hz to `dst` Hz by
     linear interpolation, continuous across blocks. Enough for a ten-band
     analyser: the loss is a fixed tilt (3 dB at 16 kHz going 48000 -> 44100),
-    and every band is judged against its own recent peak."""
+    and every band is judged against its own recent peak.
+
+    It runs fifty times a second for as long as a session does, so the work
+    per block is kept to the interpolation itself: the position is counted
+    in whole 1/dst frames (exact, and 960 frames at 48000 -> 44100 end where
+    they began), which lets the indices and weights of a block be worked out
+    once and reused; and digital silence - what the stream sends while
+    nothing plays - is answered with zeros without interpolating.
+    """
+
+    PLANS = 64                        # block shapes remembered
 
     def __init__(self, src, dst):
         self.src, self.dst = float(src), float(dst)
-        self.step = self.src / self.dst
-        self.pos = 0.0                # the next output, in input frames
+        self._s, self._d = int(round(self.src)), int(round(self.dst))
+        self.phase = 0                # the next output, in 1/dst input frames
         self.tail = None              # the last input frame of the block before
+        self._quiet = False           # that block was all zeros
+        self._plans = {}
+
+    def _plan(self, last):
+        """Where the outputs of a block whose last frame is `last` fall:
+        (count, left index, right index, right weight, left weight, the
+        phase after it)."""
+        key = (last, self.phase)
+        plan = self._plans.get(key)
+        if plan is None:
+            s, d = self._s, self._d
+            count = max(0, -((self.phase - last * d) // s))
+            at = self.phase + s * np.arange(count, dtype=np.int64)
+            i = at // d
+            frac = ((at - i * d) / d).astype(np.float32)[:, None]
+            plan = (count, i, i + 1, frac, 1 - frac, self.phase + count * s - last * d)
+            if len(self._plans) < self.PLANS:
+                self._plans[key] = plan
+        return plan
 
     def feed(self, pcm):
-        if self.src == self.dst:
+        if self._s == self._d:
             return pcm
-        if self.tail is not None:
-            pcm = np.concatenate([self.tail, pcm])
-        last = len(pcm) - 1
-        self.tail = pcm[-1:]
-        count = max(0, int(math.ceil((last - self.pos) / self.step)))
-        at = self.pos + self.step * np.arange(count)
-        self.pos += count * self.step - last
-        i = np.minimum(at.astype(np.int64), max(last - 1, 0))
-        frac = (at - i).astype(np.float32)[:, None]
-        return pcm[i] * (1 - frac) + pcm[np.minimum(i + 1, last)] * frac
+        was_quiet, self._quiet = self._quiet, not pcm.any()
+        tail, self.tail = self.tail, pcm[-1:]
+        count, i, j, frac, keep, self.phase = self._plan(
+            len(pcm) - (1 if tail is None else 0))
+        if self._quiet and (was_quiet or tail is None):
+            return np.zeros((count, pcm.shape[1]), dtype=np.float32)
+        if tail is not None:
+            pcm = np.concatenate([tail, pcm])
+        return pcm[i] * keep + pcm[j] * frac
 
 
 class AudioStream:
@@ -553,6 +581,7 @@ class AudioStream:
         self.dropped = 0                       # frames the backlog cap threw away
         self._cap = int(self.BACKLOG * self.rate)
         self._chunks, self._have = [], 0
+        self._want = 0                         # frames the waiting record() needs
         self._cond = threading.Condition()
         self._resample = None
         self._handle = None
@@ -594,7 +623,8 @@ class AudioStream:
                 old = self._chunks.pop(0)
                 self._have -= len(old)
                 self.dropped += len(old)
-            self._cond.notify()
+            if self._have >= self._want:       # else the loop would wake for nothing
+                self._cond.notify()
 
     def _on_stop(self, error):
         with self._cond:
@@ -607,6 +637,7 @@ class AudioStream:
         self._cap = max(self._cap, 2 * numframes)
         deadline = time.monotonic() + numframes / self.rate + self.GRACE
         with self._cond:
+            self._want = numframes
             while self._have < numframes and self.error is None:
                 left = deadline - time.monotonic()
                 if left <= 0:

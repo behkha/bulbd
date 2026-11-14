@@ -66,6 +66,40 @@ def test_resampling_is_continuous_across_blocks():
     assert np.allclose(whole[:n], parts[:n], atol=1e-4)
 
 
+def test_the_length_is_exact_however_long_it_runs():
+    r = Resampler(48000, 44100)
+    block = tone(1000, 48000, 960)
+    assert sum(len(r.feed(block)) for _ in range(5000)) == 5000 * 882
+    assert len(r._plans) == 2                            # the first block, then every other
+
+
+def test_odd_block_sizes_do_not_grow_the_plans_without_end():
+    r = Resampler(48000, 44100)
+    total = sum(len(r.feed(tone(440, 48000, n))) for n in range(1, 400))
+    assert abs(total - sum(range(1, 400)) * 44100 / 48000) <= 1
+    assert len(r._plans) <= Resampler.PLANS
+
+
+def test_silence_is_answered_with_zeros_and_sound_resumes_in_place():
+    quiet = np.zeros((960, 2), dtype=np.float32)
+    blocks = [tone(440, 48000, 960), quiet, quiet, quiet, tone(440, 48000, 960),
+              quiet, tone(330, 48000, 500), quiet]
+    whole = Resampler(48000, 44100).feed(np.concatenate(blocks))
+    r = Resampler(48000, 44100)
+    parts = [r.feed(b) for b in blocks]
+    assert not parts[2].any() and not parts[3].any()
+    out = np.concatenate(parts)
+    n = min(len(whole), len(out))
+    assert abs(len(whole) - len(out)) <= 1
+    assert np.allclose(whole[:n], out[:n], atol=1e-5)
+
+
+def test_a_stream_that_opens_on_silence_is_zeros_from_the_start():
+    r = Resampler(48000, 44100)
+    out = r.feed(np.zeros((960, 2), dtype=np.float32))
+    assert out.shape == (882, 2) and out.dtype == np.float32 and not out.any()
+
+
 def test_the_same_rate_passes_straight_through():
     x = tone(440, 44100, 512)
     assert Resampler(44100, 44100).feed(x) is x
@@ -123,6 +157,26 @@ def test_record_waits_for_the_buffer_that_completes_the_block():
         out = rec.record(numframes=1024)
         assert 0.03 < time.monotonic() - t0 < 0.2
     assert np.array_equal(out[:, 0], np.arange(1024))
+
+
+def test_the_loop_is_woken_only_by_the_buffer_that_completes_its_block():
+    kit = FakeKit()
+    with AudioStream(44100, 2, kit=kit) as rec:
+        wakes = []
+        notify = rec._cond.notify
+        rec._cond.notify = lambda n=1: (wakes.append(rec._have), notify(n))
+        done = []
+        loop = threading.Thread(target=lambda: done.append(rec.record(numframes=1024)))
+        loop.start()
+        while rec._want != 1024:
+            time.sleep(0.001)
+        kit.push(ramp(441))
+        kit.push(ramp(441, 441))
+        assert wakes == []                               # 882 of 1024: let it sleep
+        kit.push(ramp(441, 882))
+        loop.join(1)
+        assert wakes == [1323]
+    assert np.array_equal(done[0][:, 0], np.arange(1024))
 
 
 def test_a_stalled_stream_gives_silence_instead_of_hanging_the_loop():
