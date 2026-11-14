@@ -1627,6 +1627,7 @@ class Engine(threading.Thread):
         sync = BeatSync(timed=cfg["bulb_clock"])
         fx = DropFx()
         hold_until = 0.0                    # a bulb-timed beat's flow is running
+        lamp = None                         # the frame the lamp was last left on
         mic = cfg["mic"]
         recorder = open_recorder(mic)
         st.set(device=str(getattr(recorder, "name", recorder))[:48])
@@ -1687,8 +1688,14 @@ class Engine(threading.Thread):
                         4 + 96 * (lvl.brightness ** cfg["gamma"]), 1, 100)))
                     hsv = (int(round(hue)) % 360, int(round(sat)), val)
 
+                    # a build-up or a drop: one flow, then the loop again
+                    effect = fx.take(now, hsv, cfg["drops"])
+                    held = effect is not None or fx.holding(now)
+                    # the page shows what the lamp shows: an effect's light
+                    # while it runs, else this tick's
+                    shown = fx.light if held else hsv
                     input_db, signal = watch.read(now)
-                    st.set(hue=hsv[0], sat=hsv[1], val=hsv[2], white=False, ct=0,
+                    st.set(hue=shown[0], sat=shown[1], val=shown[2], white=False, ct=0,
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            level=round(lvl.brightness, 3),
                            hit=round(lvl.hit, 3),
@@ -1696,20 +1703,21 @@ class Engine(threading.Thread):
                            input_db=input_db, signal=signal,
                            active_palette=color.pal)
 
-                    # a build-up or a drop: one flow, then the loop again
-                    effect = fx.take(now, hsv, cfg["drops"])
                     if effect is not None:
                         sender.put(effect, True, 0)
-                        last_sent, last_hsv = now, None
+                        last_sent, last_hsv, lamp = now, None, fx.end
                         continue
-                    if fx.holding(now) or now < hold_until:
+                    if held or now < hold_until:
                         continue
-                    if fired and sync.hold:
+                    if fired and sync.hold and lamp is not None:
+                        # hold what the lamp shows: this tick's frame may
+                        # already carry the colour step meant for the flash
                         peak = (hsv[0], hsv[1], int(round(np.clip(
                             4 + 96 * sync.flash ** cfg["gamma"], 1, 100))))
-                        sender.put(beat_flow(sync.hold, last_hsv or hsv, peak), True, 0)
+                        sender.put(beat_flow(sync.hold, lamp, peak), True, 0)
                         hold_until = now + sync.hold + 0.05
-                        last_sent, last_hsv = now, peak
+                        fx.handback = False          # the flow was the hand-back
+                        last_sent, last_hsv, lamp = now, peak, peak
                         continue
 
                     if not fired and same_light(hsv, last_hsv, hue_tol=2):
@@ -1718,7 +1726,7 @@ class Engine(threading.Thread):
                     fading = color.fade_t is not None
                     sender.put(hsv, sudden=lvl.hit > 0.35 and not fading and not fx.handback,
                                duration=fx.ramp(np.clip(1000.0 / max(cfg["fps"], 5), 30, 150)))
-                    last_sent, last_hsv = now, hsv
+                    last_sent, last_hsv, lamp = now, hsv, hsv
         finally:
             if eyes is not None:
                 eyes.close()
@@ -1737,6 +1745,8 @@ class Engine(threading.Thread):
         sync = BeatSync(timed=cfg["bulb_clock"])
         fx = DropFx()
         hold_until = 0.0
+        lamp = None                         # the frame the lamp was last left on
+        held_cut = False                    # a cut read while a flow held the loop
         color = ScreenColorEngine(min_sat=cfg["min_sat"],
                                   sat_boost=cfg["sat_boost"],
                                   gamma=cfg["screen_gamma"], calm=cfg["calm"])
@@ -1800,6 +1810,9 @@ class Engine(threading.Thread):
                         continue
 
                     hue, sat, _val, cut = screen.read()
+                    # reading takes the thread's sticky cut: one read while a
+                    # flow holds the loop lands with the next send instead
+                    cut, held_cut = cut or held_cut, False
                     val = int(round(np.clip(
                         4 + 96 * (lvl.brightness ** cfg["gamma"]), 1, 100)))
                     light = screen_frame(screen, hue, sat, val)
@@ -1809,9 +1822,14 @@ class Engine(threading.Thread):
                     if pause.feed(screen.moved_at(), now, quiet):
                         light, val = pause.frame(), PauseLight.LEVEL
 
+                    effect = fx.take(now, light, cfg["drops"] and not pause.on)
+                    held = effect is not None or fx.holding(now)
+                    # the page shows what the lamp shows: an effect's light
+                    # while it runs, else this tick's
                     cut_env = max(cut_env * 0.72, 1.0 if cut else 0.0)
                     input_db, signal = watch.read(now)
-                    st.set(**light_telemetry(light, hue, val), paused=pause.on,
+                    st.set(**(light_telemetry(fx.light, hue, fx.level) if held
+                              else light_telemetry(light, hue, val)), paused=pause.on,
                            bpm=round(60.0 / max(f["beat"], 1e-3), 1),
                            capture=grab.backend,
                            level=round(lvl.brightness, 3),
@@ -1819,31 +1837,35 @@ class Engine(threading.Thread):
                            bands=[round(float(b), 3) for b in f["bands"]],
                            input_db=input_db, signal=signal)
 
-                    if not pause.on:
-                        effect = fx.take(now, light, cfg["drops"])
-                        if effect is not None:
-                            sender.put(effect, True, 0)
-                            last_sent, last_hsv = now, None
-                            continue
-                    if fx.holding(now) or now < hold_until:
+                    if effect is not None:
+                        sender.put(effect, True, 0)
+                        last_sent, last_hsv, lamp, held_cut = now, None, fx.end, cut
                         continue
-                    if fired and sync.hold and not pause.on:
+                    if held or now < hold_until:
+                        held_cut = cut              # pause edges wait in PauseLight
+                        continue
+                    if (fired and sync.hold and lamp is not None and not pause.on
+                            and not (pause.entered or pause.left)):
+                        # hold what the lamp shows; the flash lands the new
+                        # scene (a cut with it) 48-72 ms later, in 50 ms
                         peak = screen_frame(screen, hue, sat, int(round(np.clip(
                             4 + 96 * sync.flash ** cfg["gamma"], 1, 100))))
-                        sender.put(beat_flow(sync.hold, last_hsv or light, peak), True, 0)
+                        sender.put(beat_flow(sync.hold, lamp, peak), True, 0)
                         hold_until = now + sync.hold + 0.05
-                        last_sent, last_hsv = now, peak
+                        fx.handback = False          # the flow was the hand-back
+                        last_sent, last_hsv, lamp = now, peak, peak
                         continue
 
                     if not (cut or fired or pause.entered or pause.left) \
                             and same_light(light, last_hsv):
                         continue
 
-                    sender.put(light, sudden=(cut or lvl.hit > 0.35) and not pause.on
-                               and not fx.handback,
+                    # a cut lands sudden even on the hand-back from an effect
+                    sender.put(light, sudden=(cut or (lvl.hit > 0.35 and not fx.handback))
+                               and not pause.on,
                                duration=fx.ramp(pause.ramp(light, last_hsv,
                                                            1.0 / max(cfg["fps"], 5))))
-                    last_sent, last_hsv = now, light
+                    last_sent, last_hsv, lamp = now, light, light
         finally:
             screen.close()
             st.set(bands=[0.0] * 10, input_db=None, signal=True, capture=None, paused=False)

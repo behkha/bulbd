@@ -108,3 +108,140 @@ def test_bulb_clock_on_sends_each_predicted_beat_as_one_flow(monkeypatch):
 def test_bulb_clock_off_sends_no_flow(monkeypatch):
     rows = play(monkeypatch, GROOVE)
     assert flows(rows) == []
+
+
+# ------------------------------------------------------------ review round
+class Sync(dash.BeatSync):
+    made = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        Sync.made.append(self)
+
+
+class LongStrobe(dash.DropFx):
+    """A 12-flash strobe that lets go on the first tick a bulb-timed beat
+    is handed over, half a second in: the hand-back tick sends a beat flow."""
+
+    def __init__(self, *a, **k):
+        super().__init__(flashes=12)
+        self.started = None
+        self.released = None
+
+    def take(self, now, frame, on=True):
+        flow = super().take(now, frame, on)
+        if flow is not None:
+            self.started, self.flow = now, flow
+        return flow
+
+    def holding(self, now):
+        if (self.kind == "drop" and self.released is None and Sync.made[-1].hold
+                and now > self.started + 0.5):
+            self.until, self.released = now, now
+        return super().holding(now)
+
+
+def test_after_an_effect_a_beat_flow_holds_the_lamp_and_takes_the_hand_back(monkeypatch):
+    Sync.made = []
+    monkeypatch.setattr(dash, "BeatSync", Sync)
+    monkeypatch.setattr(dash, "DropFx", LongStrobe)
+    telemetry = []
+    real_set = dash.State.set
+
+    def spy(self, **kw):
+        if "val" in kw:
+            telemetry.append((dash.time.monotonic() - 1000.0, kw["hue"], kw["sat"], kw["val"]))
+        real_set(self, **kw)
+    monkeypatch.setattr(dash.State, "set", spy)
+    # a groove that keeps going into the drop: the grid is trusted throughout
+    from test_drops import track
+    rows = play(monkeypatch, song(GROOVE, pad(6), track(128, secs=14)[0]),
+                drops=True, bulb_clock=True)
+    strobe = next((t, f) for t, f in flows(rows, 24))
+    after = [r for r in rows if r[0] > strobe[0]]
+    first = after[0]
+    # 5: the first send after the effect is a beat flow holding the strobe's
+    # own light, not the loop's newer colour
+    assert isinstance(first[1], Flow) and first[1].count == 2
+    assert first[1].steps[0][1:] == strobe[1].steps[1][1:]
+    # 6: the hand-back went with that flow; no later frame gets the soft ramp
+    assert not [r for r in after[1:] if not isinstance(r[1], Flow)
+                and r[3] >= dash.DropFx.HANDBACK_MS]
+    # 4: while the strobe ran the page showed the strobe's light
+    t0, t1 = strobe[0], first[0]
+    shown = {(h, s, v) for t, h, s, v in telemetry if t0 <= t < t1 - 1e-6}
+    h, s, v = shown.pop()
+    assert not shown
+    assert (h, s, v)[2] == strobe[1].steps[1][3]
+
+
+class Grab:
+    backend, pushes, box = "sck", True, {"width": 200, "height": 130}
+
+    def __init__(self, *a, **k):
+        pass
+
+    def close(self):
+        pass
+
+
+class Screen:
+    """ScreenColorThread's contract, with a scene cut every 7th read."""
+    reads = []
+
+    def __init__(self, grab, engine, fps=10, on_frame=None):
+        self.error, self.fps, self.n, self.hue = None, fps, 0, 30.0
+        Screen.reads = []
+
+    def start(self):
+        pass
+
+    def poke(self):
+        pass
+
+    def close(self):
+        pass
+
+    def read(self):
+        self.n += 1
+        cut = self.n % 7 == 0
+        if cut:
+            self.hue = (self.hue + 120) % 360
+        Screen.reads.append((dash.time.monotonic() - 1000.0, cut))
+        return self.hue, 90.0, 0.5, cut
+
+    def white(self):
+        return False, 6500
+
+    def moved_at(self):
+        return dash.time.monotonic()
+
+
+@pytest.mark.parametrize("cfg", [dict(bulb_clock=True), dict(drops=True)],
+                         ids=["bulb clock", "drops"])
+def test_fusion_lands_every_scene_cut_even_when_a_flow_held_the_loop(monkeypatch, cfg):
+    monkeypatch.setattr(dash, "Capture", Grab)
+    monkeypatch.setattr(dash, "ScreenColorThread", Screen)
+    monkeypatch.setattr(dash, "screen_permission", lambda: True)
+    clock = Clock()
+    monkeypatch.setattr(dash.time, "monotonic", clock)
+    pcm = song(GROOVE, pad(4), roll(8), AGAIN) if cfg.get("drops") else GROOVE
+    st = dash.State({"ip": "192.168.1.2", "mode": "fusion", **cfg})
+    st.set(running=True)
+    mic = Mic(pcm, clock, st)
+    monkeypatch.setattr(dash, "open_recorder", lambda name: mic)
+    sent = Sent(clock)
+    dash.Engine(st)._fusion_loop(st, sent)
+    rows = [(t - 1000.0, f, s, d) for t, f, s, d in sent.rows]
+    cuts = [t for t, c in Screen.reads if c]
+    held = 0
+    for tc in cuts:
+        nxt = next((r for r in rows if r[0] >= tc - 1e-9), None)
+        if nxt is None:
+            continue
+        if nxt[0] > tc + 1e-9:
+            held += 1                                   # the cut's own tick sent nothing
+        f = nxt[1]
+        landed = (isinstance(f, Flow) and f.count in (2, 8)) or nxt[2] is True
+        assert landed, f"cut at {tc:.2f} went out smooth at {nxt[0]:.2f}: {nxt}"
+    assert held > 0                                     # some cuts did fall in a held tick
