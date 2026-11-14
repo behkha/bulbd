@@ -14,13 +14,15 @@ from signals import H, W, solid
 
 def run(frames, delay=5.0, fps=10, quiet=True):
     """Feed frames through CapturePacer and PauseLight the way the screen
-    loop does. -> [(t, on, entered, left)]"""
+    loop does, which sends on every edge. -> [(t, on, entered, left)]"""
     pacer, pause, out = CapturePacer(), PauseLight(delay), []
     for i, frame in enumerate(frames):
         now = i / fps
         pacer.period(frame, fps, now)
         on = pause.feed(pacer.moved_at, now, quiet)
         out.append((now, on, pause.entered, pause.left))
+        if pause.entered or pause.left:
+            pause.ramp(pause.frame(), None, 1 / fps)       # the send takes the edge
     return out
 
 
@@ -28,11 +30,17 @@ def still(rgb, secs, fps=10):
     return [solid(rgb)] * int(secs * fps)
 
 
-def dark_motion(secs, fps=10, seed=0):
-    """A dark scene that moves: dim noise that changes every frame."""
-    rng = np.random.default_rng(seed)
-    return [np.clip(0.06 + rng.normal(0, 0.05, (H, W, 3)), 0, 1).astype(np.float32)
-            for _ in range(int(secs * fps))]
+def soft_figure(secs, speed, fps=10, ground=0.05, contrast=0.03):
+    """A dark, low-contrast scene that moves: a soft blob 0.03 brighter than
+    a 0.05 ground at its peak - under CapturePacer.PIXEL - drifting across
+    at `speed` px a second."""
+    yy, xx = np.mgrid[0:H, 0:W]
+    out = []
+    for i in range(int(secs * fps)):
+        cx = 30 + (speed * i / fps) % (W - 60)
+        blob = contrast * np.exp(-((xx - cx) ** 2 + (yy - H / 2) ** 2) / (2 * 14.0 ** 2))
+        out.append(np.repeat((ground + blob)[..., None], 3, axis=2).astype(np.float32))
+    return out
 
 
 def first_on(rows):
@@ -50,8 +58,28 @@ def test_a_still_picture_raises_it_after_the_delay(label, rgb):
     assert sum(entered for *_, entered, _ in rows) == 1
 
 
-def test_a_dark_scene_that_moves_never_does():
-    assert first_on(run(dark_motion(20))) is None
+@pytest.mark.parametrize("speed", [3, 10, 40, 120])
+def test_a_dark_low_contrast_scene_that_moves_never_does(speed):
+    frames = soft_figure(20, speed)
+    assert float(np.abs(frames[1] - frames[0]).max()) < CapturePacer.PIXEL   # the pacer's test misses it
+    assert first_on(run(frames)) is None
+
+
+def test_at_the_pacer_s_slowest_rate_it_still_sees_it():
+    frames = soft_figure(30, 10, fps=2)                 # 2 fps: a still-looking picture
+    assert first_on(run(frames, fps=2)) is None
+
+
+def test_an_edge_waits_for_the_next_send():
+    pause = PauseLight(1)
+    pause.feed(0.0, 1.5)
+    pause.feed(0.0, 1.6)                                # a tick the loop skipped
+    assert pause.entered
+    assert pause.ramp(pause.frame(), (0, 50, 30), 0.04) == PauseLight.RISE_MS
+    assert not pause.entered
+    pause.feed(1.65, 1.7)
+    pause.feed(1.65, 1.75)
+    assert pause.left and pause.ramp((0, 50, 30), pause.frame(), 0.04) >= SWITCH_MS
 
 
 def test_off_by_default():

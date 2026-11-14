@@ -117,6 +117,79 @@ def test_the_first_beats_of_a_track_are_no_drop():
     assert ev == []
 
 
+# ------------------------------------------------------------ hats through the gap
+def hats(secs, bpm=128, per_beat=2, level=0.25, seed=0):
+    """Hats (and a light snare on 2 and 4) with no kick: the gap of a kick
+    dropout, a fill or a kickless verse, where the rest keeps playing."""
+    _, hh, sn = _drums(seed)
+    beat = 60.0 / bpm
+    n = int(secs * SR)
+    x = np.zeros(n, dtype=np.float32)
+    k = 0
+    while k * beat / per_beat < secs - 0.05:
+        s = int(k * beat / per_beat * SR)
+        x[s:s + len(hh)] += (level * hh)[:n - s]
+        if k % (2 * per_beat) == per_beat:
+            x[s:s + len(sn)] += (0.3 * sn)[:n - s]
+        k += 1
+    return stereo(0.5 * x) + pad(secs)
+
+
+BAR = 4 * 60 / 128
+
+
+@pytest.mark.parametrize("per_beat", [2, 4])
+def test_a_one_bar_kick_dropout_with_the_hats_going_on_gives_nothing(per_beat):
+    ev = events(song(GROOVE, hats(BAR, per_beat=per_beat), AGAIN))
+    assert ev == []
+
+
+def test_a_kick_dropout_every_eighth_bar_gives_nothing():
+    parts = []
+    for _ in range(5):                                  # 5 x (7 bars + a bar without kick)
+        parts += [track(128, secs=7 * BAR)[0], hats(BAR, per_beat=4)]
+    assert events(song(*parts)) == []
+
+
+@pytest.mark.parametrize("per_beat", [2, 4])
+def test_a_kickless_verse_is_no_build_up(per_beat):
+    ev = events(song(GROOVE, hats(12, per_beat=per_beat), AGAIN))
+    assert [e for _, e in ev if e == "build"] == []
+
+
+def test_a_fill_is_no_build_up_and_no_drop():
+    # half a bar of 16ths speeding to 32nds where the kick was, then the groove
+    ev = events(song(GROOVE, hats(BAR / 2, per_beat=4), hats(BAR / 2, per_beat=8), AGAIN))
+    assert ev == []
+
+
+def test_a_swell_ends_when_the_beat_is_back():
+    from music_bulb import DropFx
+    fx, an = DropFx(), Analyser()
+    pcm = song(GROOVE, hats(BAR, per_beat=4), AGAIN)
+    started = ended = None
+    for i in range(0, len(pcm) - BLOCK, BLOCK):
+        fx.feed(an.feed(pcm[i:i + BLOCK]))
+        if started is None and an.t >= 16.3:
+            fx.event = "build"                           # as if a swell had started here
+            assert fx.take(an.t, (20, 80, 40)) is not None
+            started = an.t
+        elif started is not None and not fx.holding(an.t):
+            ended = an.t
+            break
+    assert ended is not None and ended < 16.0 + BAR + 0.3   # on the first kick back
+
+
+def test_a_build_during_a_swell_does_not_extend_it():
+    from music_bulb import DropFx
+    fx = DropFx()
+    fx.event = "build"
+    fx.take(0.0, (20, 80, 40))
+    until = fx.until
+    fx.event = "build"
+    assert fx.take(3.0, (20, 80, 40)) is None and fx.until == until
+
+
 # ------------------------------------------------------------ the flows
 def test_the_strobe_never_passes_three_a_second():
     f = strobe_flow(200, 90, 20, rate=10, flashes=4)

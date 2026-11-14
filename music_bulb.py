@@ -642,12 +642,16 @@ class DropWatch:
     the drop is the first strong beat after one. Sustained sound has no beats
     and so never has a groove: a held note, a chord or hiss can give neither.
 
-    A build-up is called once per breakdown, BUILD_AFTER seconds into it,
-    when the onsets speed up (the last 2 s hold half as many again as the 2 s
-    before, and at least ROLL) or, 4 s in, the level has climbed RISE_DB over
-    3.5 s and kept climbing through the middle. A steady hat or pad does
-    neither. During a breakdown only a strong beat ends it: a riser's noise
-    grazing the beat bands is not the kick coming back.
+    A build-up is called once per breakdown, and only once it is one (BREAK
+    seconds without a beat), so a kick dropping out for a bar or a fill, with
+    the hats going on, is never a build-up. It is the onsets speeding up
+    within the breakdown (the last 2 s hold half as many again as the 2 s
+    before, and at least ROLL) or the level climbing RISE_DB over 3.5 s and
+    through the middle; both windows lie inside the breakdown, so steady hats
+    in a kickless verse do neither. During a breakdown only a strong beat
+    ends it: a riser's noise grazing the beat bands is not the kick coming
+    back. `kick` says this frame had a beat-like onset of any strength, which
+    is enough to end a swell.
     """
 
     LOW_SHARE = BeatClock.LOW_SHARE
@@ -655,7 +659,7 @@ class DropWatch:
     STRONG = 0.45                     # ...and its colour-step accent
     GROOVE, GROOVE_SECS = 4, 4.0
     BREAK = 5.0
-    BUILD_AFTER = 1.5
+    WEAK_AFTER = 1.5                  # s into a gap from which a weak beat is ignored
     ROLL = 6                          # onsets in the last 2 s for a roll
     RISE_DB = 6.0
     QUIET = 0.004                     # rms: LevelEngine's silence
@@ -670,6 +674,7 @@ class DropWatch:
         self.onsets = deque()
         self.db = deque(maxlen=int(round(4.0 / dt)))
         self.frames = self.quiet = 0
+        self.kick = False
 
     def feed(self, f):
         """One analyser frame. -> "build", "drop" or None."""
@@ -677,7 +682,8 @@ class DropWatch:
         self.db.append(20.0 * math.log10(max(rms, 1e-7)))
         gated = f["onset"] and f["strength"] > self.GATE
         beat = gated and f["low"] >= self.LOW_SHARE * max(f["flux"], 1e-9)
-        if (beat and self.last_beat is not None and t - self.last_beat >= self.BUILD_AFTER
+        self.kick = beat
+        if (beat and self.last_beat is not None and t - self.last_beat >= self.WEAK_AFTER
                 and f["strength"] < self.STRONG):
             beat = False                # a riser's noise grazing the low bands is no kick
         if beat:
@@ -705,15 +711,15 @@ class DropWatch:
             self.onsets.append(t)
         while self.onsets and self.onsets[0] < t - 4.0:
             self.onsets.popleft()
-        if (not self.grooved or self.built or t - self.last_beat < self.BUILD_AFTER):
+        if not self.grooved or self.built or t - self.last_beat < self.BREAK:
             return None
         recent = sum(1 for x in self.onsets if x > t - 2.0)
         before = len(self.onsets) - recent
         rolling = recent >= self.ROLL and recent >= 1.5 * before + 1
         rising = False
-        # the level is compared only within the breakdown: from the groove
-        # into a loud pad is a step, not a climb
-        if len(self.db) == self.db.maxlen and t - self.last_beat >= 4.0:
+        # the level is compared only within the breakdown (BREAK > the 4 s
+        # it spans): from the groove into a loud pad is a step, not a climb
+        if len(self.db) == self.db.maxlen:
             db = np.fromiter(self.db, dtype=np.float32)
             n = int(round(0.5 / self.dt))
             old, mid, new = db[:n].mean(), db[len(db) // 2 - n // 2:][:n].mean(), db[-n:].mean()
@@ -761,9 +767,16 @@ class DropFx:
     switching it on mid-song finds a breakdown already under way). At the
     send point, take() hands over the flow to send for a pending event, and
     holding() says the loop must keep its own frames back: any send would
-    replace the flow. A drop cuts a swell short; a swell never interrupts a
-    strobe. When the effect ends, `handback` is True once, for a soft first
-    frame instead of a jump from full."""
+    replace the flow. A drop cuts a swell short, and so does any beat coming
+    back; a swell never interrupts a strobe or extends another swell. When
+    the effect ends, `handback` is True once, for a soft first frame instead
+    of a jump from full.
+
+    `light` and `level` are what the lamp shows meanwhile, for the page (the
+    swell's target, the strobe between its flashes; level on the colour
+    LEDs' 1..100 scale), and `end` the frame the lamp is left on, which a
+    bulb-timed beat right after must hold rather than the loop's new colour.
+    """
 
     HANDBACK_MS = 400
 
@@ -774,35 +787,50 @@ class DropFx:
         self.until = -1.0
         self.kind = None
         self.handback = False
+        self.light = self.end = None
+        self.level = 0
 
     def feed(self, f):
         event = self.watch.feed(f)
         if event == "drop" or (event == "build" and self.event is None):
             self.event = event
+        elif self.watch.kick and self.kind == "build":
+            self.until = -1.0                 # the beat is back: the swell is over
         return event
+
+    def wants(self, on=True):
+        """True when take() has a flow to hand over."""
+        return bool(on) and self.event is not None
 
     def take(self, now, frame, on=True):
         """-> the Flow to send now for a pending event, or None. `frame` is
         what the loop would send this tick (an hsv tuple or White)."""
         event, self.event = self.event, None
-        if not on or event is None or (event == "build" and self.kind == "drop"
-                                       and now < self.until):
+        if not on or event is None:
             return None
+        if event == "build" and self.kind is not None and now < self.until:
+            return None                       # never over a strobe, never a second swell
+        cap = round(100 * WHITE_GAIN)          # the white LEDs' full, matched to the colour's
         if isinstance(frame, White):
             hue = sat = 0
             white, level = frame.ct, frame.bright
+            self.level = max(1, round(frame.bright / WHITE_GAIN))
         else:
             (hue, sat, level), white = frame, None
+            self.level = int(level)
         if event == "build":
             flow = swell_flow(hue, sat, white)
             self.until = now + SWELL_HOLD
+            self.light = White(white, cap) if white is not None else (int(hue), int(sat), 100)
+            self.level = 100
         else:
             flow = strobe_flow(hue, sat, level, self.rate, self.flashes, white)
             self.until = now + flow_ms(flow)
-        if white is not None:                 # the white LEDs' full is 0.4 of theirs
+            self.light = frame
+        if white is not None:
             flow = Flow(flow.count, flow.action, tuple(
-                (ms, mode, val, min(br, round(100 * WHITE_GAIN)) if br == 100 else br)
-                for ms, mode, val, br in flow.steps))
+                (ms, mode, val, cap if br == 100 else br) for ms, mode, val, br in flow.steps))
+        self.end = self.light
         self.kind = event
         return flow
 
@@ -1033,13 +1061,19 @@ class CapturePacer:
     PIXEL = 0.04                      # per-channel change that counts for a pixel
     SHARE = 0.002                     # share of pixels that must change
     STEPS = ((12.0, 2.0), (1.5, 5.0))  # (seconds still, fps cap), longest first
+    # The pause light's own test is finer: a soft shape moving over a dark
+    # scene can change by 0.03, under PIXEL, and a paused player's frames are
+    # identical to the bit. 0.01 is 2.5 levels of 255.
+    STILL_PIXEL = 0.01
 
     def __init__(self):
         self.reset()
 
-        # when the picture last really moved: a reset (a control moved) is
-        # not motion, so it does not cut a pause light short
+        # when the picture last moved by STILL_PIXEL, compared with the last
+        # frame that did (so a slow drift adds up). A reset (a control moved)
+        # is not motion, so it does not cut a pause light short.
         self.moved_at = None
+        self.still_ref = None
 
     def reset(self):
         """Forget the stillness - the next frames run at the full rate."""
@@ -1049,13 +1083,16 @@ class CapturePacer:
     def period(self, frame, fps, now):
         """-> seconds from this grab to the next one."""
         ref = self.ref
-        if self.moved_at is None:
-            self.moved_at = now
+        sref = self.still_ref
+        if sref is None or sref.shape != frame.shape:
+            self.still_ref = frame
+            if self.moved_at is None:
+                self.moved_at = now
+        elif float((np.abs(frame - sref).max(axis=2) > self.STILL_PIXEL).mean()) > self.SHARE:
+            self.still_ref, self.moved_at = frame, now
         if (ref is None or ref.shape != frame.shape
                 or float((np.abs(frame - ref).max(axis=2) > self.PIXEL).mean())
                 > self.SHARE):
-            if ref is not None:
-                self.moved_at = now
             self.ref, self.still_since = frame, None
         elif self.still_since is None:
             self.still_since = now
@@ -1184,13 +1221,18 @@ class PauseLight:
     """Turns stillness into a soft warm white, for a paused film.
 
     It reads stillness only - how long since CapturePacer last saw the
-    picture move - never brightness, so a paused film and a still slide
-    both count however dark they are, and a dark scene that moves never
-    does. `delay` seconds of stillness raise the light, faded in over RISE_MS
-    on the bulb's own ramp; the first frame that moves (CapturePacer's
-    test: 0.2% of the pixels by 0.04) hands back to the picture over
-    SWITCH_MS. In fusion the sound must be gone too (`quiet`): a still
-    picture with music playing is an album cover, not a pause.
+    picture move (its fine test: 0.2% of the pixels by STILL_PIXEL 0.01) -
+    never brightness, so a paused film and a still slide both count however
+    dark they are, and a dark scene that moves, even a soft shape on a dark
+    ground, never does. `delay` seconds of stillness raise the light, faded
+    in over RISE_MS on the bulb's own ramp; the first frame that moves hands
+    back to the picture over SWITCH_MS. In fusion the sound must be gone too
+    (`quiet`): a still picture with music playing is an album cover, not a
+    pause.
+
+    `entered` and `left` stay set until ramp() takes them with the next
+    send, so a loop that has to skip a tick (fusion, while a flow runs)
+    still lands the edge with the right ramp.
 
     The light is fixed rather than taken from the picture: a paused frame
     may be black, and the point is to see the room.
@@ -1211,18 +1253,20 @@ class PauseLight:
         was = self.on
         self.on = bool(self.delay > 0 and quiet and moved_at is not None
                        and now - moved_at >= self.delay)
-        self.entered = self.on and not was
-        self.left = was and not self.on
+        if self.on != was:
+            self.entered, self.left = self.on, not self.on
         return self.on
 
     def frame(self):
         return white_frame(self.CT, self.LEVEL)
 
     def ramp(self, frame, last, period):
-        """The bulb-side ramp for this tick: slow into the pause, quick out."""
-        if self.entered:
+        """The bulb-side ramp for the frame about to be sent: slow into the
+        pause, quick out. Takes the pending edge."""
+        entered, left, self.entered, self.left = self.entered, self.left, False, False
+        if entered:
             return self.RISE_MS
-        if self.left:
+        if left:
             return max(ramp_ms(frame, last, period), SWITCH_MS)
         return ramp_ms(frame, last, period)
 
@@ -2371,6 +2415,7 @@ def run(args):
     sync = BeatSync(timed=args.bulb_clock)
     fx = DropFx()
     hold_until = 0.0
+    lamp = None                       # the frame the lamp was last left on
     last_sent = 0.0
     last_hsv = None
 
@@ -2402,16 +2447,18 @@ def run(args):
                 effect = fx.take(now, hsv, args.drops)
                 if effect is not None:
                     sender.put(effect, True, 0)
-                    last_sent, last_hsv = now, None
+                    last_sent, last_hsv, lamp = now, None, fx.end
                     continue
                 if fx.holding(now) or now < hold_until:
                     continue
-                if fired and sync.hold:
+                if fired and sync.hold and lamp is not None:
+                    # hold what the lamp shows, not this tick's new colour
                     peak = (hsv[0], hsv[1], int(round(np.clip(
                         4 + 96 * sync.flash ** args.gamma, 1, 100))))
-                    sender.put(beat_flow(sync.hold, last_hsv or hsv, peak), True, 0)
+                    sender.put(beat_flow(sync.hold, lamp, peak), True, 0)
                     hold_until = now + sync.hold + 0.05
-                    last_sent, last_hsv = now, peak
+                    fx.handback = False
+                    last_sent, last_hsv, lamp = now, peak, peak
                     continue
 
                 if not fired and same_light(hsv, last_hsv, hue_tol=2):
@@ -2422,7 +2469,7 @@ def run(args):
                 fading = color.fade_t is not None
                 sender.put(hsv, sudden=lvl.hit > 0.35 and not fading and not fx.handback,
                            duration=fx.ramp(np.clip(min_gap * 1000, 30, 150)))
-                last_sent, last_hsv = now, hsv
+                last_sent, last_hsv, lamp = now, hsv, hsv
     finally:
         link.close(restore=args.restore)
 
@@ -2507,6 +2554,7 @@ def run_fusion(args):
     sync = BeatSync(timed=args.bulb_clock)
     fx = DropFx()
     hold_until = 0.0
+    lamp, held_cut = None, False
     pause = PauseLight(args.pause)
     screen.start()
 
@@ -2535,6 +2583,7 @@ def run_fusion(args):
                     continue
 
                 hue, sat, _val, cut = screen.read()
+                cut, held_cut = cut or held_cut, False   # a held tick's cut lands next
                 val = int(round(np.clip(
                     4 + 96 * (lvl.brightness ** args.gamma), 1, 100)))
                 light = screen_frame(screen, hue, sat, val)
@@ -2543,30 +2592,33 @@ def run_fusion(args):
                 if pause.feed(screen.moved_at(), now, quiet):
                     light = pause.frame()
 
-                if not pause.on:
-                    effect = fx.take(now, light, args.drops)
-                    if effect is not None:
-                        sender.put(effect, True, 0)
-                        last_sent, last_hsv = now, None
-                        continue
-                if fx.holding(now) or now < hold_until:
+                effect = fx.take(now, light, args.drops and not pause.on)
+                if effect is not None:
+                    sender.put(effect, True, 0)
+                    last_sent, last_hsv, lamp, held_cut = now, None, fx.end, cut
                     continue
-                if fired and sync.hold and not pause.on:
+                if fx.holding(now) or now < hold_until:
+                    held_cut = cut
+                    continue
+                if (fired and sync.hold and lamp is not None and not pause.on
+                        and not (pause.entered or pause.left)):
                     peak = screen_frame(screen, hue, sat, int(round(np.clip(
                         4 + 96 * sync.flash ** args.gamma, 1, 100))))
-                    sender.put(beat_flow(sync.hold, last_hsv or light, peak), True, 0)
+                    sender.put(beat_flow(sync.hold, lamp, peak), True, 0)
                     hold_until = now + sync.hold + 0.05
-                    last_sent, last_hsv = now, peak
+                    fx.handback = False
+                    last_sent, last_hsv, lamp = now, peak, peak
                     continue
 
                 if not (cut or fired or pause.entered or pause.left) \
                         and same_light(light, last_hsv):
                     continue
 
-                sender.put(light, sudden=(cut or lvl.hit > 0.35) and not pause.on
-                           and not fx.handback,
+                # a cut lands sudden even on the hand-back from an effect
+                sender.put(light, sudden=(cut or (lvl.hit > 0.35 and not fx.handback))
+                           and not pause.on,
                            duration=fx.ramp(pause.ramp(light, last_hsv, min_gap)))
-                last_sent, last_hsv = now, light
+                last_sent, last_hsv, lamp = now, light, light
     finally:
         screen.close()
         link.close(restore=args.restore)
