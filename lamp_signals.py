@@ -315,7 +315,8 @@ class Signals:
     """
 
     def __init__(self, state, link=lambda: None, parked=None, lamp=None, pulse=None,
-                 read=None, clock=time.monotonic, wall=_dt.datetime.now, epoch=time.time):
+                 read=None, clock=time.monotonic, wall=_dt.datetime.now, epoch=time.time,
+                 lamp_lock=None):
         self.state = state
         self.link = link
         self.parked = parked or (lambda timeout=0.0: True)
@@ -331,7 +332,9 @@ class Signals:
         self.busy_until = 0.0                   # one alert at a time
         self.recent = deque()                   # alert times, for ALERTS_PER_MIN
         self._lock = threading.Lock()
-        self._lamp = threading.RLock()
+        # the desk's lamp lock (re-entrant), shared with lamp mode, the sleep
+        # timer and a session's open and close
+        self._lamp = lamp_lock or threading.RLock()
         self._focus_wake = threading.Event()
         self._alarm_wake = threading.Event()
         self._threads = []
@@ -356,9 +359,21 @@ class Signals:
         snap = self.state.snapshot()
         return snap["ip"], snap["running"]
 
-    def _free(self, wait):
+    def _free(self, wait=0.0):
         """Called holding `_lamp`: no session running, starting or restoring."""
         return not self.state.snapshot()["running"] and self.parked(wait)
+
+    def _settle(self, wait):
+        """Before taking `_lamp`: give a session that is stopping up to
+        `wait` s to finish its restore. Not under the lock - the session's
+        close needs it."""
+        if not self.state.snapshot()["running"]:
+            self.parked(wait)
+
+    def holding(self):
+        """Focus or the sunrise has the lamp: Follow the day stands back."""
+        with self._lock:
+            return self.focus.active or self.epoch() < self.ramp_until
 
     # -- alerts ------------------------------------------------------------
     def _tail(self, pulse_ms):
@@ -398,11 +413,12 @@ class Signals:
         link = self.link()
         if link is not None and link.flow([flow[0], 0, flow[1]], flow[2]):
             return 200, {"ok": True, "via": "session", "ms": flow[2]}
+        self._settle(3.0)
         with self._lamp:
             ip, running = self._ip()
             if not ip:
                 return refuse(409, "no bulb address")
-            if not self._free(3.0):
+            if not self._free():
                 return refuse(409, "the session has the lamp")
             try:
                 self.pulse(ip, flow, self._tail(flow[2]))
@@ -418,11 +434,12 @@ class Signals:
     def focus_op(self, op):
         """start / pause / reset. -> (code, payload)."""
         if op == "start":
+            self._settle(3.0)
             with self._lamp:
                 ip, running = self._ip()
                 if not ip:
                     return 409, {"ok": False, "error": "no bulb address"}
-                if not self._free(3.0):
+                if not self._free():
                     return 409, {"ok": False, "error": "Focus runs on a stopped desk"}
                 with self._lock:
                     fresh = not self.focus.active

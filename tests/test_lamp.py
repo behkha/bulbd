@@ -139,7 +139,7 @@ class FakeLamp:
 
     def __init__(self, power="on", bright=60, mode=2, ct=4000):
         self.st = {"power": power, "bright": bright, "color_mode": mode, "ct": ct,
-                   "rgb": 255, "hue": 0, "sat": 100}
+                   "rgb": 255, "hue": 0, "sat": 100, "flowing": 0}
         self.connections = 0
         self.sent = []
         self.fail = None
@@ -699,3 +699,63 @@ def test_cli_never_sends_again_after_a_desk_timeout(capsys):
         assert lamp_main(["toggle", "--ip", "10.0.0.9"], urlopen=urlopen,
                          send=lambda *a: pytest.fail("toggled twice")) == 1
         assert "did not answer" in capsys.readouterr().err
+
+
+# ------------------------------------- beside the other things on the lamp
+def test_a_flow_on_the_bulb_is_left_running_and_the_curve_comes_back_after():
+    """An On stop look, a sleep fade or a pulse is a flow: a set would end it."""
+    clock = Clock(13)
+    st, lm, fake = lamp_mode(clock, follow_day=True)
+    fake.st["flowing"] = 1
+    assert lm.tick() == "flow" and "set_ct_abx" not in fake.methods()
+    assert st.snapshot()["day_held"] is None                  # not a hand change
+    clock.advance(5)
+    assert lm.tick() == "flow" and "set_ct_abx" not in fake.methods()
+    fake.st["flowing"] = 0
+    fake.st.update(ct=6500)                                   # what the flow left
+    assert lm.tick() == "sent" and fake.st["ct"] == 5000
+    assert st.snapshot()["day_held"] is None
+
+
+def test_the_curve_stands_back_while_focus_or_the_sunrise_has_the_lamp():
+    clock = Clock(13)
+    st, lm, fake = lamp_mode(clock, follow_day=True)
+    assert lm.tick() == "sent"
+    busy = [True]
+    lm.yield_to = lambda: busy[0]
+    fake.st.update(ct=6000)                                   # the Focus white
+    clock.t = Clock(21)()
+    assert lm.tick() == "idle" and fake.connections == 1      # no connection at all
+    busy[0] = False
+    assert lm.tick() == "sent"                                # and no "hand" hold
+    assert st.snapshot()["day_held"] is None
+
+
+def test_a_request_from_another_website_is_refused():
+    st, lm, fake = lamp_mode()
+
+    def ask(method, path, body=None, **headers):
+        h = dash.Handler.__new__(dash.Handler)
+        h.state, h.lamp = st, lm
+        raw = b"" if body is None else json.dumps(body).encode()
+        h.headers = {"Content-Length": str(len(raw)), "Host": "localhost:8765", **headers}
+        h.rfile, h.wfile = io.BytesIO(raw), io.BytesIO()
+        h.path, h.command, h.request_version = path, method, "HTTP/1.1"
+        h.requestline, h.client_address, h.close_connection = "", ("127.0.0.1", 0), False
+        (h.do_GET if method == "GET" else h.do_POST)()
+        return int(h.wfile.getvalue().split()[1])
+
+    toggle = {"op": "toggle"}
+    # the page itself, and a script with no browser headers
+    assert ask("POST", "/api/lamp", toggle, Origin="http://localhost:8765") == 200
+    assert ask("POST", "/api/lamp", toggle, **{"Sec-Fetch-Site": "same-origin"}) == 200
+    assert ask("POST", "/api/lamp", toggle) == 200
+    sent = len(fake.sent)
+    # another site, another port on this machine, a sandboxed frame, an <img>
+    assert ask("POST", "/api/lamp", toggle, Origin="https://example.com") == 403
+    assert ask("POST", "/api/lamp", toggle, Origin="http://localhost:3000") == 403
+    assert ask("POST", "/api/lamp", toggle, Origin="null") == 403
+    assert ask("POST", "/api/control", {"running": False},
+               **{"Sec-Fetch-Site": "cross-site"}) == 403
+    assert ask("GET", "/api/lamp", **{"Sec-Fetch-Site": "cross-site"}) == 403
+    assert len(fake.sent) == sent                             # nothing reached the lamp
