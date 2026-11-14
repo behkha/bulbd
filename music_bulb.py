@@ -1228,6 +1228,22 @@ class Sender(threading.Thread):
         self.alive = True
         self.lost = threading.Event()
         self.error = None
+        # a flow the bulb runs itself (an alert), and until when the loop's
+        # frames are held so they do not paint over it
+        self._flow = None
+        self._flow_lock = threading.Lock()
+        self.hold_until = 0.0
+
+    HOLD_MARGIN = 0.08          # s: the flow starts ~half an RTT after it is sent
+
+    def flow(self, params, ms):
+        """Run a `start_cf` flow (params = [count, action, expression]) that
+        lasts `ms`, and hold every frame put meanwhile; the newest of them goes
+        out when the flow has ended. With end action 0 the bulb itself returns
+        to the last frame first, so the loop carries on where it was."""
+        with self._flow_lock:
+            self._flow = (params, ms)
+        self.put(_WAKE, False)                     # a frame put after it wakes us too
 
     def put(self, hsv, sudden, duration=40):
         """Queue one frame. `duration` is the bulb-side ramp for smooth sends;
@@ -1259,17 +1275,39 @@ class Sender(threading.Thread):
             self.join(timeout)
 
     def run(self):
+        held = None
         while self.alive:
-            item = self.box.get()                  # no wake-ups between frames
+            left = self.hold_until - time.monotonic()
+            try:
+                # no wake-ups between frames; a timer only while a flow holds them
+                item = self.box.get(timeout=left) if left > 0 else self.box.get()
+            except queue.Empty:
+                item, held = held, None            # the flow is over: newest frame out
+                if item is None:
+                    continue
             if item is None:
                 break
-            frame, sudden, duration = item
+            with self._flow_lock:
+                flow, self._flow = self._flow, None
             try:
+                if flow is not None:
+                    params, ms = flow
+                    self.bulb.send_command("start_cf", params)
+                    self.hold_until = time.monotonic() + ms / 1000.0 + self.HOLD_MARGIN
+                frame, sudden, duration = item
+                if frame is _WAKE:
+                    continue
+                if time.monotonic() < self.hold_until:
+                    held = item
+                    continue
                 send_frame(self.bulb, frame, sudden, duration)
             except Exception as exc:
                 self.error = exc
                 self.lost.set()
                 break
+
+
+_WAKE = object()                # put() by Sender.flow only to wake the thread
 
 
 def send_frame(bulb, frame, sudden, duration):
@@ -1781,6 +1819,14 @@ class Link:
         if self.sender is not None:
             self.sender.put(*a, **kw)
 
+    def flow(self, params, ms):
+        """An alert on the session's own connection. -> False with no sender."""
+        sender = self.sender
+        if sender is None or sender.lost.is_set():
+            return False
+        sender.flow(params, ms)
+        return True
+
     def _try(self):
         """One hello, maybe a search, one open. -> bulb or BulbUnreachable."""
         self.moved_note = None
@@ -2172,6 +2218,45 @@ def run_fusion(args):
         link.close(restore=args.restore)
 
 
+def run_alert(args):
+    """--alert: one pulse. A running desk is asked first (POST /api/alert),
+    because only the desk can hold a session's frames while the pulse runs;
+    with no desk answering, one short plain connection to --ip."""
+    import urllib.error
+    import urllib.request
+
+    from lamp_signals import alert_flow, alert_lamp, clean_alert
+
+    body = {"color": args.alert, "pulses": args.pulses, "speed": args.speed}
+    picked, error = clean_alert(body)
+    if error:
+        sys.exit(f"--alert: {error}")
+    if args.desk:
+        req = urllib.request.Request(args.desk.rstrip("/") + "/api/alert",
+                                     data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=4) as r:
+                reply = json.loads(r.read() or b"{}")
+            print(f"pulsed through the desk ({reply.get('via')})")
+            return
+        except urllib.error.HTTPError as exc:
+            try:
+                reason = json.loads(exc.read()).get("error")
+            except Exception:
+                reason = exc.reason
+            sys.exit(f"the desk refused the alert: {reason}")
+        except (urllib.error.URLError, OSError):
+            pass                                  # no desk: go to the lamp
+    if not args.ip:
+        sys.exit("no desk answered at --desk; pass --ip to reach the bulb directly")
+    try:
+        alert_lamp(args.ip, alert_flow(*picked))
+    except Exception as exc:
+        sys.exit(f"the bulb did not take the alert: {exc}")
+    print(f"pulsed {args.ip}")
+
+
 def capture_label(grab):
     """"ScreenCaptureKit" / "mss", and why not the stream if it was wanted."""
     if grab.backend == "sck":
@@ -2215,6 +2300,16 @@ def main():
                    help="smooth colour mode: sweep between palette anchors "
                         "over this many seconds instead of snapping "
                         "(0 = snap, the default; try 1.5)")
+
+    a = p.add_argument_group("alert")
+    a.add_argument("--alert", metavar="COLOR",
+                   help="pulse the lamp in this colour (#rrggbb or red, orange, "
+                        "green, blue, purple, white), then put back what it showed")
+    a.add_argument("--pulses", type=int, default=2, help="1-5 (default 2)")
+    a.add_argument("--speed", choices=("slow", "normal", "fast"), default="normal")
+    a.add_argument("--desk", default="http://127.0.0.1:8765", metavar="URL",
+                   help="a running desk to send the alert through (default "
+                        "%(default)s; '' to always go to --ip)")
 
     g = p.add_argument_group("screen mode")
     g.add_argument("--screen", action="store_true",
@@ -2276,6 +2371,10 @@ def main():
         if not (args.ip and args.token):
             p.error("--enable-lan needs --ip and --token")
         enable_lan(args.ip, args.token)
+        return
+
+    if args.alert:
+        run_alert(args)
         return
 
     if not args.ip:

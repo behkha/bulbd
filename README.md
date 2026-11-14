@@ -210,6 +210,34 @@ brightness.
   never turns on by itself. `--ip` and `--mic` win over the file, and a
   broken file costs only the values it breaks.
 
+### Signals
+
+Under the faders, on every mode:
+
+- **Alert** pulses the lamp in a colour, 1-5 times, slow, normal or fast,
+  and then it shows what it showed before - a colour, a white, or off again
+  for a lamp that was off. With a session running the pulse goes out on the
+  session's own connection and its frames wait until the pulse is over. The
+  same pulse from a script or a timer:
+
+      curl -X POST localhost:8765/api/alert -d '{"color":"#2fb457","pulses":3,"speed":"fast"}'
+      python music_bulb.py --alert green --pulses 3 --speed fast [--ip <bulb-ip>]
+
+  The CLI goes through a running desk (`--desk URL`, default
+  `http://127.0.0.1:8765`) and straight to `--ip` when no desk answers. One
+  pulse at a time: a second while one runs is refused.
+- **Focus** is a pomodoro: cool white (5000 K) for the work block, warm
+  (2700 K) for the break, a red pulse into work and a green one into a break.
+  Start, Pause/Resume, Reset; Reset puts the lamp back. It runs on a stopped
+  desk only, and Start (a session) ends it first. The lengths are saved; a
+  running block is not.
+- **Sunrise** at a set time ramps the lamp from 1% at 1700 K to 100% at
+  6500 K over 30 minutes, one flow the bulb runs by itself. The bulb has no
+  clock, so the desk has to be running and the Mac awake to start it; an
+  armed alarm shows its time beside the desk's status, and while it ramps
+  the top bar says *sunrise* with a **Stop**. A Mac that wakes up to 20 min
+  late still starts it; a session running at that time skips it.
+
 Binds to localhost. `--host 0.0.0.0` reaches it from your phone — there is no
 authentication, so only on a network you trust.
 
@@ -403,6 +431,7 @@ music_bulb.py        DSP, screen capture, CLI, bulb lifecycle
 music_bulb_dash.py   the web desk; CloudSession drives the login
 sck_capture.py       the ScreenCaptureKit stream backend (optional pyobjc)
 palettes.py          what a valid palette is; a palette from album art
+lamp_signals.py      alert pulses, the Focus timer and the sunrise alarm
 token_extractor.py   Xiaomi cloud token extractor, importable and still a CLI
 tests/               pytest suite (synthetic signals in tests/signals.py)
 tools/check_bulb.py  manual check against a real bulb; not part of the suite
@@ -410,6 +439,7 @@ tools/check_link.py  hello, find, diagnose and a power-cycle reconnect, real bul
 tools/check_white.py white-LED brightness match and temperature sweep, real bulb
 tools/check_sync.py  Beat sync against a click track on your speakers, real bulb
 tools/fake_bulb.py   a stand-in bulb on localhost for trying the desk without one
+                     (flows as the color5 runs them; --port beside another fake)
 tools/bench_capture.py  mss vs the stream: CPU per process and colour agreement
 ```
 

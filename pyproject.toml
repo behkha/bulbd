@@ -38,7 +38,7 @@ bulbd = "music_bulb:main"
 bulbd-desk = "music_bulb_dash:main"
 
 [tool.setuptools]
-py-modules = ["music_bulb", "music_bulb_dash", "token_extractor", "sck_capture", "palettes"]
+py-modules = ["music_bulb", "music_bulb_dash", "token_extractor", "sck_capture", "palettes", "lamp_signals"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
