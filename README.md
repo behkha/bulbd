@@ -27,7 +27,7 @@ over the Yeelight LAN API at 25 updates a second. Three ways to drive it:
 
 | Mode | Source | Behaviour |
 |---|---|---|
-| **music** | microphone or loopback PCM | onset detection steps the colour through palette anchors |
+| **music** | system audio, loopback or microphone PCM | onset detection steps the colour through palette anchors |
 | **screen** | whatever is on a display | dominant on-screen colour, interpolated, snapping on scene cuts |
 | **fusion** | both | the display picks hue and saturation, the audio drives brightness |
 
@@ -186,8 +186,9 @@ brightness.
   is fetched from the network. Music and Spotify do not let a cover be
   dragged out of them: save or copy it first, or box it on the screen.
 
-- **Input** (music and fusion) lists every capture device plus *Automatic*,
-  which names the device it resolves to. The bar under it is the raw input
+- **Input** (music and fusion) lists *System audio* (what the Mac is playing,
+  where it can be captured), every capture device, and *Automatic*, which
+  names what it resolves to. The bar under it is the raw input
   level in dBFS; after 1.5 s under -70 dBFS it reads **No signal** and so does
   the top bar, because a silent input otherwise looks exactly like a broken
   lamp. A saved input that is unplugged shows as *not connected* and Start
@@ -345,11 +346,23 @@ python token_extractor.py -ni -u you@example.com -p secret -s de -o out.json
 
 ## Audio capture on macOS
 
-`soundcard` has no CoreAudio loopback: `include_loopback=True` warns and is
-ignored. BlackHole is a virtual cable, not a system tap — it only carries
-what macOS *outputs* into it, so capturing from it while your output is the
-built-in speakers gives you digital silence, which looks exactly like a
-broken install.
+**System audio** is the default: what the Mac is playing, read straight from
+a ScreenCaptureKit stream. No virtual cable, no Multi-Output device, and the
+output and its volume keys stay as they are. It needs macOS 13, the `sck`
+extra and the Screen Recording permission (the one Screen and Fusion already
+use); macOS shows its recording indicator while a session listens.
+*Automatic* picks it whenever those are there, and it can be named:
+
+```bash
+python music_bulb.py --ip "$BULB_IP" --mic "System audio"
+python music_bulb.py --list-devices
+```
+
+Without them the old order applies. `soundcard` has no CoreAudio loopback:
+`include_loopback=True` warns and is ignored. BlackHole is a virtual cable,
+not a system tap — it only carries what macOS *outputs* into it, so capturing
+from it while your output is the built-in speakers gives you digital silence,
+which looks exactly like a broken install.
 
 To feed it, build a **Multi-Output Device** in Audio MIDI Setup containing the
 physical output *and* BlackHole 2ch — physical device first as master, drift
@@ -358,11 +371,10 @@ then select it as the system output:
 
 ```bash
 python music_bulb.py --ip "$BULB_IP" --mic "BlackHole 2ch"
-python music_bulb.py --list-devices
 ```
 
 With a Multi-Output device (or BlackHole itself) selected as the system
-output, `--mic` is optional: the virtual cable is picked automatically, in the
+output and no system audio, the virtual cable is picked automatically, in the
 CLI and on the desk. With a plain output selected it falls back to the
 microphone. On the desk the **Input** picker does what `--mic` does, and its
 level bar shows the silence straight away.
@@ -483,7 +495,7 @@ LAN, the clock and the capture frameworks, so it passes without pyobjc. About
 ```
 music_bulb.py        DSP, screen capture, CLI, bulb lifecycle
 music_bulb_dash.py   the web desk; CloudSession drives the login
-sck_capture.py       the ScreenCaptureKit stream backend (optional pyobjc)
+sck_capture.py       the ScreenCaptureKit backend: screen frames and system audio (optional pyobjc)
 palettes.py          what a valid palette is; a palette from album art
 bulb_alone.py        what the lamp runs on its own: On stop flows, Sleep, fades
 lamp_signals.py      alert pulses, the Focus timer and the sunrise alarm

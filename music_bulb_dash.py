@@ -40,6 +40,7 @@ import numpy as np
 
 from music_bulb import (PALETTES, SAMPLERATE, BLOCK, Analyser, ColorEngine,
                         LevelEngine, pick_recorder, enable_lan,
+                        SYSTEM_AUDIO, system_audio_blocked,
                         Capture, ScreenColorEngine, ScreenColorThread,
                         CapturePacer, crop_letterbox, screen_permission,
                         Link, BulbUnreachable, White, screen_frame, same_light,
@@ -661,7 +662,8 @@ def open_recorder(name):
     try:
         return pick_recorder(name, quiet=True)
     except RuntimeError:
-        if name:
+        # system audio says itself what it is missing
+        if name and name.strip().lower() != SYSTEM_AUDIO.lower():
             raise RuntimeError(f"{name} is not connected. Choose another input.")
         raise
 
@@ -669,10 +671,13 @@ def open_recorder(name):
 def audio_inputs():
     """What the input picker lists: every capture device, and the name the
     automatic choice resolves to right now."""
-    import soundcard as sc
     names = []
     with contextlib.suppress(Exception):
-        names = [m.name for m in sc.all_microphones()]
+        if system_audio_blocked() is None:
+            names.append(SYSTEM_AUDIO)
+    with contextlib.suppress(Exception):
+        import soundcard as sc
+        names += [m.name for m in sc.all_microphones() if m.name not in names]
     auto = ""
     with contextlib.suppress(Exception):
         auto = str(pick_recorder(None, quiet=True).name)

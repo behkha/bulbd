@@ -1,5 +1,6 @@
 """
-sck_capture.py - screen frames from a ScreenCaptureKit stream (macOS 12.3+).
+sck_capture.py - screen frames (macOS 12.3+) and system audio (13+) from
+ScreenCaptureKit streams.
 
 mss grabs the screen with CGWindowListCreateImage: every grab makes
 WindowServer composite the display and makes tccd / trustd / syspolicyd
@@ -31,6 +32,18 @@ What was checked on this Mac (macOS 27, pyobjc 13):
   ("Color LCD" on the built-in panel) - what mss returns - where sRGB or
   P3 would shift every value. The first frame's colour space is checked.
 - `sourceRect` is in the display's own points, origin top left.
+
+System audio rides on the same kit (macOS 13+): SystemAudio stands where a
+soundcard microphone does and AudioStream where its recorder does, so the
+audio loops read what the Mac is playing with no virtual cable and no
+Multi-Output device. Checked on this Mac:
+- A stream with only an audio output added delivers no pictures at all.
+- The audio is 48000 Hz float32, planar (one block: all of the left
+  channel, then all of the right), 960 frames every 20 ms, whatever
+  `sampleRate` asks for - 44100 was asked and ignored - so Resampler brings
+  it to the rate the loop wants.
+- Silence is delivered as buffers of zeros at the same pace, not withheld.
+- A buffer arrives 20-47 ms after its first sample was played.
 """
 
 import atexit
@@ -44,6 +57,7 @@ import numpy as np
 
 COMPLETE = 0                       # SCFrameStatus: a new picture
 IDLE = 1                           # nothing changed; the sample has no pixels
+SYSTEM_AUDIO = "System audio"      # the input's name, on the desk and the CLI
 
 
 class StreamDied(RuntimeError):
@@ -189,6 +203,63 @@ class Kit:
 
         handle["stream"].updateConfiguration_completionHandler_(cfg, done)
 
+    def start_audio(self, on_audio, on_stop, timeout=3.0):
+        """Start a stream that carries only what the Mac is playing.
+        `on_audio(sample)` gets each buffer. -> a handle for stop()."""
+        S = self.S
+        shown = self.displays(timeout)
+        if not shown:
+            raise RuntimeError("no display to attach the audio stream to")
+        main = self.Q.CGMainDisplayID()
+        display = next((d for d, _ in shown if d.displayID() == main), shown[0][0])
+        cfg = S.SCStreamConfiguration.alloc().init()
+        cfg.setWidth_(2)                       # a picture is never asked for:
+        cfg.setHeight_(2)                      # no screen output is added
+        cfg.setMinimumFrameInterval_(self.CM.CMTimeMake(10, 1))
+        cfg.setCapturesAudio_(True)
+        cfg.setChannelCount_(2)
+        cfg.setExcludesCurrentProcessAudio_(True)
+        flt = S.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
+        audio = S.SCStreamOutputTypeAudio
+
+        def on_sample(sample, kind):
+            if kind == audio:
+                on_audio(sample)
+
+        out = self.Output.alloc().init()
+        out.on_sample, out.on_stop = on_sample, on_stop
+        stream = S.SCStream.alloc().initWithFilter_configuration_delegate_(flt, cfg, out)
+        ok, err = stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            out, audio, None, None)
+        if not ok:
+            raise RuntimeError(f"could not add the audio output: {err}")
+        (error,) = _call(stream.startCaptureWithCompletionHandler_, timeout)
+        if error is not None:
+            raise RuntimeError(f"stream did not start: {error}")
+        return {"stream": stream, "out": out, "cfg": cfg}
+
+    def read_audio(self, sample):
+        """-> (float32 pcm of shape (frames, channels), its sample rate),
+        or None for a buffer with nothing in it."""
+        CM = self.CM
+        frames = CM.CMSampleBufferGetNumSamples(sample)
+        fmt = CM.CMSampleBufferGetFormatDescription(sample)
+        block = CM.CMSampleBufferGetDataBuffer(sample)
+        if not frames or fmt is None or block is None:
+            return None
+        # AudioStreamBasicDescription: rate, format, flags, bytes per packet,
+        # frames per packet, bytes per frame, channels, bits per channel
+        d = CM.CMAudioFormatDescriptionGetStreamBasicDescription(fmt)
+        rate, flags, channels, bits = d[0], d[2], d[6], d[7]
+        if not flags & 1 or bits != 32:        # kAudioFormatFlagIsFloat
+            raise ValueError("system audio is not 32-bit float")
+        status, data = CM.CMBlockBufferCopyDataBytes(
+            block, 0, CM.CMBlockBufferGetDataLength(block), None)
+        if status != 0:
+            return None
+        # kAudioFormatFlagIsNonInterleaved = 32
+        return pcm_frames(data, frames, channels, not flags & 32), float(rate)
+
     def stop(self, handle, timeout=2.0):
         """Stop the stream and wait for it to say so. -> True if it did."""
         out = handle["out"]
@@ -243,6 +314,23 @@ def close_all():
     """No stream outlives the process: the recording indicator goes off."""
     for grab in list(_LIVE):
         grab.close()
+
+
+def audio_supported():
+    """Could a system audio stream exist here? macOS 13+ with pyobjc's
+    ScreenCaptureKit installed. The Screen Recording grant is the caller's
+    question (music_bulb.system_audio_blocked). Imports no pyobjc."""
+    if sys.platform != "darwin":
+        return False
+    import importlib.util
+    import platform
+    try:
+        if int(platform.mac_ver()[0].split(".")[0]) < 13:
+            return False
+        return all(importlib.util.find_spec(m) is not None
+                   for m in ("ScreenCaptureKit", "CoreMedia", "Quartz"))
+    except Exception:
+        return False
 
 
 def find_display(displays, box):
@@ -388,3 +476,202 @@ class StreamGrabber:
                 self.kit.stop(handle)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# system audio
+# ---------------------------------------------------------------------------
+def pcm_frames(data, frames, channels, interleaved):
+    """Raw float32 samples -> shape (frames, channels). A planar buffer holds
+    each channel whole, one after the other."""
+    a = np.frombuffer(data, dtype=np.float32)
+    if frames <= 0 or channels <= 0 or a.size < frames * channels:
+        raise ValueError("audio buffer shorter than its format")
+    a = a[:frames * channels]
+    return a.reshape(frames, channels) if interleaved else a.reshape(channels, frames).T
+
+
+def fit_channels(pcm, channels):
+    """`pcm` (frames, n) with the channel count the loop asked for."""
+    have = pcm.shape[1]
+    if have == channels:
+        return pcm
+    if channels == 1:
+        return pcm.mean(axis=1, keepdims=True)
+    if have == 1:
+        return np.repeat(pcm, channels, axis=1)
+    return pcm[:, :channels] if have > channels else np.pad(pcm, ((0, 0), (0, channels - have)))
+
+
+class Resampler:
+    """A stream of (frames, channels) blocks from `src` Hz to `dst` Hz by
+    linear interpolation, continuous across blocks. Enough for a ten-band
+    analyser: the loss is a fixed tilt (3 dB at 16 kHz going 48000 -> 44100),
+    and every band is judged against its own recent peak."""
+
+    def __init__(self, src, dst):
+        self.src, self.dst = float(src), float(dst)
+        self.step = self.src / self.dst
+        self.pos = 0.0                # the next output, in input frames
+        self.tail = None              # the last input frame of the block before
+
+    def feed(self, pcm):
+        if self.src == self.dst:
+            return pcm
+        if self.tail is not None:
+            pcm = np.concatenate([self.tail, pcm])
+        last = len(pcm) - 1
+        self.tail = pcm[-1:]
+        count = max(0, int(math.ceil((last - self.pos) / self.step)))
+        at = self.pos + self.step * np.arange(count)
+        self.pos += count * self.step - last
+        i = np.minimum(at.astype(np.int64), max(last - 1, 0))
+        frac = (at - i).astype(np.float32)[:, None]
+        return pcm[i] * (1 - frac) + pcm[np.minimum(i + 1, last)] * frac
+
+
+class AudioStream:
+    """What a soundcard recorder gives a loop - `record(numframes)` blocks
+    until that many frames are there and returns float32 of shape
+    (numframes, channels) - fed by the system audio stream.
+
+    Buffers are converted on ScreenCaptureKit's thread and queued; at most
+    BACKLOG seconds are kept, so a loop that stopped reading (a reconnect)
+    comes back to the present instead of working through the past. A stream
+    that stalls costs a block of silence per GRACE rather than a hung loop;
+    one that stops is started again, at most once per RESTART seconds.
+    """
+
+    BACKLOG = 0.5
+    GRACE = 0.25
+    RESTART = 5.0
+
+    def __init__(self, samplerate, channels=2, kit=None):
+        self.rate, self.channels = float(samplerate), int(channels)
+        self.kit = kit
+        self.error = None
+        self.dropped = 0                       # frames the backlog cap threw away
+        self._cap = int(self.BACKLOG * self.rate)
+        self._chunks, self._have = [], 0
+        self._cond = threading.Condition()
+        self._resample = None
+        self._handle = None
+        self._started = None
+
+    def __enter__(self):
+        self._start()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _start(self):
+        try:
+            if self.kit is None:
+                self.kit = Kit()
+            self.error = None
+            self._started = time.monotonic()
+            self._handle = self.kit.start_audio(self._on_audio, self._on_stop)
+        except Exception as e:
+            raise RuntimeError(f"{SYSTEM_AUDIO} did not start: {e}") from e
+        _LIVE.add(self)
+
+    # -- ScreenCaptureKit's thread ------------------------------------------
+    def _on_audio(self, sample):
+        got = self.kit.read_audio(sample)
+        if got is None:
+            return
+        pcm, rate = got
+        if self._resample is None or self._resample.src != rate:
+            self._resample = Resampler(rate, self.rate)
+        pcm = fit_channels(self._resample.feed(pcm), self.channels)
+        if not len(pcm):
+            return
+        with self._cond:
+            self._chunks.append(pcm)
+            self._have += len(pcm)
+            while self._have - len(self._chunks[0]) >= self._cap:
+                old = self._chunks.pop(0)
+                self._have -= len(old)
+                self.dropped += len(old)
+            self._cond.notify()
+
+    def _on_stop(self, error):
+        with self._cond:
+            self.error = StreamDied(f"the audio stream stopped: {error}")
+            self._cond.notify()
+
+    # -- the loop's thread --------------------------------------------------
+    def record(self, numframes):
+        numframes = int(numframes)
+        self._cap = max(self._cap, 2 * numframes)
+        deadline = time.monotonic() + numframes / self.rate + self.GRACE
+        with self._cond:
+            while self._have < numframes and self.error is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
+            died = self.error if self._have < numframes else None
+            out = self._take(numframes)
+        if died is not None:
+            self._restart(died)
+        return out
+
+    def _take(self, n):
+        parts, got = [], 0
+        while got < n and self._chunks:
+            chunk = self._chunks[0]
+            if len(chunk) <= n - got:
+                parts.append(self._chunks.pop(0))
+            else:
+                parts.append(chunk[:n - got])
+                self._chunks[0] = chunk[n - got:]
+            got += len(parts[-1])
+        self._have -= got
+        if got < n:                            # a stall: the rest is silence
+            parts.append(np.zeros((n - got, self.channels), dtype=np.float32))
+        return np.ascontiguousarray(np.concatenate(parts), dtype=np.float32)
+
+    def _restart(self, died):
+        """The stream stopped (the display went, the Mac slept): one new one,
+        unless the last start is too recent to be anything but a loop."""
+        if self._handle is None:
+            raise died                          # closed, or never started
+        if time.monotonic() - self._started < self.RESTART:
+            raise died
+        self._stop()
+        try:
+            self._start()
+        except RuntimeError as e:
+            raise StreamDied(f"{died}; {e}") from e
+
+    def _stop(self):
+        with self._cond:
+            handle, self._handle = self._handle, None
+        _LIVE.discard(self)
+        if handle is not None:
+            try:
+                self.kit.stop(handle)
+            except Exception:
+                pass
+
+    def close(self):
+        """Stop the stream. Safe to call twice and from any thread."""
+        self._stop()
+        with self._cond:
+            self._cond.notify_all()
+
+
+class SystemAudio:
+    """What the Mac is playing, where the loops expect a soundcard
+    microphone: a `name` and `recorder()`. Nothing starts until the
+    recorder is entered."""
+
+    name = SYSTEM_AUDIO
+
+    def __init__(self, kit=None):
+        self.kit = kit
+
+    def recorder(self, samplerate, channels=2, **_):
+        return AudioStream(samplerate, channels, kit=self.kit)

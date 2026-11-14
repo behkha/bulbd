@@ -2531,6 +2531,8 @@ def list_devices():
     except TypeError:
         mics = sc.all_microphones()
     print("Capture devices:")
+    why = system_audio_blocked()
+    print("   ", SYSTEM_AUDIO, f"  (unavailable: {why})" if why else "")
     for m in mics:
         print("   ", m.name)
     print("\nOutput devices:")
@@ -2573,7 +2575,37 @@ def _output_feeds_a_cable(speaker):
         return False
 
 
+SYSTEM_AUDIO = "System audio"     # sck_capture.SYSTEM_AUDIO; that module loads lazily
+
+
+def system_audio_blocked():
+    """None if what the Mac is playing can be captured directly (the
+    ScreenCaptureKit audio stream), else the sentence saying why not."""
+    import sck_capture
+    if not sck_capture.audio_supported():
+        if sys.platform != "darwin":
+            return f"{SYSTEM_AUDIO} is macOS only"
+        return (f"{SYSTEM_AUDIO} needs macOS 13 and the sck extra "
+                "(pip install -e '.[sck]')")
+    if screen_permission() is False:
+        return (f"{SYSTEM_AUDIO} needs Screen Recording permission - grant it in "
+                "System Settings > Privacy & Security, or choose another input")
+    return None
+
+
 def pick_recorder(mic_name=None, quiet=False):
+    """The input to capture: a soundcard microphone, or SystemAudio, which
+    stands in for one. With no name the order is system audio, a loopback of
+    the output, a virtual cable the output feeds, the default microphone."""
+    if (mic_name or "").strip().lower() == SYSTEM_AUDIO.lower():
+        why = system_audio_blocked()
+        if why:
+            raise RuntimeError(why)
+        import sck_capture
+        return sck_capture.SystemAudio()
+    if not mic_name and system_audio_blocked() is None:
+        import sck_capture
+        return sck_capture.SystemAudio()
     import soundcard as sc
     if mic_name:
         for attempt in (lambda: sc.get_microphone(mic_name, include_loopback=True),
@@ -2951,7 +2983,9 @@ def main():
     p.add_argument("--ip")
     p.add_argument("--token", help="only for --enable-lan")
     p.add_argument("--enable-lan", action="store_true")
-    p.add_argument("--mic", help="exact audio device name to capture")
+    p.add_argument("--mic", help="exact audio device name to capture, or "
+                        f"'{SYSTEM_AUDIO}' for what the Mac is playing "
+                        "(the default where it is available)")
     p.add_argument("--list-devices", action="store_true",
                    help="print every capture and output device, then exit")
     p.add_argument("--palette", choices=sorted(PALETTES), default=None,
