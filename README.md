@@ -215,7 +215,9 @@ brightness.
   zero, stops without restoring; after Stop, a restored look fades on the
   bulb and an On stop look keeps running until the lamp switches off.
   `python music_bulb.py --ip <bulb-ip> --sleep 30` sets it from a shell
-  (`--sleep 0` clears it).
+  (`--sleep 0` clears it). The shell cannot tell its own fade from an On stop
+  look, so it fades, or on 0 freezes, whatever the lamp shows. **Use as
+  power-on look** waits for Stop.
 - **Use as power-on look** (Setup) makes what the lamp shows now the look it
   comes on with from the wall switch. The old one cannot be read back, so it
   asks first; `tools/check_default.py` does the same from a shell.

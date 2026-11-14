@@ -224,7 +224,8 @@ def engine(monkeypatch):
     st = make_state(ip="192.168.1.2")
     eng = dash.Engine(st)
     eng.sleep.call = lambda ip, batches: []
-    return st, eng
+    yield st, eng
+    eng.sleep._disarm()
 
 
 def stop_once(st, eng, saved=None):
@@ -288,12 +289,14 @@ def test_restore_with_a_timer_hands_the_fade_to_the_bulb(engine):
     assert st.snapshot()["sleep"]["step"] == [2, 2700, 30]      # Cancel puts this back
 
 
-def test_a_lamp_restored_to_off_drops_the_timer(engine):
+def test_a_lamp_restored_to_off_gets_nothing_after_its_set_power_off(engine):
+    # review 7: a cron_del after set_power off could be refused and turn a
+    # good restore into "could not restore"; the bulb's timer is harmless
     st, eng = engine
-    st.set(sleep={"at": time.time() + 1800, "step": None})
+    st.set(sleep={"at": time.time() + 1800, "step": [2, 2700, 30]})
     link = stop_once(st, eng, saved=dict(WARM, power="off"))
-    assert link.closed is True and link.then == [("cron_del", [0])]
-    assert st.snapshot()["sleep"] is None
+    assert link.closed is True and link.then == []
+    assert st.snapshot()["sleep"]["step"] is None
 
 
 def test_an_idle_look_keeps_running_under_a_timer(engine):
@@ -309,7 +312,7 @@ def test_a_timer_running_out_ends_the_session_dark(engine):
     st.set(idle="candle")
 
     def loop(st_, link):
-        st_.set(sleep={"at": time.time() + 600, "step": None})
+        st_.set(sleep={"at": time.time() + 0.2, "step": None})
         eng.sleep._fire()                                    # the timer runs out
         assert not st_.snapshot()["running"]
     run_session(st, eng, loop)
@@ -410,7 +413,7 @@ def test_cancel_clears_the_timer_and_puts_the_faded_look_back():
 
 
 def test_running_out_while_stopped_only_clears_the_desk():
-    st, t = timer(Bulb(), sleep={"at": time.time() + 600, "step": None})
+    st, t = timer(Bulb(), sleep={"at": time.time() + 0.2, "step": None})
     t._disarm()
     t._fire()
     assert st.snapshot()["sleep"] is None and not t.fired.is_set()
@@ -439,3 +442,238 @@ def test_power_on_look_endpoint(monkeypatch):
     code, _ = post(st, {}, path="/api/default")
     assert code == 200 and sent == [("192.168.1.2", [("set_default", [])])]
     assert post(make_state(), {}, path="/api/default")[0] == 400       # no bulb set up
+
+
+# ------------------------------------------------- lead review, round 1
+def test_review1_a_second_time_replaces_our_fade_and_off_ends_it():
+    bulb = Bulb()
+    st, t = timer(bulb)
+    try:
+        assert t.start(30) == ""
+        step = st.snapshot()["sleep"]["step"]
+        bulb.props[-1] = "1"                              # our fade shows as flowing now
+        assert t.start(60) == ""
+        assert bulb.sent[-1] == alone.sleep_commands(60, step)    # replaced, same look
+        assert st.snapshot()["sleep"]["step"] == step
+        assert t.cancel() == ""
+        assert bulb.sent[-1] == alone.cancel_commands(step)       # the fade is ended
+    finally:
+        t._disarm()
+
+
+def test_review1_cli_never_leaves_an_old_fade_running(monkeypatch):
+    sent = []
+    flowing = ["0"]
+
+    class Sock:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: Sock())
+    monkeypatch.setattr(music_bulb, "read_lamp", lambda ip, **kw: dict(WARM))
+
+    def call(ip, cmds, **kw):
+        sent.append(cmds)
+        return [flowing if m == "get_prop" else ["ok"] for m, _ in cmds]
+    monkeypatch.setattr(music_bulb, "lamp_call", call)
+    args = type("A", (), {"ip": "192.0.2.1", "sleep": 30})()
+    music_bulb.sleep_now(args)
+    assert sent[-1] == alone.sleep_commands(30, [2, 2700, 30])
+    flowing[0] = "1"                                      # its fade is running
+    args.sleep = 60
+    music_bulb.sleep_now(args)
+    assert sent[-1] == [("cron_del", [0])] + alone.sleep_commands(60, [2, 2700, 30])
+    args.sleep = 0
+    music_bulb.sleep_now(args)
+    assert sent[-1] == alone.cancel_commands([2, 2700, 30])  # frozen, not left to fade off
+
+
+class Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+class Rec:
+    def __init__(self):
+        self.puts = []
+
+    def put(self, *a, **kw):
+        self.puts.append((a, kw))
+
+
+def test_review2_a_still_frame_is_resent_as_the_fade_dims():
+    clock, rec, f = Clock(), Rec(), [1.0]
+    d = alone.Dimmed(rec, lambda: f[0], clock=clock)
+    d.put((10, 80, 60), sudden=False, duration=40)
+    f[0] = 0.5
+    assert d.refresh() is False                           # the loop sent just now
+    clock.t += alone.Dimmed.REFRESH
+    assert d.refresh() is True
+    assert rec.puts[-1] == (((10, 80, 30), False, int(alone.Dimmed.REFRESH * 1000)), {})
+    clock.t += alone.Dimmed.REFRESH
+    assert d.refresh() is False                           # same level: nothing to send
+    d2 = alone.Dimmed(Rec(), lambda: 1.0, clock=clock)
+    assert d2.refresh() is False                          # no frame yet
+
+
+def test_review2_the_fader_wakes_only_inside_the_fade(monkeypatch):
+    monkeypatch.setattr(alone.Dimmed, "REFRESH", 0.02)
+    st = make_state(ip="192.168.1.2", sleep={"at": time.time() + 300, "step": None})
+    eng = dash.Engine(st)
+    calls = []
+    done = __import__("threading").Event()
+    dimmed = type("D", (), {"refresh": lambda self: calls.append(1)})()
+    th = __import__("threading").Thread(target=eng._fade, args=(dimmed, done), daemon=True)
+    th.start()
+    time.sleep(0.2)
+    done.set(); eng.sleep.kick.set(); th.join(1)
+    assert len(calls) >= 3
+    eng.sleep._disarm()
+    st2 = make_state(ip="192.168.1.2")                    # no timer: it never wakes
+    eng2 = dash.Engine(st2)
+    calls.clear()
+    done2 = __import__("threading").Event()
+    th = __import__("threading").Thread(target=eng2._fade, args=(dimmed, done2), daemon=True)
+    th.start()
+    time.sleep(0.1)
+    done2.set(); eng2.sleep.kick.set(); th.join(1)
+    assert calls == []
+
+
+def get_state(state, engine):
+    h = dash.Handler.__new__(dash.Handler)
+    h.state = state
+    h.headers = {"Host": "localhost:8765"}
+    h.rfile, h.wfile = __import__("io").BytesIO(), __import__("io").BytesIO()
+    h.path, h.command, h.request_version = "/api/state", "GET", "HTTP/1.1"
+    h.requestline, h.client_address, h.close_connection = "", ("127.0.0.1", 0), False
+    h.do_GET()
+    return __import__("json").loads(h.wfile.getvalue().partition(b"\r\n\r\n")[2])
+
+
+def test_review2_the_page_shows_the_dimmed_level(monkeypatch):
+    st = make_state(ip="192.168.1.2", sleep={"at": time.time() + 300, "step": None})
+    eng = type("E", (), {})()
+    eng.sleep = dash.SleepTimer(st, call=Bulb())
+    monkeypatch.setattr(dash.Handler, "engine", eng, raising=False)
+    try:
+        st.set(running=True, val=80)
+        assert get_state(st, eng)["val"] == pytest.approx(40, abs=1)
+        st.set(running=False)
+        assert get_state(st, eng)["val"] == 80
+    finally:
+        eng.sleep._disarm()
+
+
+def test_review3_a_timer_whose_end_has_passed_is_over():
+    st, t = timer(Bulb())
+    st.set(sleep={"at": time.time() - 30, "step": None})  # the Mac slept through it
+    assert t.left() is None and t.current() is None
+    assert alone.dim_factor(t.left()) == 1.0              # a new session is not dimmed
+    t.session_started()
+    assert st.snapshot()["sleep"] is None
+    t._disarm()
+
+
+def test_review3_a_late_timer_does_not_end_a_session_started_after_it():
+    st, t = timer(Bulb())
+    st.set(sleep={"at": time.time() - 30, "step": None}, running=True)
+    t.session_from = time.time()                          # started after waking
+    t._fire()
+    snap = st.snapshot()
+    assert snap["running"] and snap["sleep"] is None and not t.fired.is_set()
+    t._disarm()
+
+
+@pytest.mark.parametrize("how", ["idle", "no_restore", "no_look"])
+def test_review4_stop_without_a_fade_forgets_the_old_look(engine, how):
+    st, eng = engine
+    st.set(sleep={"at": time.time() + 1800, "step": [1, 0x3366FF, 70]})
+    saved = dict(WARM)
+    if how == "idle":
+        st.set(idle="candle")
+    elif how == "no_restore":
+        eng.restore = False
+    else:
+        saved = dict(WARM, bright=0)                      # nothing look_step can use
+    stop_once(st, eng, saved=saved)
+    assert st.snapshot()["sleep"]["step"] is None
+    sent = []
+    eng.sleep.call = lambda ip, batches: sent.extend(batches)
+    eng.sleep.cancel()
+    assert sent == [alone.cancel_commands()]              # only cron_del: the candle stays
+
+
+def test_review4_a_session_drops_the_fade_its_frames_replace(engine):
+    st, eng = engine
+    st.set(sleep={"at": time.time() + 1800, "step": [2, 2700, 30]})
+    seen = []
+
+    def loop(st_, link):
+        seen.append(st_.snapshot()["sleep"]["step"])
+        st_.set(running=False)
+    eng.restore = False
+    run_session(st, eng, loop)
+    assert seen == [None]
+
+
+def test_review5_fired_never_outlives_its_session():
+    st, t = timer(Bulb())
+    st.set(sleep={"at": time.time() + 0.2, "step": None}, running=True)
+    t._fire()                                             # running, but no session began
+    assert not t.fired.is_set()
+    t.fired.set()
+    t.session_started()
+    assert not t.fired.is_set()
+    t._disarm()
+
+
+def test_review6_power_on_look_is_refused_during_a_session(monkeypatch):
+    sent = []
+    monkeypatch.setattr(music_bulb, "lamp_call", lambda *a, **k: sent.append(a))
+    st = make_state(ip="192.168.1.2")
+    st.set(running=True)
+    code, body = post(st, {}, path="/api/default")
+    assert code == 409 and sent == []
+
+
+def test_review6_lamp_calls_hold_the_lock():
+    held = []
+    st, t = timer(None)
+
+    def call(ip, batches):
+        held.append(t._lock._is_owned())
+        return Bulb()(ip, batches)
+    t.call = call
+    try:
+        t.start(30)
+        t.cancel()
+        assert held == [True, True]
+    finally:
+        t._disarm()
+
+
+def test_review8_a_failing_leave_still_stops_and_closes(engine, monkeypatch):
+    st, eng = engine
+
+    def boom(cfg, link):
+        raise KeyError("idle")
+    monkeypatch.setattr(eng, "_leave", boom)
+    link = stop_once(st, eng)
+    assert link.closed is True and link.then == []
+
+
+def test_review9_a_superseded_timer_callback_does_nothing():
+    st, t = timer(Bulb())
+    try:
+        t.start(30)
+        old = t._gen
+        t.start(60)
+        st.set(sleep=dict(st.snapshot()["sleep"], at=time.time() + 0.1))
+        t._fire(old)                                      # the 30-minute Timer, already running
+        assert st.snapshot()["sleep"] is not None
+    finally:
+        t._disarm()

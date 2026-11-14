@@ -2204,20 +2204,34 @@ def leave_commands(args):
 
 def sleep_now(args):
     """--sleep: set (or with 0 clear) the bulb's own off timer and exit. One
-    short connection; a still look also gets the fade."""
+    short connection.
+
+    The CLI keeps no state, so it cannot tell its own earlier fade from an
+    idle look the desk left running (and on this firmware flow_params does
+    not describe the running flow). It takes the safe side: a new time fades
+    whatever the lamp shows now, replacing any flow, and 0 also freezes a
+    running flow on its current look. Either way no earlier fade can still
+    switch the lamp off at its old time."""
     from bulb_alone import SLEEP_MAX, cancel_commands, look_step, sleep_commands
-    if args.sleep == 0:
-        lamp_call(args.ip, cancel_commands())
-        print("sleep timer cleared")
-        return
-    if not 1 <= args.sleep <= SLEEP_MAX:
+    if not 0 <= args.sleep <= SLEEP_MAX:
         raise SystemExit(f"--sleep must be 0..{SLEEP_MAX} minutes")
-    saved = read_lamp(args.ip)
-    if not saved or saved["power"] != "on":
-        raise SystemExit("the lamp is off: nothing to switch off")
-    (flowing,) = lamp_call(args.ip, [("get_prop", ["flowing"])])
-    step = None if (flowing or ["0"])[0] == "1" else look_step(saved)
-    lamp_call(args.ip, sleep_commands(args.sleep, step))
+    sock = socket.create_connection((args.ip, LAMP_PORT), 2)
+    try:
+        saved = read_lamp(args.ip, sock=sock)
+        (flowing,) = lamp_call(args.ip, [("get_prop", ["flowing"])], sock=sock)
+        running = (flowing or ["0"])[0] == "1"
+        if args.sleep == 0:
+            step = look_step(saved) if running else None
+            lamp_call(args.ip, cancel_commands(step), sock=sock)
+            print("sleep timer cleared")
+            return
+        if not saved or saved["power"] != "on":
+            raise SystemExit("the lamp is off: nothing to switch off")
+        step = look_step(saved)
+        lamp_call(args.ip, ([("cron_del", [0])] if running else [])
+                  + sleep_commands(args.sleep, step), sock=sock)
+    finally:
+        sock.close()
     print(f"the lamp switches off in {args.sleep} min"
           + (", fading over the last 10" if step else ""))
 

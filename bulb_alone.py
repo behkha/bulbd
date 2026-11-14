@@ -17,6 +17,7 @@ release_bulb(then=...); nothing opens a connection. Measured on the color5
 """
 import colorsys
 import math
+import threading
 import time
 
 IDLE_LOOKS = ("restore", "candle", "drift", "breathe")
@@ -160,31 +161,66 @@ def dim_factor(left_s, fade_s=SLEEP_FADE_S):
     return max(0.01, left_s / fade_s)
 
 
+def dim_level(v, factor):
+    """One brightness number scaled, never below 1 (0 stays 0)."""
+    if factor >= 1.0 or not v:
+        return v
+    return max(1, round(v * factor))
+
+
 def dim_frame(frame, factor):
     """A frame with its brightness scaled: an (h, s, v) tuple or a White."""
     if factor >= 1.0:
         return frame
     if hasattr(frame, "ct") and hasattr(frame, "bright"):
-        return type(frame)(frame.ct, max(1, round(frame.bright * factor)))
+        return type(frame)(frame.ct, dim_level(frame.bright, factor))
     h, s, v = frame
-    return (h, s, max(1, round(v * factor)))
+    return (h, s, dim_level(v, factor))
 
 
 class Dimmed:
     """A Link whose frames are dimmed by `factor()`; everything else passes
-    through. The desk hands this to its loops while a sleep timer runs."""
+    through. The desk hands this to its loops while a session runs.
 
-    def __init__(self, link, factor):
-        self._link, self._factor = link, factor
+    The loops send only when the light changes (same_light), so on a still
+    picture or in silence nothing would carry the fade: refresh() re-sends
+    the last frame, dimmed, when the loops have been quiet for REFRESH s and
+    the dimmed level moved. Its ramp is REFRESH long, so the steps join up."""
+
+    REFRESH = 2.0
+
+    def __init__(self, link, factor, clock=time.monotonic):
+        object.__setattr__(self, "_link", link)
+        object.__setattr__(self, "_factor", factor)
+        object.__setattr__(self, "_clock", clock)
+        object.__setattr__(self, "_lock", threading.Lock())
+        object.__setattr__(self, "_last", None)     # (frame, args, kwargs) as the loop sent it
+        object.__setattr__(self, "_sent", None)     # the dimmed frame last on the wire
+        object.__setattr__(self, "_at", 0.0)
 
     def put(self, frame, *a, **kw):
-        self._link.put(dim_frame(frame, self._factor()), *a, **kw)
+        with self._lock:
+            out = dim_frame(frame, self._factor())
+            object.__setattr__(self, "_last", (frame, a, kw))
+            object.__setattr__(self, "_sent", out)
+            object.__setattr__(self, "_at", self._clock())
+            self._link.put(out, *a, **kw)
+
+    def refresh(self):
+        """-> True if the last frame was re-sent at the current dim."""
+        with self._lock:
+            if self._last is None or self._clock() - self._at < self.REFRESH:
+                return False
+            out = dim_frame(self._last[0], self._factor())
+            if out == self._sent:
+                return False
+            object.__setattr__(self, "_sent", out)
+            object.__setattr__(self, "_at", self._clock())
+            self._link.put(out, False, int(self.REFRESH * 1000))
+            return True
 
     def __getattr__(self, name):
         return getattr(self._link, name)
 
     def __setattr__(self, name, value):
-        if name.startswith("_"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._link, name, value)
+        setattr(self._link, name, value)

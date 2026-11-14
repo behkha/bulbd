@@ -774,22 +774,41 @@ class SleepTimer:
     The bulb counts (cron_add), so the lamp switches off on time whether the
     desk runs, quits or the Mac sleeps. The desk keeps `sleep` = {at, step}
     in its settings and arms one threading.Timer for `at`: no polling, a
-    stopped desk sleeps until then. When the timer runs out during a
-    session, `fired` makes the session end without the restore, which would
-    switch the lamp back on.
+    stopped desk sleeps until then. `at` is wall time: a timer whose `at`
+    has passed is over, even if the threading.Timer (which does not count
+    system sleep) has not fired yet.
 
-    Set while stopped on a still look, the bulb also fades it (a flow ending
-    in off) and `step` keeps the look for Cancel. During a session the
-    session dims its own frames (bulb_alone.Dimmed); on Stop, _leave() hands
-    the fade to the bulb for the time left.
+    `step` is the desk's own fade: the look a fade flow on the bulb is
+    dimming, set when one was sent and None otherwise. It, not the bulb's
+    `flowing`, says whose flow is running, so a new time replaces our fade
+    and Cancel ends it, while an idle look is left alone. A session's frames
+    replace any flow, so a session clears it; on Stop, _leave() hands the
+    fade back to the bulb or clears it.
+
+    When the timer runs out during a session that began before `at`,
+    `fired` makes that session end without the restore, which would switch
+    the lamp back on. A session clears `fired` when it starts.
+
+    Every read-modify-write of `sleep` and every lamp call holds `_lock`, so
+    the HTTP threads, the Timer callback and the session's Stop see one
+    order. Each arm gets a new generation; a callback from an older one
+    does nothing.
+
+    The bulb is reached with one short connection (`call`): during a session
+    yeelight has closed the control socket and the music connection never
+    answers, so a reply (the lamp is off, -5006) can only come back on a
+    connection of its own. _lock keeps it to one at a time.
     """
 
     def __init__(self, state, call=None):
         self.state = state
         self.call = call or self._call
         self.fired = threading.Event()
+        self.kick = threading.Event()           # wakes the session's fader
+        self.session_from = None                # wall time the running session began
         self._timer = None
-        self._lock = threading.Lock()
+        self._gen = 0
+        self._lock = threading.RLock()
         cur = state.snapshot()["sleep"]
         if cur:
             self._arm(cur["at"])
@@ -807,91 +826,137 @@ class SleepTimer:
         finally:
             sock.close()
 
-    def left(self):
+    def current(self, now=None):
+        """The timer if it is still ahead, else None."""
         cur = self.state.snapshot()["sleep"]
-        return None if not cur else max(0.0, cur["at"] - time.time())
+        now = time.time() if now is None else now
+        return cur if cur and cur["at"] > now else None
+
+    def left(self, now=None):
+        now = time.time() if now is None else now
+        cur = self.current(now)
+        return None if cur is None else cur["at"] - now
 
     def _arm(self, at):
         with self._lock:
             if self._timer:
                 self._timer.cancel()
-            self._timer = threading.Timer(max(0.0, at - time.time()), self._fire)
+            self._gen += 1
+            self._timer = threading.Timer(max(0.0, at - time.time()), self._fire, (self._gen,))
             self._timer.daemon = True
             self._timer.start()
+        self.kick.set()
 
     def _disarm(self):
         with self._lock:
+            self._gen += 1
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
+        self.kick.set()
 
-    def _fire(self):
-        snap = self.state.snapshot()
-        if snap["running"]:
-            self.fired.set()
-            self.state.control(sleep=None, running=False, status="sleeping", notice=None)
-        else:
-            self.state.control(sleep=None)
+    def _fire(self, gen=None):
+        with self._lock:
+            if gen is not None and gen != self._gen:
+                return                          # disarmed or re-armed meanwhile
+            cur = self.state.snapshot()["sleep"]
+            if cur and cur["at"] > time.time() + 0.5:
+                self._arm(cur["at"])            # early (clock moved): wait again
+                return
+            self._timer = None
+            snap = self.state.snapshot()
+            began = self.session_from
+            if snap["running"] and cur and began is not None and began < cur["at"]:
+                self.fired.set()
+                self.state.control(sleep=None, running=False, status="sleeping", notice=None)
+            else:
+                # stopped, or a session started after the end time (the Mac
+                # slept through it): the bulb already switched off
+                self.state.control(sleep=None)
+
+    def session_started(self):
+        """A session begins: forget a timer that ran out unseen, drop the
+        fade its frames are about to replace, and any stale `fired`."""
+        with self._lock:
+            self.fired.clear()
+            self.session_from = time.time()
+            cur = self.state.snapshot()["sleep"]
+            if cur and cur["at"] <= self.session_from:
+                self._disarm()
+                self.state.control(sleep=None)
+            elif cur and cur.get("step"):
+                self.state.control(sleep=dict(cur, step=None))
+
+    def session_ended(self):
+        with self._lock:
+            self.session_from = None
+            self.fired.clear()
 
     def start(self, minutes):
         """-> error sentence or ''."""
-        snap = self.state.snapshot()
-        if not snap["ip"]:
-            return "Set up the bulb first."
-        step = None
-        try:
-            if snap["running"]:
-                # frames would replace a fade: the bulb only counts, the
-                # session dims itself
-                self.call(snap["ip"], [alone.sleep_commands(minutes)])
-            else:
-                props = list(music_bulb.LAMP_PROPS) + ["flowing"]
+        with self._lock:
+            snap = self.state.snapshot()
+            if not snap["ip"]:
+                return "Set up the bulb first."
+            cur = self.current()
+            ours = cur.get("step") if cur else None
+            step = None
+            try:
+                if snap["running"]:
+                    # frames would replace a fade: the bulb only counts, the
+                    # session dims itself
+                    self.call(snap["ip"], [alone.sleep_commands(minutes)])
+                elif ours:
+                    # our own fade is running: replace it, from the same look
+                    step = ours
+                    self.call(snap["ip"], [alone.sleep_commands(minutes, step)])
+                else:
+                    props = list(music_bulb.LAMP_PROPS) + ["flowing"]
 
-                def then(out):
-                    nonlocal step
-                    values = out[0][0] or []
-                    raw = dict(zip(props, values))
-                    saved = {"power": raw.get("power")}
-                    for k in music_bulb.LAMP_PROPS[1:]:
-                        with contextlib.suppress(TypeError, ValueError):
-                            saved[k] = int(raw.get(k))
-                    if raw.get("flowing") != "1":     # an idle look keeps running
-                        step = alone.look_step(saved)
-                    return alone.sleep_commands(minutes, step)
+                    def then(out):
+                        nonlocal step
+                        raw = dict(zip(props, out[0][0] or []))
+                        saved = {"power": raw.get("power")}
+                        for k in music_bulb.LAMP_PROPS[1:]:
+                            with contextlib.suppress(TypeError, ValueError):
+                                saved[k] = int(raw.get(k))
+                        # a flow we did not send is an idle look: it keeps
+                        # running and the timer alone switches it off
+                        if raw.get("flowing") != "1":
+                            step = alone.look_step(saved)
+                        return alone.sleep_commands(minutes, step)
 
-                self.call(snap["ip"], [[("get_prop", props)], then])
-        except Exception as exc:
-            return lamp_error(exc)
-        at = time.time() + minutes * 60
-        self.fired.clear()
-        self.state.control(sleep={"at": at, "step": step})
-        self._arm(at)
-        return ""
+                    self.call(snap["ip"], [[("get_prop", props)], then])
+            except Exception as exc:
+                return lamp_error(exc)
+            at = time.time() + minutes * 60
+            self.state.control(sleep={"at": at, "step": step})
+            self._arm(at)
+            return ""
 
     def cancel(self):
-        snap = self.state.snapshot()
-        cur = snap["sleep"]
-        self._disarm()
-        self.state.control(sleep=None)
-        if not snap["ip"]:
+        with self._lock:
+            snap = self.state.snapshot()
+            cur = snap["sleep"]
+            self._disarm()
+            self.state.control(sleep=None)
+            if not snap["ip"]:
+                return ""
+            step = None if snap["running"] or not cur else cur.get("step")
+            try:
+                self.call(snap["ip"], [alone.cancel_commands(step)])
+            except Exception as exc:
+                return lamp_error(exc)
             return ""
-        step = None if snap["running"] or not cur else cur.get("step")
-        try:
-            self.call(snap["ip"], [alone.cancel_commands(step)])
-        except Exception as exc:
-            return lamp_error(exc)
-        return ""
 
     def handed_over(self, step):
-        """Stop gave the fade to the bulb: Cancel now puts `step` back."""
-        cur = self.state.snapshot()["sleep"]
-        if cur:
-            self.state.control(sleep=dict(cur, step=step))
-
-    def dropped(self):
-        """The lamp ended off, so there is nothing left to switch off."""
-        self._disarm()
-        self.state.control(sleep=None)
+        """Stop left the lamp: `step` is the fade it handed to the bulb, or
+        None when the lamp shows something else (an idle look, the last
+        frame, a look with no fade)."""
+        with self._lock:
+            cur = self.state.snapshot()["sleep"]
+            if cur and cur.get("step") != step:
+                self.state.control(sleep=dict(cur, step=step))
 
 
 class Engine(threading.Thread):
@@ -988,8 +1053,13 @@ class Engine(threading.Thread):
             return
         loops = {"music": self._audio_loop, "screen": self._screen_loop,
                  "fusion": self._fusion_loop}
-        # a sleep timer dims the last minutes of a session
+        # a sleep timer dims the last minutes of a session, on a still
+        # picture too: the fader re-sends the last frame as it dims
         dimmed = alone.Dimmed(link, lambda: alone.dim_factor(self.sleep.left()))
+        self.sleep.session_started()
+        done = threading.Event()
+        fader = threading.Thread(target=self._fade, args=(dimmed, done), daemon=True)
+        fader.start()
         try:
             while True:
                 cfg = st.snapshot()
@@ -1004,12 +1074,41 @@ class Engine(threading.Thread):
                 loops.get(self._mode(cfg), self._audio_loop)(st, dimmed)
         finally:
             self.picker = None
-            restore, then = self._leave(st.snapshot(), link)
+            done.set()
+            self.sleep.kick.set()
+            fader.join(2)
+            try:
+                restore, then = self._leave(st.snapshot(), link)
+            except Exception as exc:
+                # whatever went wrong, the sender must stop and the socket close
+                print(f"could not work out what to leave on the lamp: {exc}", file=sys.stderr)
+                restore, then = self.restore, []
+            self.sleep.session_ended()
             if restore and link.saved and not link.lost:
                 st.set(status="restoring the lamp")
             link.close(restore=restore, then=then)
             st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10,
                    input_db=None, signal=True)
+
+    def _fade(self, dimmed, done):
+        """While a session runs: re-send the last frame as the sleep fade
+        dims it, every Dimmed.REFRESH s inside the fade and not at all
+        outside it (a set or cancelled timer wakes it through `kick`)."""
+        timer = self.sleep
+        while not done.is_set():
+            left = timer.left()
+            if left is None:
+                wait = None
+            elif left > alone.SLEEP_FADE_S:
+                wait = min(left - alone.SLEEP_FADE_S, 300.0)
+            else:
+                wait = alone.Dimmed.REFRESH
+            timer.kick.wait(wait)
+            timer.kick.clear()
+            if done.is_set():
+                return
+            with contextlib.suppress(Exception):
+                dimmed.refresh()
 
     def _leave(self, cfg, link):
         """What Stop sends: -> (restore, then) for Link.close.
@@ -1018,7 +1117,7 @@ class Engine(threading.Thread):
         on), just off. An idle look: that flow instead of the restore; a
         pending timer still switches it off. The restore with a timer
         pending: the restored look, then the bulb fades it for the time
-        left. A lamp restored to off has no timer left to run."""
+        left. A lamp restored to off keeps the bulb's timer and gets no fade."""
         if self.sleep.fired.is_set():
             self.sleep.fired.clear()
             return False, [("set_power", ["off", "smooth", 500])]
@@ -1028,19 +1127,19 @@ class Engine(threading.Thread):
             name = cfg["palette"] if cfg["palette"] in pals else cfg["active_palette"]
             anchors = pals.get(name) or PALETTES["ember"]
         then = alone.idle_commands(cfg["idle"], anchors)
+        left = self.sleep.left()
+        step = None
+        if not then and left is not None and left >= 1 and self.restore and not link.lost:
+            # a lamp restored to off has nothing to fade; the bulb's timer
+            # stays (switching an off lamp off is harmless), so nothing
+            # follows the restore's set_power off, where it could be refused
+            step = alone.look_step(link.saved)
+        self.sleep.handed_over(step)            # Cancel never pushes a stale look
         if then:
             return False, then
-        cur, saved = cfg["sleep"], link.saved
-        if not cur or not self.restore or link.lost:
-            return self.restore, []
-        if saved and saved.get("power") == "off":
-            self.sleep.dropped()
-            return True, [("cron_del", [0])]
-        step, left = alone.look_step(saved), cur["at"] - time.time()
-        if not step or left < 1:
-            return True, []
-        self.sleep.handed_over(step)
-        return True, [alone.fade_flow(step, left)]
+        if step:
+            return True, [alone.fade_flow(step, left)]
+        return self.restore, []
 
     # -- screen mode --------------------------------------------------------
     def _screen_loop(self, st, sender):
@@ -2902,7 +3001,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return
         if self.path.startswith("/api/state"):
-            self._send(200, json.dumps(self.state.snapshot()), "application/json")
+            snap = self.state.snapshot()
+            engine = getattr(Handler, "engine", None)
+            if snap["running"] and engine is not None:
+                # the page paints what the lamp shows: dimmed by a sleep fade
+                snap["val"] = alone.dim_level(snap["val"],
+                                              alone.dim_factor(engine.sleep.left()))
+            self._send(200, json.dumps(snap), "application/json")
         elif self.path.startswith("/api/cloud/state"):
             snap = self.cloud.snapshot()
             snap["available"] = not self._cloud_ready()
@@ -2963,13 +3068,22 @@ class Handler(BaseHTTPRequestHandler):
             # the lamp's power-on look (set_default). Its old one cannot be
             # read back, so the page confirms first.
             self._body()
-            ip = self.state.snapshot()["ip"]
+            snap = self.state.snapshot()
+            ip = snap["ip"]
+            if snap["running"]:
+                # a session's frames are not a look to keep, and the session
+                # holds the bulb's slots: stop first, as check_default.py says
+                self._json(409, {"ok": False, "error": "Stop the session first."})
+                return
             error = "" if ip else "Set up the bulb first."
+            engine = getattr(Handler, "engine", None)
             if ip:
-                try:
-                    music_bulb.lamp_call(ip, [("set_default", [])])
-                except Exception as exc:
-                    error = lamp_error(exc)
+                # one extra connection at a time, shared with the sleep timer
+                with (engine.sleep._lock if engine is not None else contextlib.nullcontext()):
+                    try:
+                        music_bulb.lamp_call(ip, [("set_default", [])])
+                    except Exception as exc:
+                        error = lamp_error(exc)
             self._json(400 if error else 200, {"ok": not error, "error": error})
             return
         if not self.path.startswith("/api/control"):
