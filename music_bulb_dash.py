@@ -121,10 +121,20 @@ BUILTIN_PRESETS = [
 MAX_PRESETS = 24
 PRESET_NAME_MAX = 32
 MIN_REGION = 32                     # points; smaller than this is a mis-click
+# Lamp mode's Follow the day: white moves with local time while no session
+# runs. Morning and evening are minutes after midnight, on a 15-minute grid.
+LAMP_NUMERIC = {"day_k": (2700, 6500, int), "night_k": (2700, 6500, int),
+                "wake": (0, 1425, int), "dusk": (0, 1425, int)}
+LAMP_DEFAULTS = {"follow_day": False, "day_k": 5000, "night_k": 2700,
+                 "wake": 7 * 60, "dusk": 20 * 60,
+                 # epoch seconds a hand-set temperature holds the curve off until
+                 "day_held": None}
+LAMP_SAVED = tuple(LAMP_DEFAULTS)
 # what survives a restart. Never `running` (the lamp must not start on its
 # own) and nothing from the cloud login (no secret touches disk).
 SAVED_KEYS = ("ip", "did", "mic", "mode", "auto", "palette", "calm", *NUMERIC,
-              "monitor", "region", "presets", "palettes", "idle", "sleep")
+              "monitor", "region", "presets", "palettes", "idle", "sleep",
+              *LAMP_SAVED)
 
 
 def _number(v):
@@ -419,18 +429,14 @@ def clean_patch(patch, snap):
         out["idle"] = patch["idle"]
     if "sleep" in patch:                # from the settings file; the page uses /api/sleep
         out["sleep"] = alone.clean_sleep(patch["sleep"])
+    out.update(clean_lamp(patch, snap))
     return out
 
 
-def settings_path():
-    """Where the desk keeps its settings: the platform's per-user config dir."""
-    if sys.platform == "darwin":
-        base = os.path.expanduser("~/Library/Application Support")
-    elif os.name == "nt":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    else:
-        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "bulbd", "settings.json")
+# lamp mode; the lamp CLI reads the same settings file, so the path lives there
+import socket  # noqa: E402
+from music_bulb import (settings_path, lamp_link, lamp_commands, lamp_state,  # noqa: E402
+                        LAMP_PROPS, LAMP_FADE_MS, LAMP_OPS, find_bulb)
 
 
 class SettingsStore:
@@ -576,6 +582,8 @@ class State:
             # the screen capture in use: "sck", "mss", or None when not capturing
             "capture": None,
         }
+        # lamp mode: Follow the day, and the lamp as last read (never saved)
+        self._d.update(LAMP_DEFAULTS, lamp=None, lamp_error=None)
         if saved:
             self._d.update(clean_patch(saved, self._d))
 
@@ -959,6 +967,315 @@ class SleepTimer:
                 self.state.control(sleep=dict(cur, step=step))
 
 
+# ---------------------------------------------------------------------------
+# lamp mode - the desk as a plain lamp while no session runs
+# ---------------------------------------------------------------------------
+DAY_TICK = 300                      # s between Follow the day's checks
+DAY_STEP = 50                       # K: the curve moves in steps this big
+DAY_UP = 60                         # min: night to day, from the morning time
+DAY_DOWN = 120                      # min: day to night, from the evening time
+DAY_FADE_MS = 3000                  # a curve step glides in rather than jumps
+DAY_RESUME_HOUR = 4                 # a hand-set temperature holds until 04:00
+GRID = 15                           # min: the strip's handles snap to this
+MIN_DAY = 120                       # min: the evening at least this after the morning
+
+
+def clean_lamp(patch, snap):
+    """Follow the day's settings out of `patch`, clamped like the faders.
+    The evening stays at least MIN_DAY after the morning on the same day:
+    the one that moved gives way."""
+    out = {}
+    for key, (lo, hi, _) in LAMP_NUMERIC.items():
+        v = patch.get(key)
+        if _number(v):
+            v = int(round(min(max(v, lo), hi)))
+            if key in ("wake", "dusk"):
+                v = min(int(round(v / GRID)) * GRID, hi)
+            out[key] = v
+    if "wake" in out or "dusk" in out:
+        wake = out.get("wake", snap.get("wake", LAMP_DEFAULTS["wake"]))
+        dusk = out.get("dusk", snap.get("dusk", LAMP_DEFAULTS["dusk"]))
+        top = LAMP_NUMERIC["dusk"][1]
+        if dusk - wake < MIN_DAY:
+            if "dusk" in out:
+                dusk = min(wake + MIN_DAY, top)
+                wake = min(wake, dusk - MIN_DAY)
+            else:
+                wake = dusk - MIN_DAY
+                if wake < 0:
+                    wake, dusk = 0, MIN_DAY
+            out.update(wake=wake, dusk=dusk)
+    if isinstance(patch.get("follow_day"), bool):
+        out["follow_day"] = patch["follow_day"]
+    if "day_held" in patch:
+        v = patch["day_held"]
+        if v is None or (_number(v) and v > 0):
+            out["day_held"] = v
+    return out
+
+
+def _smooth(x):
+    x = min(max(x, 0.0), 1.0)
+    return x * x * (3 - 2 * x)
+
+
+def day_kelvin(minute, day_k=5000, night_k=2700, wake=420, dusk=1200):
+    """The white for `minute` after local midnight: night_k until `wake`, up
+    to day_k over DAY_UP minutes, down again over DAY_DOWN from `dusk`, on a
+    smoothstep, in DAY_STEP steps. An evening before the morning wraps past
+    midnight; a day too short for both ramps peaks below day_k."""
+    span = (dusk + DAY_DOWN - wake) % 1440
+    into = (minute - wake) % 1440
+    f = 0.0 if into >= span else min(_smooth(into / DAY_UP), _smooth((span - into) / DAY_DOWN))
+    k = night_k + (day_k - night_k) * f
+    return int(round(k / DAY_STEP)) * DAY_STEP
+
+
+def day_target(snap, now):
+    t = time.localtime(now)
+    return day_kelvin(t.tm_hour * 60 + t.tm_min + t.tm_sec / 60, snap["day_k"],
+                      snap["night_k"], snap["wake"], snap["dusk"])
+
+
+def next_resume(now):
+    """Epoch seconds of the next DAY_RESUME_HOUR:00, local time."""
+    t = time.localtime(now)
+    at = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, DAY_RESUME_HOUR, 0, 0, 0, 0, -1))
+    if at <= now:
+        t = time.localtime(now + 86400)
+        at = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, DAY_RESUME_HOUR, 0, 0, 0, 0, -1))
+    return at
+
+
+def holding(snap, now):
+    return bool(snap["day_held"]) and now < snap["day_held"]
+
+
+class LampBusy(RuntimeError):
+    """A lamp action the desk will not do while a session owns the bulb."""
+
+
+def lamp_problem(exc, ip):
+    if isinstance(exc, ConnectionRefusedError):
+        return f"The bulb at {ip} refused the connection. LAN control may be off."
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return f"The bulb did not answer at {ip}."
+    if isinstance(exc, OSError):
+        return f"The bulb at {ip} cannot be reached ({exc.strerror or exc})."
+    return f"The bulb at {ip} refused it: {exc}"
+
+
+class LampMode(threading.Thread):
+    """The lamp while the desk is stopped: actions from the page and the
+    hotkey CLI, and Follow the day.
+
+    Every exchange is one lamp_link() connection, closed at once, and goes
+    through _turn(): it waits for a stopping session to finish its restore,
+    then takes `lock` - which the engine also holds while a session opens
+    and closes the bulb - and checks again that no session runs. So nothing
+    lands while a session enters music mode, reads the lamp, or puts it back.
+
+    Follow the day wakes every DAY_TICK seconds while it is on and not at
+    all while it is off; it connects only when the curve's value moved since
+    it last sent one, or when it last found the lamp off (so a lamp switched
+    on at the wall is corrected within a tick). Manual wins: a temperature
+    set here, or one it finds on the lamp that it did not send, holds the
+    curve off until DAY_RESUME_HOUR; ticking the switch again resumes it at
+    once. A reading taken while its own send is still fading is not judged."""
+
+    daemon = True
+
+    def __init__(self, state, idle=None, link=lamp_link, clock=time.time,
+                 lock=None, find=find_bulb):
+        super().__init__()
+        self.state = state
+        self.idle = idle                        # the engine's parked flag
+        self.link = link
+        self.clock = clock
+        self.find = find
+        # one exchange with the lamp at a time, shared with the engine
+        self.lock = lock or threading.Lock()
+        self.wake = threading.Event()
+        self.sent = None                        # the curve value last sent
+        self.fading_until = 0.0                 # clock() until that send has landed
+        self.found_off = False
+        self.searched = False                   # one search per unreachable spell
+
+    # -- the page, the CLI and the engine -------------------------------------
+    def changed(self, clean):
+        """A /api/control patch landed: re-tick when the curve's inputs moved."""
+        if clean.get("follow_day") is True or clean.get("day_held", 0) is None:
+            self.sent = None                    # resume: send without second-guessing
+        if "ip" in clean:                       # another bulb, or the same one moved
+            self.state.set(lamp=None, lamp_error=None)
+            self.sent, self.found_off, self.searched = None, False, False
+        if set(clean) & set(LAMP_DEFAULTS):
+            self.wake.set()
+
+    def session_ended(self):
+        """A session let go of the bulb: whatever it left (a failed restore,
+        --no-restore) is not a hand-set white, so the next tick reasserts."""
+        self.sent, self.found_off = None, False
+        self.wake.set()
+
+    def _settle(self, wait=10.0):
+        """Let a session that is stopping finish its restore first."""
+        if self.idle is not None:
+            self.idle.wait(wait)
+
+    @contextlib.contextmanager
+    def _turn(self):
+        self._settle()
+        with self.lock:
+            snap = self.state.snapshot()
+            if snap["running"]:
+                raise LampBusy("a session is running")
+            yield snap
+
+    def _talk(self, snap, body):
+        """Run body(call) on one connection to the lamp. A bulb that does
+        not answer at its address, with a known id, is searched for once (as
+        Link does for a moved lease); if it is elsewhere the address is saved
+        and body runs there - nothing reached the old address, so nothing is
+        sent twice."""
+        ip = snap["ip"]
+        try:
+            with self.link(ip) as call:
+                out = body(call)
+        except OSError as exc:
+            moved = None
+            if snap["did"] is not None and not self.searched:
+                self.searched = True
+                moved = self.find(snap["did"], ip)
+            if not moved or moved == ip:
+                self.state.set(lamp_error=lamp_problem(exc, ip))
+                raise
+            self.state.control(ip=moved)
+            self.changed({"ip": moved})
+            try:
+                with self.link(moved) as call:
+                    out = body(call)
+            except Exception as exc2:
+                self.state.set(lamp_error=lamp_problem(exc2, moved))
+                raise
+        except Exception as exc:
+            self.state.set(lamp_error=lamp_problem(exc, ip))
+            raise
+        self.searched = False
+        return out
+
+    def read(self):
+        if self.state.snapshot()["running"]:
+            raise LampBusy("a session is running")
+        return self._exchange(None, None, None)
+
+    def act(self, op=None, ct=None, bright=None):
+        if self.state.snapshot()["running"]:
+            if op != "toggle":
+                raise LampBusy("a session is running")
+            # one key press = dark: end the session (it puts the lamp back)
+            # and then switch the lamp off
+            self.state.control(running=False, status="stopping", notice=None)
+            time.sleep(0.05)
+            op = "off"
+        return self._exchange(op, ct, bright)
+
+    def _exchange(self, op, ct, bright):
+        with self._turn() as snap:
+            if not snap["ip"]:
+                raise LampBusy("no bulb address - set one in Setup")
+            now = self.clock()
+            follow = snap["follow_day"] and not holding(snap, now)
+            sending = {}
+
+            def body(call):
+                todo = op
+                if todo == "toggle" and follow:
+                    # turning on applies the curve, so find out which way first
+                    (power,) = call([("get_prop", ["power"])])[0]
+                    todo = "off" if power == "on" else "on"
+                cmds = lamp_commands(todo, ct, bright)
+                # a lamp coming on (up from off does too) gets the curve's white
+                if todo in ("on", "up") and follow and ct is None:
+                    sending["ct"] = day_target(snap, now)
+                    cmds.append(("set_ct_abx", [sending["ct"], "smooth", LAMP_FADE_MS]))
+                return call(cmds + [("get_prop", list(LAMP_PROPS))])
+
+            results = self._talk(snap, body)
+        lamp = lamp_state(results[-1])
+        if "ct" in sending:                     # only once it has gone out
+            self.sent = sending["ct"]
+            self.fading_until = now + LAMP_FADE_MS / 1000 + 1
+        self.state.set(lamp=lamp, lamp_error=None)
+        # an off lamp ignores a temperature, so there is nothing to hold for
+        if ct is not None and snap["follow_day"] and lamp and lamp["power"] == "on":
+            self.state.control(day_held=next_resume(now))
+        return lamp
+
+    # -- Follow the day -------------------------------------------------------
+    def run(self):
+        while True:
+            if not self.state.snapshot()["follow_day"]:
+                self.wake.wait()                # off: no wakes at all
+                self.wake.clear()
+                continue
+            try:
+                self.tick()
+            except Exception:
+                pass                            # the lamp may be away; next tick
+            self.wake.wait(DAY_TICK)
+            self.wake.clear()
+
+    def tick(self):
+        """One Follow the day check. -> what it did, for the tests."""
+        snap = self.state.snapshot()
+        if not snap["follow_day"] or snap["running"] or not snap["ip"]:
+            return "idle"
+        now = self.clock()
+        if snap["day_held"]:
+            if now < snap["day_held"]:
+                return "held"
+            self.state.control(day_held=None)
+            self.sent = None
+        if day_target(snap, now) == self.sent and not self.found_off:
+            return "same"
+        try:
+            with self._turn() as snap:
+                if not snap["follow_day"] or not snap["ip"]:
+                    return "idle"
+                target = day_target(snap, now)
+                judge = self.sent is not None and now >= self.fading_until
+
+                def body(call):
+                    (power, mode, ct) = call([("get_prop", ["power", "color_mode", "ct"])])[0]
+                    if power != "on":
+                        return "off"
+                    try:
+                        mode, ct = int(mode), int(ct)
+                    except (TypeError, ValueError):
+                        mode, ct = None, None
+                    if judge and not self.found_off and (
+                            mode != 2 or ct is None or abs(ct - self.sent) > DAY_STEP):
+                        return "hand"
+                    call([("set_ct_abx", [target, "smooth", DAY_FADE_MS])])
+                    return "sent"
+
+                what = self._talk(snap, body)
+        except LampBusy:
+            return "idle"
+        if what == "off":
+            self.found_off = True
+            return what
+        self.found_off = False
+        if what == "hand":
+            self.state.control(day_held=next_resume(now))
+            return what
+        self.sent, self.fading_until = target, now + DAY_FADE_MS / 1000 + 1
+        lamp = dict(snap["lamp"] or {}, power="on", color_mode=2, ct=target)
+        self.state.set(lamp=lamp, lamp_error=None)
+        return "sent"
+
+
 class Engine(threading.Thread):
     daemon = True
 
@@ -971,6 +1288,11 @@ class Engine(threading.Thread):
         self.idle.set()
         self.picker = None                      # an AutoPicker while Auto is on
         self.sleep = SleepTimer(state)
+        # lamp mode's lock: held while a session opens and closes the bulb,
+        # so no plain lamp command lands in the middle; and who to tell when
+        # a session has let go of the bulb
+        self.lamp_lock = threading.Lock()
+        self.on_session_end = None
 
     def _mode(self, cfg):
         """The mode to run: the picker's choice under Auto, else the desk's.
@@ -1048,7 +1370,9 @@ class Engine(threading.Thread):
 
         link = Link(cfg["ip"], did=cfg["did"], remember=self.restore,
                     status=report, stopped=st.stopped, moved=moved)
-        if not link.open():
+        with self.lamp_lock:
+            opened = link.open()
+        if not opened:
             st.set(status="stopped")
             return
         loops = {"music": self._audio_loop, "screen": self._screen_loop,
@@ -1086,9 +1410,12 @@ class Engine(threading.Thread):
             self.sleep.session_ended()
             if restore and link.saved and not link.lost:
                 st.set(status="restoring the lamp")
-            link.close(restore=restore, then=then)
+            with self.lamp_lock:
+                link.close(restore=restore, then=then)
             st.set(status="stopped", level=0.0, hit=0.0, bands=[0.0] * 10,
                    input_db=None, signal=True)
+            if self.on_session_end:
+                self.on_session_end()
 
     def _fade(self, dimmed, done):
         """While a session runs: re-send the last frame as the sleep fade
@@ -1822,6 +2149,29 @@ body[data-mode="fusion"] .no-fusion{display:none !important}
 body[data-deck="runtime"] .deck-cloud,
 body[data-deck="cloud"] .deck-runtime{display:none !important}
 
+/* lamp mode: the bulb as a plain lamp while no session runs */
+.lampctl{display:grid;gap:10px}
+.tog{display:inline-flex;align-items:center;gap:10px;border:0;background:none;padding:2px 0;cursor:pointer;font-weight:600}
+.tog i{width:34px;height:20px;border-radius:10px;background:var(--line);position:relative;flex:none}
+.tog i::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:var(--sf)}
+.tog[aria-checked="true"] i{background:var(--ink)}
+.tog[aria-checked="true"] i::after{left:17px;background:var(--bg)}
+.tog:disabled{opacity:.4;cursor:default}
+.lampctl input[type=range]:disabled{opacity:.4;cursor:default}
+input[type=range].kel::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,#ffa757,#ffc794,#ffdfc2,#fff1e7,#fef9ff)}
+input[type=range].kel::-moz-range-track{height:6px;border-radius:3px;background:linear-gradient(90deg,#ffa757,#ffc794,#ffdfc2,#fff1e7,#fef9ff)}
+input[type=range].kel::-moz-range-progress{background:transparent}
+input[type=range].kel::-webkit-slider-thumb{margin-top:-5px;box-shadow:0 0 0 2px var(--sf)}
+.strip{position:relative;height:34px;border-radius:6px;overflow:hidden;box-shadow:inset 0 0 0 1px var(--line);
+  touch-action:none;cursor:ew-resize;user-select:none;-webkit-user-select:none}
+.strip canvas{position:absolute;inset:0;width:100%;height:100%}
+/* the strip is always pale, so its marks are dark in both themes */
+.strip .now{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#17181a;pointer-events:none}
+.strip button{position:absolute;top:50%;width:12px;height:22px;margin:-11px 0 0 -6px;padding:0;border:0;border-radius:3px;
+  background:#fff;box-shadow:0 0 0 1.5px #17181a;cursor:ew-resize}
+.ticks{display:flex;justify-content:space-between;color:var(--dim);font-size:12px;margin-top:-4px}
+.lro{color:#111}
+
 /* ---------- setup ---------- */
 .setup{display:grid;grid-template-columns:380px 1fr;gap:24px;align-items:start}
 .login{display:grid;gap:12px}
@@ -1859,6 +2209,7 @@ td .mini+.mini{margin-left:6px}
         <span class="only-music no-fusion pal" id="rp"></span>
         <span class="only-music" id="rd"></span>
       </div>
+      <div class="ro lro" id="lro" hidden></div>
     </div>
     <canvas id="tape" hidden></canvas>
     <div class="spec" id="spec"></div>
@@ -1868,6 +2219,25 @@ td .mini+.mini{margin-left:6px}
     <!-- ============================ RUNTIME ============================ -->
     <p class="note deck-runtime" id="errnote" hidden><span id="errtxt"></span>
       <button class="btn" id="errfix" type="button" hidden>Open Setup</button></p>
+    <div class="lampctl deck-runtime" id="lampctl" hidden>
+      <div class="transport">
+        <button class="tog" id="lpower" type="button" role="switch" aria-checked="false"><i></i>Lamp</button>
+        <span class="sp"></span>
+        <label class="chk"><input type="checkbox" id="follow">Follow the day</label>
+      </div>
+      <div id="day" hidden>
+        <div class="strip" id="strip"><canvas id="stripc"></canvas><span class="now" id="snow"></span>
+          <button type="button" id="hwake" role="slider" aria-label="Morning" aria-valuemin="0" aria-valuemax="1425"></button>
+          <button type="button" id="hdusk" role="slider" aria-label="Evening" aria-valuemin="0" aria-valuemax="1425"></button></div>
+        <div class="ticks"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+      </div>
+      <div class="rows">
+        <div class="r" id="ctrow"><label for="lct">Temperature</label>
+          <input type="range" class="kel" id="lct" min="2700" max="6500" step="50" value="4000"><output id="v-lct"></output></div>
+        <div class="r"><label for="lbr">Brightness</label>
+          <input type="range" id="lbr" min="1" max="100" step="1" value="50"><output id="v-lbr"></output></div>
+      </div>
+    </div>
     <div class="transport deck-runtime">
       <span class="seg" id="modes">
         <button type="button" data-mode="music" aria-pressed="true">Music</button>
@@ -2141,7 +2511,7 @@ function setStatus(text, notice){
   st.className = 'st' + (text==='running' || text==='connected' ? ' on'
     : text==='no signal' ? ' quiet'
     : /^(connecting|starting|stopping|restoring|reconnecting|searching)/.test(text) ? ' busy'
-    : /^(error|no bulb|server)/.test(text) ? ' bad' : '');
+    : /^(error|no bulb|server|unreachable)/.test(text) ? ' bad' : '');
 }
 $('errfix').addEventListener('click',()=>{ location.hash='cloud'; });
 
@@ -2725,8 +3095,11 @@ async function poll(){
     // the reasons go, unless something more urgent is there
     const autoNote = s.auto && !s.screen_ok
       ? {kind:'warn', text:'No Screen Recording permission, so Auto stays on Music.'} : null;
-    setStatus(s.running && s.status==='running' && !s.signal && mode!=='screen' ? 'no signal' : s.status,
-              s.notice || autoNote);
+    const lampErr = !s.running && !s.notice && s.lamp_error ? {kind:'err', text:s.lamp_error} : null;
+    setStatus(s.running && s.status==='running' && !s.signal && mode!=='screen' ? 'no signal'
+              : lampErr ? 'unreachable' : s.status,
+              s.notice || autoNote || lampErr);
+    paintLamp(s, r, g, b);
     paintMeter(s);
     maybeShot(s);
     const addr=$('addr');
@@ -2786,7 +3159,151 @@ async function poll(){
   pollTimer = setTimeout(poll, pollDelay());
 }
 poll();
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ shotStale=true; poll(); cloudPoll(); } });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ shotStale=true; lampStale=true; poll(); cloudPoll(); } });
+addEventListener('focus', ()=>{ lampStale=true; poll(); });
+
+
+/* ------------------------------- lamp mode ------------------------------- */
+// While no session runs the desk is a plain lamp. The lamp is read when this
+// section comes into view (load, Stop, returning to the page), never on a
+// timer; every change is one short connection on the desk's side.
+const LM = __LAMP__;
+let lampStale=true, lampReadAt=0, lampReadTimer=0, lampIp=null, lampHold=0, lampTimer=0, lampWant={}, dayDrag=null, dayDraft=null;
+function smooth(x){ x=Math.min(Math.max(x,0),1); return x*x*(3-2*x); }
+function dayKelvin(min, s){   // music_bulb_dash.day_kelvin
+  const span=((s.dusk+LM.down-s.wake)%1440+1440)%1440, into=((min-s.wake)%1440+1440)%1440;
+  const f = into>=span ? 0 : Math.min(smooth(into/LM.up), smooth((span-into)/LM.down));
+  return Math.round((s.night_k+(s.day_k-s.night_k)*f)/LM.step)*LM.step;
+}
+function hhmm(m){ return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); }
+function following(s){ return s.follow_day && !(s.day_held && s.day_held*1000 > Date.now()); }
+async function lampRead(){
+  // at most one read per 1.5 s; one asked for sooner is put off, not dropped
+  const wait = 1500-(Date.now()-lampReadAt);
+  if(wait > 0){
+    if(!lampReadTimer) lampReadTimer=setTimeout(()=>{ lampReadTimer=0; lampRead(); }, wait);
+    return;
+  }
+  lampStale=false;
+  lampReadAt=Date.now();
+  try{ await fetch('/api/lamp'); }catch(e){}
+  poll();
+}
+async function lampDo(body){
+  lampHold=Date.now()+1200;
+  try{ await post('/api/lamp', body); }catch(e){}
+  poll();
+}
+function lampSoon(key, v){   // a fader being dragged: at most ~3 sends a second
+  lampWant[key]=v; lampHold=Date.now()+1200;
+  if(lampTimer) return;
+  lampTimer=setTimeout(()=>{ const b=lampWant; lampWant={}; lampTimer=0; lampDo(b); }, 330);
+}
+function paintFader(id, text){
+  const el=$(id);
+  el.style.setProperty('--p', (el.value-el.min)/(el.max-el.min)*100+'%');
+  $('v-'+id).textContent=text;
+}
+function drawStrip(s){
+  const c=$('stripc'), dpr=devicePixelRatio||1, W=Math.round(c.clientWidth*dpr)||1, H=Math.round(c.clientHeight*dpr)||1;
+  if(c.width!==W || c.height!==H){ c.width=W; c.height=H; }
+  const x=c.getContext('2d');
+  for(let px=0; px<W; px++){
+    const [r,g,b]=kelvin2rgb(dayKelvin(px/W*1440, s), 100);
+    x.fillStyle=`rgb(${r},${g},${b})`; x.fillRect(px,0,1,H);
+  }
+}
+let stripKey='';
+function paintStrip(s){
+  const d=dayDraft ? Object.assign({}, s, dayDraft) : s;
+  const key=[d.wake,d.dusk,d.day_k,d.night_k,$('strip').clientWidth].join();
+  if(key!==stripKey){ stripKey=key; drawStrip(d); }
+  [['hwake',d.wake],['hdusk',d.dusk]].forEach(([id,m])=>{
+    const h=$(id); h.style.left=(m/1440*100)+'%';
+    h.setAttribute('aria-valuenow', m); h.setAttribute('aria-valuetext', hhmm(m)); h.title=hhmm(m);
+  });
+  const now=new Date();
+  $('snow').style.left=((now.getHours()*60+now.getMinutes())/1440*100)+'%';
+}
+function paintLamp(s, r, g, b){
+  const show = !s.running && !!s.ip;
+  // read when the section comes into view or the address changes - never
+  // because a read came back empty, which would make it a timer
+  if(show && ($('lampctl').hidden || s.ip !== lampIp)) lampStale=true;
+  lampIp = s.ip;
+  $('lampctl').hidden = !show;
+  const L=s.lamp, on=!!(L && L.power==='on'), held=Date.now() < lampHold;
+  const lro=$('lro');
+  lro.hidden = !(show && on);
+  if(show){
+    if(on){
+      const [lr,lg,lb] = L.color_mode===2 ? kelvin2rgb(L.ct, 40+0.6*L.bright)
+        : [(L.rgb>>16)&255,(L.rgb>>8)&255,L.rgb&255].map(c=>Math.round(c*(40+0.6*L.bright)/100));
+      $('field').style.background=`rgb(${lr},${lg},${lb})`;
+      lro.style.color=(0.299*lr+0.587*lg+0.114*lb) > 150 ? '#111' : '#fff';
+      lro.textContent=(L.color_mode===2 ? L.ct+' K · ' : '')+L.bright+'%';
+    } else $('field').style.background='';
+  }
+  if(!show){ return; }
+  if(lampStale && !lampReadTimer && document.body.dataset.deck==='runtime' && !document.hidden) lampRead();
+  const follow=following(s);
+  $('lpower').setAttribute('aria-checked', on);
+  $('lpower').disabled = !L;
+  $('lct').disabled = $('lbr').disabled = !on;
+  if(!held){
+    $('follow').checked=follow;
+    if(L){ $('lct').value=L.ct || 4000; $('lbr').value=L.bright || 1; }
+  }
+  $('day').hidden=!follow; $('ctrow').hidden=follow;
+  paintFader('lct', L ? $('lct').value+' K' : '–');
+  paintFader('lbr', L ? $('lbr').value+'%' : '–');
+  if(follow) paintStrip(s);
+}
+$('lpower').addEventListener('click',()=>{
+  const on=$('lpower').getAttribute('aria-checked')==='true';
+  $('lpower').setAttribute('aria-checked', !on);
+  lampDo({op:'toggle'});
+});
+$('lct').addEventListener('input',e=>{ paintFader('lct', e.target.value+' K'); lampSoon('ct', +e.target.value); });
+$('lbr').addEventListener('input',e=>{ paintFader('lbr', e.target.value+'%'); lampSoon('bright', +e.target.value); });
+$('follow').addEventListener('change',e=>{ lampHold=Date.now()+1200; send({follow_day:e.target.checked}); });
+// the strip: drag the nearer handle, or focus one and use the arrow keys
+function stripMin(e){
+  const b=$('strip').getBoundingClientRect();
+  return Math.round(Math.min(Math.max((e.clientX-b.left)/b.width,0),1)*1440/LM.grid)*LM.grid;
+}
+// the handles never cross: evening stays LM.minDay after morning (as clean_lamp)
+function dayClamp(k, m){
+  const top=1440-LM.grid;
+  return k==='wake' ? Math.max(0, Math.min(m, live.dusk-LM.minDay))
+                    : Math.min(top, Math.max(m, live.wake+LM.minDay));
+}
+$('strip').addEventListener('pointerdown',e=>{
+  if(!live) return;
+  const m=stripMin(e), dist=k=>Math.min(Math.abs(m-live[k]), 1440-Math.abs(m-live[k]));
+  dayDrag = e.target.id==='hwake' ? 'wake' : e.target.id==='hdusk' ? 'dusk' : dist('wake')<=dist('dusk') ? 'wake' : 'dusk';
+  $('strip').setPointerCapture(e.pointerId);
+  dayDraft={[dayDrag]:dayClamp(dayDrag, m)}; paintStrip(live);
+});
+$('strip').addEventListener('pointermove',e=>{ if(dayDrag){ dayDraft={[dayDrag]:dayClamp(dayDrag, stripMin(e))}; paintStrip(live); } });
+function dayCommit(){
+  if(!dayDraft) return;
+  const d=dayDraft; dayDrag=null;
+  Object.assign(live, d); send(d); dayDraft=null;
+}
+$('strip').addEventListener('pointerup', dayCommit);
+$('strip').addEventListener('pointercancel', ()=>{ dayDrag=null; dayDraft=null; if(live) paintStrip(live); });
+let dayKeyTimer=0;
+[['hwake','wake'],['hdusk','dusk']].forEach(([id,k])=>{
+  $(id).addEventListener('keydown',e=>{
+    const d={ArrowLeft:-1,ArrowDown:-1,ArrowRight:1,ArrowUp:1}[e.key];
+    if(!d || !live) return;
+    e.preventDefault();
+    const m=dayClamp(k, ((dayDraft && dayDraft[k]) ?? live[k]) + d*LM.grid*(e.shiftKey?4:1));
+    dayDraft={[k]:m}; paintStrip(live);
+    clearTimeout(dayKeyTimer); dayKeyTimer=setTimeout(dayCommit, 400);
+  });
+});
 
 /* ------------------------------ setup deck ------------------------------ */
 $('defbtn').addEventListener('click', ()=>{ $('defask').hidden=false; $('defok').hidden=true; $('deferr').textContent=''; });
@@ -2945,6 +3462,7 @@ class Handler(BaseHTTPRequestHandler):
     cloud_enabled = True
     cloud_reason = ""
     local = True                    # bound to loopback; see _host_ok
+    lamp = None                     # LampMode
     # keep-alive: the page talks to the desk many times a second, and
     # HTTP/1.0 would cost a new connection and a new thread for each one.
     # Every response carries Content-Length, which 1.1 needs. The timeout
@@ -3020,6 +3538,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, audio_inputs())
         elif self.path.startswith("/api/snapshot"):
             self._snapshot()
+        elif self.path.startswith("/api/lamp"):
+            self._do_lamp(None)
         elif self.path in ("/", "/index.html"):
             page = (PAGE.replace("__PALETTES__", json.dumps(PALETTES))
                         .replace("__PAL_RULES__", json.dumps({
@@ -3027,7 +3547,10 @@ class Handler(BaseHTTPRequestHandler):
                             "max": pal_rules.MAX_ANCHORS, "sat": pal_rules.SAT_RANGE,
                             "side": ART_SIDE}))
                         .replace("__PRESETS__", json.dumps(BUILTIN_PRESETS))
-                        .replace("__SLEEP_STEPS__", json.dumps(list(alone.SLEEP_STEPS))))
+                        .replace("__SLEEP_STEPS__", json.dumps(list(alone.SLEEP_STEPS)))
+                        .replace("__LAMP__", json.dumps({
+                            "up": DAY_UP, "down": DAY_DOWN, "step": DAY_STEP, "grid": GRID,
+                            "minDay": MIN_DAY})))
             self._send(200, page, "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
@@ -3086,6 +3609,13 @@ class Handler(BaseHTTPRequestHandler):
                         error = lamp_error(exc)
             self._json(400 if error else 200, {"ok": not error, "error": error})
             return
+        if self.path.startswith("/api/lamp"):
+            body = self._body()
+            if not isinstance(body, dict):
+                self._send(400, "bad json", "text/plain")
+                return
+            self._do_lamp(body)
+            return
         if not self.path.startswith("/api/control"):
             self.close_connection = True        # its body was never read
             self._send(404, "not found", "text/plain")
@@ -3115,6 +3645,11 @@ class Handler(BaseHTTPRequestHandler):
         # the bulb's id is learned on the wire, never taken from the page,
         # and a new address may be a different bulb
         clean.pop("did", None)
+        # the hold is set by a hand-set temperature; ticking Follow the day
+        # is what lifts it
+        clean.pop("day_held", None)
+        if clean.get("follow_day") is True:
+            clean["day_held"] = None
         # Auto off keeps the mode it was running rather than jumping back to
         # the last one picked by hand
         if clean.get("auto") is False and snap["auto"] and "mode" not in clean \
@@ -3131,7 +3666,37 @@ class Handler(BaseHTTPRequestHandler):
             clean["running"] = False
             clean["status"] = f"bulb address is now {clean['ip']} - press Start"
         self.state.control(**clean)
+        if self.lamp:
+            self.lamp.changed(clean)
         self._send(200, json.dumps({"ok": True}), "application/json")
+
+    def _do_lamp(self, body):
+        """GET reads the lamp; POST {op?, ct?, bright?} changes it. Each is
+        one short connection. While a session runs only a toggle is taken
+        (it stops the session, then turns the lamp off)."""
+        if self.lamp is None:
+            self._json(503, {"ok": False, "error": "lamp mode is not running"})
+            return
+        try:
+            if body is None:
+                lamp = self.lamp.read()
+            else:
+                op = body.get("op")
+                ct, bright = body.get("ct"), body.get("bright")
+                if (op is not None and op not in LAMP_OPS) \
+                        or (ct is not None and not _number(ct)) \
+                        or (bright is not None and not _number(bright)):
+                    self._json(400, {"ok": False, "error": "bad lamp action"})
+                    return
+                lamp = self.lamp.act(op, ct, bright)
+        except LampBusy as exc:
+            self._json(409, {"ok": False, "error": str(exc),
+                             "lamp": self.state.snapshot()["lamp"]})
+            return
+        except Exception:
+            self._json(502, {"ok": False, "error": self.state.snapshot()["lamp_error"]})
+            return
+        self._json(200, {"ok": True, "lamp": lamp})
 
     def _do_presets(self):
         body = self._body()
@@ -3258,6 +3823,10 @@ def main():
     store.attach(state)
     engine = Engine(state, restore=args.restore, capture=args.capture)
     engine.start()
+    lamp = LampMode(state, idle=engine.idle, lock=engine.lamp_lock)
+    engine.on_session_end = lamp.session_ended
+    lamp.start()
+    Handler.lamp = lamp
     Handler.state = state
     Handler.engine = engine
     Handler.cloud = CloudSession()
