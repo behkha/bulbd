@@ -169,9 +169,14 @@ def dim_level(v, factor):
 
 
 def dim_frame(frame, factor):
-    """A frame with its brightness scaled: an (h, s, v) tuple or a White."""
+    """A frame with its brightness scaled: an (h, s, v) tuple, a White, or
+    a Flow (a bulb-timed beat, a swell, a strobe), whose every step dims."""
     if factor >= 1.0:
         return frame
+    if hasattr(frame, "steps"):
+        return frame._replace(steps=tuple(
+            (ms, mode, value, dim_level(bright, factor) if bright > 0 else bright)
+            for ms, mode, value, bright in frame.steps))
     if hasattr(frame, "ct") and hasattr(frame, "bright"):
         return type(frame)(frame.ct, dim_level(frame.bright, factor))
     h, s, v = frame
@@ -211,6 +216,8 @@ class Dimmed:
         with self._lock:
             if self._last is None or self._clock() - self._at < self.REFRESH:
                 return False
+            if hasattr(self._last[0], "steps"):
+                return False                    # a flow is an event, not a look to repeat
             out = dim_frame(self._last[0], self._factor())
             if out == self._sent:
                 return False

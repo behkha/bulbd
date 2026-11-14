@@ -514,6 +514,20 @@ def test_with_nothing_new_the_last_frame_goes_out_again_after_the_pulse(running)
     assert [x for x, _ in bulb.log] == [(5, 5, 5), "start_cf", (5, 5, 5)]
 
 
+def test_a_flash_flow_is_not_sent_again_after_the_pulse(running):
+    # a bulb-timed beat or a strobe is an event: repeating it would flash twice
+    from music_bulb import Flow
+    bulb, s = running()
+    s.put(Flow(2, 1, ((60, 1, 255, 40), (50, 1, 255, 100))), True)
+    assert wait_for(lambda: len(bulb.log) == 1)
+    s.flow([2, 0, "50,1,255,100,50,1,255,1"], 100)
+    assert wait_for(lambda: len(bulb.log) == 2)
+    time.sleep(0.35)                                          # well past the hold
+    assert [x for x, _ in bulb.log] == ["start_cf", "start_cf"]
+    s.put((7, 7, 7), False)                                   # and frames carry on
+    assert wait_for(lambda: len(bulb.log) == 3)
+
+
 # 3. the released frame and the next one are LED_GAP apart
 def test_the_frame_after_the_release_waits_led_gap(running):
     from music_bulb import LED_GAP

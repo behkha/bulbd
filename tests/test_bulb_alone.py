@@ -677,3 +677,30 @@ def test_review9_a_superseded_timer_callback_does_nothing():
         assert st.snapshot()["sleep"] is not None
     finally:
         t._disarm()
+
+
+# ------------------------------------------ beside film-music's flow frames
+def test_a_flow_frame_dims_step_by_step_and_is_never_repeated():
+    """A bulb-timed beat, a swell or a strobe goes through Dimmed like any
+    frame: each step's brightness is scaled, and the fade's refresh does not
+    send the flash a second time."""
+    from music_bulb import Flow
+    flash = Flow(2, 1, ((60, 1, 0xFF0000, 40), (50, 1, 0xFF0000, 100)))
+    assert alone.dim_frame(flash, 1.0) is flash
+    dim = alone.dim_frame(flash, 0.5)
+    assert isinstance(dim, Flow) and (dim.count, dim.action) == (2, 1)
+    assert [s[3] for s in dim.steps] == [20, 50] and [s[:3] for s in dim.steps] == \
+        [s[:3] for s in flash.steps]
+    assert alone.dim_frame(Flow(1, 1, ((50, 1, 1, 1),)), 0.01).steps[0][3] == 1
+
+    class Link:
+        sent = []
+
+        def put(self, *a, **kw):
+            self.sent.append(a)
+
+    now, factor = [0.0], [0.5]
+    d = alone.Dimmed(Link(), lambda: factor[0], clock=lambda: now[0])
+    d.put(flash, True)
+    now[0], factor[0] = 10.0, 0.25
+    assert d.refresh() is False and len(Link.sent) == 1
